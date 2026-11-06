@@ -1,0 +1,4 @@
+# DSH bundle patch: mounts the character-db plugin as a Cordis row.
+- insert:
+    - id: character-db
+      name: "@character-db/dsh-plugin"

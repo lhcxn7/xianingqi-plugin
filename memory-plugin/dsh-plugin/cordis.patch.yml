@@ -1,0 +1,4 @@
+# DSH bundle patch: mounts the memory plugin as a Cordis row.
+- insert:
+    - id: memory-plugin
+      name: "@memory-plugin/dsh-plugin"

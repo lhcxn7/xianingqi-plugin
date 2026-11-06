@@ -1,0 +1,29 @@
+{
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.0 <0.3.0"
+  },
+  "description": "Local-file memory plugin for DeepSeek Harness: deterministic capture, keyword recall injection and snapshots for persona AIs. No network, no login, no cloud.",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.0 <0.3.0",
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "README.md",
+    "src"
+  ],
+  "license": "MIT",
+  "main": "./src/index.ts",
+  "name": "@memory-plugin/dsh-plugin",
+  "private": true,
+  "scripts": {
+    "test": "node test/mock-test.ts"
+  },
+  "type": "module",
+  "version": "0.1.6"
+}

@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# test / run artefacts
+.tmp-*/
+*.log
+
+# DSH snapshot-push sync record (lives next to the repo, never inside it)
+.muse-github-snapshot-sync.json
+
+# OS
+.DS_Store
+Thumbs.db
