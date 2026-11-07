@@ -85,8 +85,17 @@ export function snapshotComplete(dataDir: string, name: string): boolean {
   try {
     return readdirSync(dir).some(
       (f) =>
-        ["log.jsonl", "index.json", "persona-sessions.json"].includes(f) ||
-        /^log-\d{4}-\d{2}\.jsonl$/.test(f),
+        [
+          "log.jsonl",
+          "index.json",
+          "persona-sessions.json",
+          "graph.json",
+          "attributes.json",
+          "review.json",
+          "fragments.json",
+        ].includes(f) ||
+        /^log-\d{4}-\d{2}\.jsonl$/.test(f) ||
+        /^summary-\d{4}-\d{2}\.jsonl$/.test(f),
     );
   } catch {
     return false;
@@ -113,6 +122,18 @@ function isPluginOwned(name: string): boolean {
     name === "index.json" ||
     name === "persona-sessions.json" ||
     name === "appended-ids.json" ||
+    // 0.2.0: graph, attributes, review state and compressed
+    // summaries are plugin-owned and snapshotted together with the
+    // log. starmap.html is deliberately EXCLUDED — derived
+    // artifact, regenerable from the other files.
+    // 0.3.0: fragments.json is plugin-owned too (derived layer on
+    // top of the log — a restore must revert it together with the
+    // log, or fragments would point at pre-restore sources).
+    name === "graph.json" ||
+    name === "attributes.json" ||
+    name === "review.json" ||
+    name === "fragments.json" ||
+    /^summary-\d{4}-\d{2}\.jsonl$/.test(name) ||
     /^log-\d{4}-\d{2}\.jsonl$/.test(name)
   );
 }

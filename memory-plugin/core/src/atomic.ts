@@ -20,6 +20,41 @@ export function ensureDir(dir: string): void {
   mkdirSync(dir, { recursive: true });
 }
 
+/** Windows: renameSync can throw EPERM/EACCES when the target is
+ *  briefly held by antivirus/indexer (MoveFileEx behaviour,
+ *  review-9 tip, unreproduced). Retry those two codes a few times
+ *  with a tiny pause; anything else — or a fourth failure — throws
+ *  as before. The happy path is unchanged: one rename, no delay. */
+const RENAME_RETRY_CODES = new Set(["EPERM", "EACCES"]);
+const RENAME_RETRIES = 3;
+const RENAME_RETRY_MS = 15;
+
+function renameWithRetry(tmp: string, path: string): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(tmp, path);
+      return;
+    } catch (err) {
+      const code = (err as { code?: unknown } | null)?.code;
+      if (
+        typeof code !== "string" ||
+        !RENAME_RETRY_CODES.has(code) ||
+        attempt >= RENAME_RETRIES
+      ) {
+        throw err;
+      }
+      // Synchronous pause: atomicWriteText is a sync API, and
+      // Atomics.wait is the stdlib way to sleep in place.
+      Atomics.wait(
+        new Int32Array(new SharedArrayBuffer(4)),
+        0,
+        0,
+        RENAME_RETRY_MS,
+      );
+    }
+  }
+}
+
 export function atomicWriteText(path: string, text: string): void {
   const dir = dirname(path);
   ensureDir(dir);
@@ -34,7 +69,7 @@ export function atomicWriteText(path: string, text: string): void {
   } finally {
     closeSync(fd);
   }
-  renameSync(tmp, path);
+  renameWithRetry(tmp, path);
   // Best-effort directory fsync so the rename itself survives a crash.
   try {
     const dfd = openSync(dir, "r");

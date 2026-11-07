@@ -87,6 +87,11 @@ export interface MemoryPluginConfig {
   /** Substrings marking a session as a persona window. Default the
    *  skill's own trigger: messages containing 夏柠柒 / 柠柒. */
   triggerWords?: string[];
+  /** 0.3.0: substrings marking a mid-turn message as explicitly
+   *  reaching for the past (condition (a) of the restrained
+   *  mid-conversation recall trigger). Default
+   *  DEFAULT_MEMORY_CUE_WORDS. */
+  memoryCueWords?: string[];
 }
 
 export interface MemoryPluginContext {
@@ -97,6 +102,16 @@ export interface MemoryPluginContext {
   // which fails plugin activation. (Found 2026-11-05 in a live DSH
   // 0.2.1-rc.5 run; the mock test used to hide it because the fake
   // ctx was a plain object carrying config.)
+  // agent/pre-step is a waterfall: the handler receives
+  // (decision, next) and MUST return next()'s result (see the NOTE
+  // in index.ts). Its `next` is typed here so a handler can call it
+  // under --strict; the generic overload below would leave it
+  // `unknown` (truthiness-narrowed to `{}`), which is uncallable.
+  on(
+    event: "agent/pre-step",
+    handler: (decision: unknown, next: () => unknown) => unknown,
+    opts?: { prepend?: boolean },
+  ): void;
   on(
     event: string,
     handler: (...args: unknown[]) => unknown,
