@@ -12,6 +12,13 @@
 //   twice in context.
 // - The plugin injects facts only and never makes stage judgments;
 //   stage comes from MEMORY.md layer 1.
+// - 0.2.0 additions are all plugin-owned too: the memory graph
+//   (graph.json), per-memory attributes (attributes.json), review
+//   state (review.json), compressed one-line summaries
+//   (summary-YYYY-MM.jsonl) and the starmap (starmap.html, derived
+//   and regenerable — NOT snapshotted). The skill's files are never
+//   written; the graph/attributes/review only ever describe the
+//   plugin's own log.
 // - Memory entries are never deleted. Log rollover MOVES entries into
 //   segments; snapshots copy only the plugin's own files (log + index
 //   + segments + persona-sessions.json) and NEVER MEMORY.md, the
@@ -42,7 +49,14 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteText, ensureDir } from "./atomic.ts";
+import { AttributeStore } from "./attributes.ts";
 import { formatDate, formatTime, monthKey } from "./dates.ts";
+import { FragmentStore } from "./fragments.ts";
+import type {
+  FragmentCreateResult,
+  FragmentInput,
+} from "./fragments.ts";
+import { MemoryGraph } from "./graph.ts";
 import {
   acquireWriteLock,
   DEFAULT_LOCK_TIMEOUT_MS,
@@ -56,14 +70,26 @@ import {
 import { MemoryFile } from "./memory-file.ts";
 import { DEFAULT_TOKEN_CAP, recallFromEntries } from "./recall.ts";
 import {
+  REVIEW_INTERVAL_MS,
+  loadReviewState,
+  loadSummaries,
+  runReview,
+} from "./review.ts";
+import {
   listSnapshots,
   restoreSnapshot,
   takeSnapshot,
 } from "./snapshot.ts";
+import {
+  STARMAP_FILE,
+  buildStarmapData,
+  renderStarmapHtml,
+} from "./starmap.ts";
 import { tokenize } from "./tokenize.ts";
 import type {
   CoreOptions,
   CoreStats,
+  EmotionTag,
   EndSessionResult,
   Importance,
   Layer1State,
@@ -71,7 +97,9 @@ import type {
   MemoryEntry,
   ParsedMemoryFile,
   RecallResult,
+  ReviewResult,
   Role,
+  StarmapResult,
   WindowKind,
 } from "./types.ts";
 
@@ -86,6 +114,9 @@ export interface RecordInput {
   sessionId?: string;
   /** Epoch ms. Defaults to now. Tests pass explicit old timestamps. */
   ts?: number;
+  /** 0.2.0: model-supplied emotion tag; the lexicon guesses when
+   *  absent. */
+  emotion?: EmotionTag;
 }
 
 export class MemoryCore {
@@ -94,6 +125,20 @@ export class MemoryCore {
   private readonly snapshotKeep: number;
   private readonly memoryFile: MemoryFile;
   private readonly index: KeywordIndex;
+  /** 0.2.0: memory graph (edges between log entries). */
+  private readonly graph: MemoryGraph;
+  /** 0.2.0: per-memory attributes. */
+  private readonly attrs: AttributeStore;
+  /** 0.3.0: fragments (summary layer on top of the log). */
+  private readonly fragments: FragmentStore;
+  /** 0.2.0: entryId -> compressed one-line summary (review). */
+  private summaries: Map<string, string>;
+  /** 0.2.0: last entry per session, for session-edge linking. */
+  private lastBySession = new Map<string, MemoryEntry>();
+  /** 0.2.0: entry ids surfaced by the last recall per session —
+   *  the next record in that session links to them as "recall"
+   *  edges (the conversation moved there because A was recalled). */
+  private pendingRecallLinks = new Map<string, string[]>();
   private entries: MemoryEntry[] = [];
   private counter = 0;
   /** Entries currently in log.jsonl (not yet rolled into segments).
@@ -121,6 +166,9 @@ export class MemoryCore {
     this.counter = this.entries.length;
     this.currentLogCount = this.currentLogEntries().length;
     this.lastSeenFingerprints = fingerprintLogFiles(this.logFiles());
+    for (const e of this.entries) {
+      this.lastBySession.set(e.sessionId, e);
+    }
     this.index = new KeywordIndex(join(this.dataDir, INDEX_FILE));
     if (!this.index.load(this.logFiles())) {
       this.index.build(this.entries);
@@ -138,11 +186,30 @@ export class MemoryCore {
               this.logFiles(),
             );
           },
-          { timeoutMs: 2000 },
+          2000,
         );
       } catch (err) {
         console.warn(
           `[memory-plugin] 索引初次落盘被锁占用，跳过本次保存（下次 flush 时重建）：${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    // 0.2.0: graph + attributes. A first run over an old data dir
+    // backfills the graph from the existing log (one-time, derived
+    // data — the log stays the source of truth).
+    this.graph = new MemoryGraph(this.dataDir);
+    this.attrs = new AttributeStore(this.dataDir);
+    this.fragments = new FragmentStore(this.dataDir);
+    this.summaries = loadSummaries(this.dataDir);
+    if (!this.graph.loadedExisting && this.entries.length > 0) {
+      try {
+        this.withWriteLock(() => {
+          this.graph.backfill(this.entries, this.index, Date.now());
+          this.graph.save();
+        });
+      } catch (err) {
+        console.warn(
+          `[memory-plugin] 图谱首次回填失败（下次加载时重试）：${err instanceof Error ? err.message : String(err)}`,
         );
       }
     }
@@ -242,6 +309,18 @@ export class MemoryCore {
     this.currentLogCount = this.currentLogEntries().length;
     this.index.build(this.entries);
     this.lastSeenFingerprints = fp;
+    // 0.2.0: another writer may have moved the graph, the
+    // attributes or the summaries too — reload them together, or
+    // this instance's next save would overwrite their changes.
+    // 0.3.0: same for fragments.json.
+    this.graph.reload();
+    this.attrs.reload();
+    this.fragments.reload();
+    this.summaries = loadSummaries(this.dataDir);
+    this.lastBySession.clear();
+    for (const e of this.entries) {
+      this.lastBySession.set(e.sessionId, e);
+    }
     return true;
   }
 
@@ -303,6 +382,22 @@ export class MemoryCore {
       this.entries.splice(lo, 0, entry);
       this.currentLogCount += 1;
       this.index.add(entry);
+      // 0.2.0: link the graph (session + keyword edges), ensure the
+      // attributes row, and consume any pending recall links (the
+      // conversation moved here because those entries were recalled).
+      const prevInSession = this.lastBySession.get(entry.sessionId) ?? null;
+      this.graph.linkNewEntry(entry, this.index, prevInSession, ts);
+      this.lastBySession.set(entry.sessionId, entry);
+      this.attrs.ensure(entry, input.emotion, ts);
+      const pending = this.pendingRecallLinks.get(entry.sessionId);
+      if (pending && pending.length > 0) {
+        for (const id of pending.slice(0, 3)) {
+          this.graph.link(id, entry.id, "recall", ts);
+        }
+        this.pendingRecallLinks.delete(entry.sessionId);
+      }
+      this.graph.save();
+      this.attrs.save();
       if (this.currentLogCount > this.logMaxEntries) {
         this.rollover();
       }
@@ -326,6 +421,9 @@ export class MemoryCore {
       window?: "persona" | "task" | "all";
       tokenCap?: number;
       limit?: number;
+      /** 0.2.0: per-session recall-link tracking + attention factor. */
+      sessionId?: string;
+      recentTexts?: string[];
     } = {},
   ): RecallResult {
     // A non-string query (a bad tool call) returns empty, never
@@ -363,12 +461,152 @@ export class MemoryCore {
     // never eats a cap slot. The 0.1.6 dedupe there also drops log
     // hits that repeat what the skill already read at open (layer 1
     // + layer 2, passed below) — the curated copy wins.
-    return recallFromEntries(
+    // 0.2.0: recall-from-entries also receives the graph, the
+    // attributes and the compressed summaries, plus the session
+    // context for the attention factor and recall-link tracking.
+    // 0.3.0: plus the fragments — a hit covered by a verified
+    // fragment injects the fragment text instead of the full
+    // original (recallFromEntries re-checks it first).
+    const result = recallFromEntries(
       [...this.entries, ...archiveHits],
       layer1,
       query,
-      { ...opts, candidateIds, layer2: parsed.layer2 },
+      {
+        ...opts,
+        candidateIds,
+        layer2: parsed.layer2,
+        graph: this.graph,
+        attributes: this.attrs,
+        summaries: this.summaries,
+        fragments: this.fragments,
+      },
     );
+    // 0.2.0: the next record in this session links back to the
+    // entries that were surfaced (the conversation moved there
+    // because they were recalled), and surfaced entries are bumped
+    // in memory (recallCount++, clarity +0.15) — persisted at
+    // flush().
+    if (opts.sessionId) {
+      const surfaced = result.hits
+        .filter((h) => h.entry.source !== "archive")
+        .slice(0, 3)
+        .map((h) => h.entry.id);
+      if (surfaced.length > 0) {
+        // Append-merge, never overwrite: two recalls in one session
+        // with no record between them must both leave their links
+        // for the next record — a plain set() drops the first batch
+        // and the recall edges for it are never built.
+        const prev = this.pendingRecallLinks.get(opts.sessionId) ?? [];
+        const merged = [...prev];
+        for (const id of surfaced) {
+          if (!merged.includes(id)) merged.push(id);
+        }
+        this.pendingRecallLinks.set(opts.sessionId, merged);
+      }
+    }
+    const now = Date.now();
+    for (const hit of result.hits) {
+      if (hit.entry.source === "archive") continue;
+      this.attrs.bumpOnRecall(hit.entry.id, now);
+    }
+    return result;
+  }
+
+  // ---- mid-turn trigger (0.3.0) ------------------------------------
+  //
+  // Condition (b) of the restrained mid-conversation recall trigger:
+  // true when the query's keywords match at least one persona-window
+  // entry whose significance is >= threshold (default 0.8). Uses the
+  // keyword index (candidate ids) + the attribute store; ensure() is
+  // in-memory only until flush, so this writes nothing to disk, and
+  // it reuses initialSignificance / the stored row — the significance
+  // logic itself is untouched. Archive entries are not in the index
+  // and are not checked (the trigger is about the live log); task
+  // entries never count (their window is not persona).
+  hasHighSignificanceMatch(query: string, threshold = 0.8): boolean {
+    if (typeof query !== "string") return false;
+    const tokens = tokenize(query);
+    if (tokens.length === 0) return false;
+    const candidateIds = new Set<string>();
+    for (const [, ids] of this.index.lookup(tokens)) {
+      for (const id of ids) candidateIds.add(id);
+    }
+    if (candidateIds.size === 0) return false;
+    const now = Date.now();
+    const byId = new Map(this.entries.map((e) => [e.id, e]));
+    for (const id of candidateIds) {
+      const entry = byId.get(id);
+      if (!entry || entry.window !== "persona") continue;
+      if (this.attrs.ensure(entry, undefined, now).significance >= threshold) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // ---- daily model review (0.3.0, new layer 2) --------------------
+  //
+  // yesterdayEntries(): every persona-window log entry from
+  // yesterday (host-local date). The model review reads ALL of
+  // them — no token limit on reading. Task-window entries are not
+  // her memories and are left out.
+  yesterdayEntries(now = Date.now()): MemoryEntry[] {
+    const yesterday = formatDate(now - 86_400_000);
+    return this.entries.filter(
+      (e) => e.window === "persona" && e.date === yesterday,
+    );
+  }
+
+  /** Apply the model review's picks: every id that names a real log
+   *  entry is raised to significance 0.9 and flagged modelMarked
+   *  (the code review never compresses it). Only upgrades, never
+   *  downgrades: an entry already at 0.9 stays 0.9. Unknown ids are
+   *  reported, never applied, never an error. Runs under the write
+   *  lock and persists attributes.json. */
+  applyModelMarks(
+    ids: string[],
+    now = Date.now(),
+  ): { applied: string[]; unknown: string[] } {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const byId = new Map(this.entries.map((e) => [e.id, e]));
+      const applied: string[] = [];
+      const unknown: string[] = [];
+      for (const id of ids) {
+        const entry = byId.get(id);
+        if (!entry) {
+          unknown.push(id);
+          continue;
+        }
+        const attrs = this.attrs.ensure(entry, undefined, now);
+        if (attrs.significance < 0.9) attrs.significance = 0.9;
+        attrs.modelMarked = true;
+        applied.push(id);
+      }
+      this.attrs.save();
+      return { applied, unknown };
+    });
+  }
+
+  // ---- fragments (0.3.0) ---------------------------------------
+  //
+  // Create a fragment on top of the verbatim log. The model writes
+  // the summary + tone + quotes; the code verifies them against the
+  // source entries and REJECTS the fragment (nothing saved) when
+  // the key terms / quotes / tone do not match. The log is never
+  // touched by this path.
+
+  createFragment(input: FragmentInput): FragmentCreateResult {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const entriesById = new Map(this.entries.map((e) => [e.id, e]));
+      return this.fragments.create(input, entriesById);
+    });
+  }
+
+  /** All stored fragments (for memory_status / review / tests). */
+  listFragments(): import("./fragments.ts").Fragment[] {
+    return this.fragments.all();
   }
 
   // ---- MEMORY.md (read-only) --------------------------------------
@@ -448,11 +686,18 @@ export class MemoryCore {
    *  Under the write lock, and refreshes from disk first when another
    *  writer moved: saving a stale in-memory index over the current
    *  log files would make a fresh core accept it as current and never
-   *  find the other writer's entries. */
+   *  find the other writer's entries.
+   *  0.2.0: also persists the graph and the attributes (in-memory
+   *  recall bumps live here until flushed). 0.3.0: also persists
+   *  fragments (in-memory suspect marks from recall live here
+   *  until flushed). */
   flush(): void {
     this.withWriteLock(() => {
       this.refreshIfStale();
       this.index.save(this.logFiles());
+      this.graph.save();
+      this.attrs.save();
+      this.fragments.save();
     });
   }
 
@@ -487,6 +732,9 @@ export class MemoryCore {
       this.counter = this.entries.length;
       this.currentLogCount = this.currentLogEntries().length;
       this.rebuildIndex();
+      // (rebuildIndex -> refreshIfStale already reloads the 0.2.0
+      // graph, attributes, summaries and session map, since the
+      // restored log files moved the fingerprints.)
       return safety;
     });
   }
@@ -512,6 +760,73 @@ export class MemoryCore {
     });
   }
 
+  /** 0.2.0 daily review. Runs only when due (>24 h since the last
+   *  one) unless force is set — there is no background service, so
+   *  the DSH shell calls this at session start. Decay, compression,
+   *  promotion and new-edge linking happen here; the starmap is
+   *  regenerated afterwards so the picture always matches the data.
+   *  Returns null when skipped as not due. Never writes MEMORY.md.
+   *
+   *  The due-gate is checked TWICE: once before the lock (cheap
+   *  skip) and once inside the lock. Two processes starting at the
+   *  same moment both see "due" before the lock; without the
+   *  in-lock re-check both would run the review (TOCTOU) and the
+   *  day's work — decay, compression, promotion — would happen
+   *  twice. */
+  review(force = false, now = Date.now()): ReviewResult | null {
+    const state = loadReviewState(this.dataDir);
+    if (!force && state.lastReviewedAt !== null && now - state.lastReviewedAt < REVIEW_INTERVAL_MS) {
+      return null;
+    }
+    const result = this.withWriteLock(() => {
+      this.refreshIfStale();
+      if (!force) {
+        const fresh = loadReviewState(this.dataDir);
+        if (fresh.lastReviewedAt !== null && now - fresh.lastReviewedAt < REVIEW_INTERVAL_MS) {
+          return null;
+        }
+      }
+      const r = runReview({
+        dataDir: this.dataDir,
+        entries: this.entries,
+        graph: this.graph,
+        attrs: this.attrs,
+        index: this.index,
+        fragments: this.fragments.all(),
+        now,
+      });
+      // review.json was written by runReview; the in-memory
+      // summaries cache picks up any new compressed lines.
+      this.summaries = loadSummaries(this.dataDir);
+      return r;
+    });
+    if (result === null) return null;
+    // Regenerate the starmap outside the lock (read-only render).
+    this.generateStarmap();
+    return result;
+  }
+
+  /** 0.3.1 (拾光): regenerate starmap.html from the current graph +
+   *  attributes + log. Derived artifact — excluded from snapshots,
+   *  regenerated on review and on demand (memory_starmap tool). */
+  generateStarmap(): StarmapResult {
+    const data = buildStarmapData(
+      this.entries,
+      this.graph.allEdges(),
+      this.attrs.all(),
+      Date.now(),
+      this.fragments.all(),
+    );
+    const html = renderStarmapHtml(data);
+    atomicWriteText(join(this.dataDir, STARMAP_FILE), html);
+    return {
+      path: join(this.dataDir, STARMAP_FILE),
+      nodes: data.memories.length,
+      edges: data.edges.length,
+      generatedAt: Date.now(),
+    };
+  }
+
   stats(): CoreStats {
     return {
       totalEntries: this.entries.length,
@@ -519,6 +834,13 @@ export class MemoryCore {
       archiveMonths: this.memoryFile.listArchiveMonths(),
       indexTokens: this.index.size,
       snapshots: this.listSnapshots(),
+      // 0.2.0
+      graphEdges: this.graph.size,
+      attributes: this.attrs.size,
+      lastReviewAt: loadReviewState(this.dataDir).lastReviewedAt,
+      // 0.3.0
+      fragments: this.fragments.size,
+      suspectFragments: this.fragments.suspectCount,
     };
   }
 }

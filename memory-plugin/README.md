@@ -23,7 +23,7 @@ asking her to go look.
 
 ## Requirements
 
-- DSH `>=0.2.0 <0.3.0` (verified on 0.2.1-rc.5).
+- DSH `0.2.1-rc.5 || >=0.2.0 <0.3.0` (verified on 0.2.1-rc.5).
 - Node `^22.19.0 || >=24.0.0`.
 - No build step: the plugin runs TypeScript directly (erasable syntax
   only), so a GitHub install works without `tsc` or `prepare`.
@@ -37,7 +37,7 @@ install the `dsh-plugin/` folder alone.
 ### Option A — one line (DSH plugin command)
 
 ```sh
-dsh plugin --profile <name> add github:lhcxn7/xianingqi-plugin#v0.1.6&path:/memory-plugin/dsh-plugin
+dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v0.3.0&path:/memory-plugin/dsh-plugin"
 ```
 
 Replace `<name>` with your DSH profile name (often `web` or
@@ -60,15 +60,13 @@ Paste this into your own DSH agent and let it do the work. It installs
 the plugin; you restart DSH by hand afterwards.
 
 > 帮我装一个 DSH 记忆插件：从 GitHub 把 lhcxn7/xianingqi-plugin
-> 这个仓库的 v0.1.6 版装进来（我的 profile 是 <你的 profile 名>）。
+> 这个仓库的 v0.3.0 版装进来（我的 profile 是 <你的 profile 名>）。
 > 插件在仓库的 memory-plugin/dsh-plugin 子目录，core 在 memory-plugin/core 目录，两个目录
 > 必须在一起，装的时候别只拷 dsh-plugin 一个目录。装完告诉我
 > 结果，报错原文发我；装好后我自己重启 DSH。我的记忆数据文件夹
 > 在 <你的记忆数据文件夹路径>，帮我把插件的 dataDir 指到它
 > （插件配置或环境变量 MEMORY_PLUGIN_DATA_DIR），不要用默认路
-> 径，也不要新建空文件夹。我的记忆数据文件夹在 <你的记忆数据文件夹路径>，帮我把
-> 插件的 dataDir 指到它（插件配置或环境变量
-> MEMORY_PLUGIN_DATA_DIR），不要用默认路径，也不要新建空文件夹。
+> 径，也不要新建空文件夹。
 
 ## Config
 
@@ -108,8 +106,9 @@ memory-plugin/
                         # recall, MemoryCore
     test/demo.ts        # end-to-end demo/test on sample data (temp dir)
   dsh-plugin/           # DSH shell: hooks + systemPrompt injection +
-                        # memory_search/memory_remember/memory_snapshot/
-                        # memory_restore/memory_status tools
+                        # memory_search/memory_remember/memory_fragment/
+                        # memory_snapshot/memory_restore/memory_status/
+                        # memory_starmap tools
     src/                # apply(ctx), trigger-based session tracking
     test/mock-test.ts   # mock-DSH test, no real DSH needed
   mcp-server/           # DEFERRED (DSH first, per user decision)
@@ -198,6 +197,117 @@ memory-plugin/
       https://github.com/lhcxn7/xianingqi-plugin, tag v0.1.6
       (branch stand-in until a real tag is made); GitHub install
       still to be verified from a clean profile once the repo exists.
+- [x] Lock TOCTOU race fix + dedupe remainder rule + packaged
+      privacy guard (0.1.7, 2026-11-07) — the lock was redesigned
+      around an arbiter: every operation on the canonical lock dir
+      (`<dataDir>/.locks/write.lock`) runs under a separate arbiter
+      lock (`<dataDir>/.locks/arbiter.lock`, atomic mkdir), and the
+      canonical dir is NEVER moved (earlier claim-and-verify renames
+      opened a window in which a third process could take the path
+      while it was renamed away). Stale locks are reclaimed by rmSync
+      under the arbiter, releases delete only on an in-place token
+      match. The arbiter release deletes in place only on a token
+      match — a mismatch (or a gone dir) means it is not ours, so it
+      is left alone; there is no rename and no retry. The orphan race
+      of the rename design (a breaker moving the dir while its holder
+      releases it) cannot happen under NO-RENAME. Multi-process mutex test (3 outer rounds x 4 workers x
+      15 rounds, START/END log never overlapping) proves at most one
+      holder. Recall dedupe now drops a log hit only when the remainder after
+      removing the matched MEMORY.md fact is < 10 chars, so a log
+      turn holding a known fact PLUS a new fact survives. The
+      shipped-tree privacy guard now falls back to a shipped SAMPLE
+      blocklist (fake entries only) when the private blocklist is
+      absent, and asserts the guard actually executed (plus a
+      negative control that plants a blocklisted term and expects
+      it flagged) — a packaged copy can no longer "pass" by
+      skipping the check.
+- [x] 片段层 (0.3.0, 2026-11-07) — fragments on top of the
+      verbatim log (core/src/fragments.ts, fragments.json): the log
+      stays the ground-truth base, verbatim, one line per message,
+      never edited, with NO tone in it; a fragment is a short
+      model-written summary (~10 tokens) with mandatory provenance
+      (sourceIds), a free-form tone tag in the model's own words
+      (e.g. 很喜欢 / 嘴上嫌弃心里喜欢 — NOT a fixed list), 1–2
+      verbatim quotes copied from the source, topic/keywords, and a
+      verified flag. Fragments are the visible stars in the star
+      map (one fragment = one star; clicking shows its text + tone
+      + the source log entries); log entries with no fragment yet
+      still appear as stars. Created through the new
+      `memory_fragment` tool (persona windows only) or proposed as
+      clusters by the daily review — both paths share the same code
+      verification, which runs at creation AND at retrieval: the
+      fragment's key terms and quotes must appear in the source
+      entries' text, and a KNOWN tone tag must be within 1 level of
+      the sources' attitude markers. A fragment that fails at
+      creation is REJECTED (nothing saved, reasons returned); a
+      fragment that fails at retrieval falls back to the verbatim
+      source log entry and is marked suspect (never silently
+      deleted — the next review can fix or drop it). Recall injects
+      the fragment text (with its tone tag) instead of the full
+      originals — one fragment injected once even when several of
+      its sources surface — so injection costs ~10 tokens per memory
+      instead of ~100; the 1500-token cap and the 心光 valve (top 5,
+      max 2/topic) are unchanged. Fragments are snapshotted with the
+      log (fragments.json is plugin-owned). Honest limit: code
+      checks catch gross fabrication (a "粉色筷子" the source never
+      mentions) and clear tone mismatches ("很喜欢酸梅湯" from
+      "酸梅湯还行吧，也就那样"), but subtle tone — a fragment that
+      paraphrases without using any lexicon word, or a free-form tone
+      the lexicon cannot place — can still slip through; the tone
+      check is skipped, never failed, for an unlisted tone word.
+      Verification is a safety net, not a guarantee; the iron rule
+      （只记真实对话不许编） is enforced by provenance +
+      verification, not by trust. 核对是按字面逐字比对的：片段必须
+      用来源原文里的字（湯/汤算两个字），对不上时拒绝原因会点名缺
+      了哪个词，模型照着改就行。 Free-form tagging (0.3.0 design
+      update): emotion and tone are the model's own words — the
+      `memory_remember` emotion param and the `memory_fragment` tone
+      param explicitly invite any mood the model perceives (委屈/
+      傲娇/吃醋/害羞/无奈/宠溺/期待/忐忑/别扭/赌气/窝心/失落/心动/
+      安心/澎湃 …), not a fixed list; the emotion lexicon
+      (attributes.ts) was deliberately NOT expanded — it stays a
+      coarse fallback that only fires when the model is silent, and
+      the tone lexicon likewise stays a verification vocabulary, not
+      a vocabulary list. Downstream handles arbitrary words: the
+      activation emotion factor tries an exact type match, then a
+      coarse polarity match (same polarity 0.7, opposite 0.2, unknown
+      or explicitly neutral polarity 0.5), and the starmap colours unknown types by
+      polarity (positive gold, negative blue) or the neutral default
+      — an unknown word still renders a star, never nothing.
+- [x] 识海升级 (0.2.0, 2026-11-07) — six new things on top of 0.1.7:
+      graph (core/src/graph.ts, graph.json: nodes are log entries,
+      three edge kinds — same-session adjacency, shared rare keyword
+      df≤5, recall co-occurrence; weight +0.05 on traversal capped
+      1.0, review decay ×0.95 floored 0.1; recall climbs 1–2 hops
+      over keyword + recall edges only, never session edges);
+      attributes (core/src/attributes.ts, attributes.json: per-memory
+      emotion+intensity, clarity, recall count, significance,
+      computed retrievability — emotion model-tagged via
+      memory_remember, keyword-lexicon fallback);
+      activation (core/src/activation.ts: five-factor product —
+      content × relationship × emotion × time × attention — a gate
+      only, ranking still uses the old score);
+      心光 valve (recall.ts: threshold 0.02 before the token cap,
+      per-topic max 2 + top 5 after it, explicit limit disables it);
+      daily review (core/src/review.ts, review.json: runs at session
+      start when >24 h since the last one — decay, compress light old
+      memories to summary-YYYY-MM.jsonl, promote often-recalled ones,
+      backfill edges, regenerate the starmap; only while DSH is open,
+      no background service; runs only for a session already known
+      to be persona — a brand-new persona session gets its first
+      review on its next open);
+      思维星空海 (core/src/starmap.ts, starmap.html: local 拾光
+      star map — memories as stars on two spiral arms, click a
+      star for its detail panel; no search, no time-flow slider,
+      no 常用词 field). Known limits: real-DSH verification is
+      mock-only so far (review on session start, starmap generation,
+      pre-step envelope fields); still keyword-only, no vector /
+      semantic search; review runs only while DSH is open. Deep audit
+      of the first 0.2.0 build found 6 Major + 9 Minor, no Blocker;
+      all fixed except m6/m7 (design tradeoffs: memory_search returns
+      full text of compressed entries by design; record() writes
+      graph.json + attributes.json on every call by design), each with
+      a regression test (core demo 117 PASS, mock 105 PASS).
 - [ ] MCP server shell — deferred.
 
 ## Guarantees that hold
@@ -210,7 +320,8 @@ memory-plugin/
   three-layer summaries per the skill). Memory entries are never
   deleted: log rollover moves entries into segments, snapshots keep
   dated copies of the plugin's own files only (log + index +
-  segments + persona-sessions.json — never MEMORY.md, monthly
+  segments + persona-sessions.json + graph.json + attributes.json +
+  review.json + fragments.json — never MEMORY.md, monthly
   archives or the diary), restore snapshots first and only replaces
   files present in the snapshot. Snapshots themselves rotate (default
   keep=30) — that rotation deletes old snapshot *copies*, not memory

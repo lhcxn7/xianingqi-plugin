@@ -7,7 +7,18 @@
 //   M7) and its turn-1 appended ids (restored from appended-ids.json,
 //   0.1.4 minor 1 — without them the next turn would re-register the
 //   same hits as context), and the old session's dynamic context is
-//   disposed first.
+//   disposed first. 0.2.0: also runs the daily review once here, but
+//   ONLY for a session already known to be persona (restored from
+//   the persisted set, review-9 m-6 — a fresh session cannot be told
+//   apart from a task session yet, so it gets its first review on
+//   its next open). core.review(), 24 h gate inside, never forced —
+//   a review failure is caught and warned, never breaks the session.
+// - agent/pre-step (awaited waterfall, {prepend:true}): run keyword
+//   recall on the incoming user message(s), PERSONA windows only;
+//   0.2.0: recall gets the session id (recall-link tracking +
+//   relationship factor) and the session's last 5 user texts
+//   (attention factor); the recent-texts list is updated AFTER the
+//   recall, so the current turn never attends to itself.
 // - agent/pre-step (awaited waterfall, {prepend:true}): run keyword
 //   recall on the incoming user message(s), PERSONA windows only;
 //   turn 1 appends the recall to decision.messages (the only seam
@@ -32,8 +43,16 @@
 // - ctx.effect disposer: endSession() — snapshot + rollover + flush
 //   (audit M5/M12; before 0.1.3 endSession existed but nothing ever
 //   called it, so the "snapshot protection" never ran).
-// - memory_search / memory_remember / memory_snapshot /
-//   memory_restore / memory_status tools (fallback for the model).
+// - memory_search / memory_remember / memory_fragment /
+//   memory_snapshot / memory_restore / memory_status /
+//   memory_starmap / memory_daily_review tools (fallback for the
+//   model). memory_remember takes an optional emotion ("温暖" or
+//   "温暖:0.7"); memory_fragment creates a fragment on top of the
+//   log (0.3.0, code-verified against its sources);
+//   memory_daily_review submits the daily model review's picks
+//   (0.3.0, new layer 2); memory_starmap regenerates starmap.html
+//   on demand. Write tools are gated to persona windows like
+//   the rest.
 //   Tool parameters are compiled to real JSON Schema locally when
 //   @deepseek-ai/dsh-tools does not resolve (audit M2 — it never
 //   resolves in a link: install) and self-checked after register.
@@ -89,11 +108,16 @@
 // Persona vs task windows: the plugin uses the skill's own trigger — a
 // session becomes a persona session when a user message in it contains
 // 夏柠柒 / 柠柒 (configurable via triggerWords). Task windows never
-// trigger, so their messages are never recorded. Known limitation: a
-// task-window message that happens to contain the trigger is recorded
-// too — the same ambiguity the skill itself has. By design, messages
-// sent BEFORE the first trigger word in a session never enter the
-// log: the plugin only knows a session is a persona window once the
+// trigger, so their messages are never recorded. 0.3.1: a user message
+// that contains the trigger AND a task-blocklist word (TASK_BLOCKLIST:
+// technical words like GitHub / SKILL.md / 插件, or task-action words
+// like 更新 / 安装 / 升级) does NOT mark the session — the task
+// instruction is recognised as a task, not a chat. Once marked, a
+// session stays persona for its whole lifetime (one-way latch); the
+// blocklist only gates the marking, never un-marks a session and never
+// filters individual messages out of the verbatim log. By design,
+// messages sent BEFORE the first trigger word in a session never enter
+// the log: the plugin only knows a session is a persona window once the
 // trigger appears (audit m15 — the skill's own MEMORY.md summary may
 // still retain them, the verbatim log does not).
 
@@ -103,11 +127,19 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   MemoryCore,
+  MODEL_REVIEW_CATEGORIES,
   atomicWriteText,
+  buildModelReviewPrompt,
   formatLayer1,
   formatRecallBlock,
+  parseModelReviewIds,
 } from "../../core/src/index.ts";
-import type { RecallResult } from "../../core/src/index.ts";
+import type {
+  FragmentCandidate,
+  MemoryEntry,
+  RecallResult,
+  ReviewResult,
+} from "../../core/src/index.ts";
 import { isObjectSchema, loadDefineTool } from "./define-tool.ts";
 import type {
   MemoryPluginConfig,
@@ -123,11 +155,147 @@ export const inject = ["tools", "systemPrompt"];
 export const DEFAULT_TRIGGER_WORDS = ["夏柠柒", "柠柒"];
 export const DEFAULT_TOKEN_CAP = 1500;
 
+/** 0.3.0: substrings marking a mid-turn user message as explicitly
+ *  reaching for the past — condition (a) of the restrained
+ *  mid-conversation recall trigger. Small and literal by design:
+ *  the recall's own keyword match is the second filter, so a cue
+ *  with no matching memory injects nothing. Configurable via
+ *  MemoryPluginConfig.memoryCueWords. */
+export const DEFAULT_MEMORY_CUE_WORDS = [
+  "还记得",
+  "还记不记得",
+  "你说过",
+  "以前",
+  "那次",
+  "那家",
+  "我们去过",
+  "当时",
+  "那时候",
+  "之前",
+  "曾经",
+];
+
 export function isPersonaTrigger(
   text: string,
   triggerWords: string[] = DEFAULT_TRIGGER_WORDS,
 ): boolean {
   return triggerWords.some((w) => w.length > 0 && text.includes(w));
+}
+
+/** 0.3.1: substrings that mark a user message as a TASK instruction
+ *  rather than a persona chat, even when it also contains the
+ *  trigger. Two groups: technical words (almost never spoken in a
+ *  persona chat) and task-action words (the verbs of task
+ *  instructions). Checked only against USER messages, only for the
+ *  persona-marking decision — DSH/assistant output never triggers
+ *  marking and is never checked against this list, and once a
+ *  session is marked persona it stays persona (one-way latch);
+ *  the blocklist never un-marks a session and never filters
+ *  individual messages out of the verbatim log (the log stays
+ *  complete — a gap would break fragment verification and the
+ *  daily review). Substring match, same as the trigger itself. */
+export const TASK_BLOCKLIST: string[] = [
+  // Technical words — almost never in a persona chat.
+  "GitHub",
+  "github",
+  "dsh plugin",
+  "memory-plugin",
+  "SKILL.md",
+  "dataDir",
+  "log.jsonl",
+  "agentPreset",
+  "preset",
+  "cordis",
+  "commit",
+  "push",
+  "分支",
+  "仓库",
+  "v0.",
+  "profile",
+  "记忆插件",
+  "代码",
+  "命令",
+  "路径",
+  // Task-action words — the verbs of task instructions.
+  "更新",
+  "安装",
+  "覆盖",
+  "下载",
+  "报错",
+  "重启",
+  "配置",
+  "打包",
+  "审查",
+  "推送",
+  "修改",
+  "测试",
+  "版本",
+  "skill",
+  "插件",
+  "升级",
+  "修复",
+  "优化",
+  "发布",
+  "部署",
+  "构建",
+  "备份",
+  "删除",
+  "导入",
+  "导出",
+  "创建",
+  "同步",
+];
+
+/** 0.3.1: true when the text contains any task-blocklist word. */
+export function hasTaskBlocklistWord(
+  text: string,
+  blocklist: string[] = TASK_BLOCKLIST,
+): boolean {
+  return blocklist.some((w) => w.length > 0 && text.includes(w));
+}
+
+/** 0.3.1: the persona-marking gate — true when the user message
+ *  carries the trigger AND no task-blocklist word. A task
+ *  instruction that mentions her name ("帮我把夏柠柒的 skill
+ *  更新一下") does not mark the session; a plain address
+ *  ("夏柠柒，在吗") does. */
+export function shouldMarkPersona(
+  text: string,
+  triggerWords: string[] = DEFAULT_TRIGGER_WORDS,
+  blocklist: string[] = TASK_BLOCKLIST,
+): boolean {
+  return (
+    isPersonaTrigger(text, triggerWords) &&
+    !hasTaskBlocklistWord(text, blocklist)
+  );
+}
+
+/** 0.3.0: true when the text explicitly reaches for the past
+ *  (contains one of the memory-cue substrings). */
+export function hasMemoryCue(
+  text: string,
+  cueWords: string[] = DEFAULT_MEMORY_CUE_WORDS,
+): boolean {
+  return cueWords.some((w) => w.length > 0 && text.includes(w));
+}
+
+/** 0.2.0: parse a model-supplied emotion tag for memory_remember:
+ *  "温暖" or "温暖:0.7" (full-width ： also accepted) into
+ *  {type, intensity}. Anything unparseable returns undefined and the
+ *  caller treats it as "not passed" — the core's keyword lexicon
+ *  guesses instead. Intensity is clamped to 0..1. */
+export function parseEmotion(
+  raw: unknown,
+): { type: string; intensity: number } | undefined {
+  if (typeof raw !== "string") return undefined;
+  const s = raw.trim().replace(/：/g, ":");
+  if (!s) return undefined;
+  const idx = s.lastIndexOf(":");
+  if (idx === -1) return { type: s, intensity: 0.5 };
+  const type = s.slice(0, idx).trim();
+  const n = Number(s.slice(idx + 1).trim());
+  if (!type || !Number.isFinite(n)) return undefined;
+  return { type, intensity: Math.min(1, Math.max(0, n)) };
 }
 
 function resolveDataDir(config?: MemoryPluginConfig): string {
@@ -287,6 +455,26 @@ interface SessionState {
    *  there, so those hits are never re-registered as context
    *  (audit m16). */
   appendedIds: Set<string>;
+  /** 0.2.0: this session's most recent user texts (max 5), fed to
+   *  recall as recentTexts for the attention factor. Updated AFTER
+   *  each recall, so the current turn never attends to itself.
+   *  In-memory only — a rebuilt session starts empty. */
+  recentUserTexts: string[];
+  /** 0.3.0 daily model review: set at agent/created when the code
+   *  review ran (restored persona, >24h — the m-6 gate); the first
+   *  pre-step after that hands yesterday's messages to the model
+   *  and marks it done, so it happens once per session-open. */
+  modelReviewDue: boolean;
+  modelReviewDone: boolean;
+  /** M-1 (review-12): fragment candidates from the code review that
+   *  just ran at agent/created (persona entries only — review.ts
+   *  filters task windows). Handed to the model with yesterday's
+   *  messages on the first pre-step, then cleared. In-memory only. */
+  modelReviewCandidates: FragmentCandidate[] | null;
+  /** Disposer for the daily-review dynamic context (per-session,
+   *  like the recall disposer). Cleared when the model submits
+   *  the review (memory_daily_review) or the session rebuilds. */
+  reviewDisposer: (() => void) | null;
 }
 
 // Persona-session ids, persisted in the data dir so a rebuilt session
@@ -319,6 +507,8 @@ export function apply(
   const dataDir = resolveDataDir(config);
   const tokenCap = config?.tokenCap ?? DEFAULT_TOKEN_CAP;
   const triggerWords = config?.triggerWords ?? DEFAULT_TRIGGER_WORDS;
+  const memoryCueWords =
+    config?.memoryCueWords ?? DEFAULT_MEMORY_CUE_WORDS;
 
   // Warn once per distinct problem (not on every event).
   const warned = new Set<string>();
@@ -477,7 +667,17 @@ export function apply(
   const getSession = (id: string): SessionState => {
     let s = sessions.get(id);
     if (!s) {
-      s = { persona: false, turns: 0, disposer: null, appendedIds: new Set() };
+      s = {
+        persona: false,
+        turns: 0,
+        disposer: null,
+        appendedIds: new Set(),
+        recentUserTexts: [],
+        modelReviewDue: false,
+        modelReviewDone: false,
+        modelReviewCandidates: null,
+        reviewDisposer: null,
+      };
       sessions.set(id, s);
     }
     return s;
@@ -496,6 +696,27 @@ export function apply(
    *  the gate prefers exec.agent.session.id, the calling session's
    *  own id, and uses this only when exec carries no agent. */
   let currentTurnSessionId: string | null = null;
+
+  /** Persona gate shared by the write tools (audit M4, 0.2.0):
+   *  the calling session's OWN id comes from
+   *  exec.agent.session.id (dsh-tools calls tool.execute(
+   *  exec.arguments, exec)); the most recent pre-step session is
+   *  only a fallback when exec carries no agent. A task-window call
+   *  is refused, not recorded — the v1.6 "task windows never write
+   *  memory" rule holds on the plugin's own write paths too. */
+  const toolSession = (
+    exec?: unknown,
+  ): { sid: string | null; persona: boolean } => {
+    const execSid = (
+      exec as { agent?: { session?: { id?: unknown } } } | undefined
+    )?.agent?.session?.id;
+    const sid =
+      execSid !== undefined && execSid !== null && `${execSid}`.length > 0
+        ? `${execSid}`
+        : currentTurnSessionId;
+    const current = sid !== null ? sessions.get(sid) : undefined;
+    return { sid, persona: current?.persona === true };
+  };
 
   // Stable directives: facts only, no stage judgments. Duplicate
   // registration (plugin applied twice in one process, e.g. two
@@ -568,6 +789,64 @@ export function apply(
     );
   };
 
+  // 0.3.0 daily model review: hand yesterday's messages to the
+  // model (as Xia) on the first turn after a due code review, so
+  // she can pick the important ones with memory_daily_review.
+  // Per-session context, like the recall context — and like it,
+  // never the global layer: yesterday's messages must not leak
+  // into every other window. When agent.ctx is unavailable the
+  // review is skipped (one warn), never forced onto the global
+  // layer. No entries yesterday means nothing to review.
+  const registerModelReview = (
+    sid: string,
+    agentCtx?: { systemPrompt?: SystemPromptRegistry },
+  ): void => {
+    let entries: MemoryEntry[];
+    try {
+      entries = core.yesterdayEntries();
+    } catch (err) {
+      warnOnce(
+        "model-review-read-failed",
+        `昨日记忆读取失败，本次跳过模型复盘（${err instanceof Error ? err.message : String(err)}）。`,
+      );
+      return;
+    }
+    if (entries.length === 0) return;
+    if (!agentCtx?.systemPrompt) {
+      warnOnce(
+        "model-review-no-agent-ctx",
+        "没有 agent.ctx，本次跳过模型复盘（昨日记忆不进全局上下文）。",
+      );
+      return;
+    }
+    const session = getSession(sid);
+    // M-1 (review-12): candidates captured at agent/created travel
+    // with the review context; consumed once here, then cleared.
+    const candidates = session.modelReviewCandidates ?? [];
+    session.modelReviewCandidates = null;
+    try {
+      session.reviewDisposer?.();
+    } catch {
+      // Disposer failures must not break the turn.
+    }
+    session.reviewDisposer = null;
+    try {
+      const handle = agentCtx.systemPrompt.context({
+        name: "memory-plugin:daily-review",
+        order: 500,
+        text: buildModelReviewPrompt(entries, candidates),
+      });
+      if (typeof handle === "function") {
+        session.reviewDisposer = handle as () => void;
+      }
+    } catch (err) {
+      warnOnce(
+        "model-review-context-failed",
+        `模型复盘上下文注册失败（${err instanceof Error ? err.message : String(err)}），本次跳过模型复盘。`,
+      );
+    }
+  };
+
   // Session start: only tracked here; the memory read that turn 1
   // depends on happens in agent/pre-step (awaited). A rebuilt
   // persona session keeps its flag (audit M7) — never reset
@@ -582,6 +861,13 @@ export function apply(
     if (old?.disposer) {
       try {
         old.disposer();
+      } catch {
+        // Disposer failures must not break session tracking.
+      }
+    }
+    if (old?.reviewDisposer) {
+      try {
+        old.reviewDisposer();
       } catch {
         // Disposer failures must not break session tracking.
       }
@@ -603,14 +889,64 @@ export function apply(
       turns: restored ? 1 : 0,
       disposer: null,
       appendedIds,
+      recentUserTexts: [],
+      modelReviewDue: false,
+      modelReviewDone: false,
+      modelReviewCandidates: null,
+      reviewDisposer: null,
     });
+    // 0.2.0: daily review at session start — ONLY for a session
+    // already known to be persona (restored from the persisted
+    // set, review-9 m-6). At agent/created a fresh session has
+    // said no trigger word yet, so it cannot be told apart from a
+    // task session: running the review here would write
+    // attributes.json / graph.json / review.json / summary-*.jsonl
+    // / starmap.html for task agents too, contradicting "task
+    // windows read-only" and slowing session start. A brand-new
+    // persona session gets its first review on its next open (when
+    // it is restored as persona). core.review() is NOT forced — it
+    // returns null when the last review was under 24 h ago, and
+    // runs decay / promotion / compression / edge backfill +
+    // starmap regeneration when due. There is no background
+    // service, so this is the only moment review can run. A review
+    // failure must NEVER break the session: one warn line, nothing
+    // else — the session, the log and recall are all unaffected.
+    // 0.3.0: when the code review runs, the daily MODEL review is
+    // due too — the flag is picked up on the session's first
+    // pre-step, which hands yesterday's messages to the model (as
+    // Xia) for her own importance judgment. Same trigger, same
+    // timing, no new schedule.
+    if (restored) {
+      let reviewResult: ReviewResult | null = null;
+      try {
+        reviewResult = core.review();
+      } catch (err) {
+        warnOnce(
+          "review-failed",
+          `每日复盘失败，本次跳过（${err instanceof Error ? err.message : String(err)}），记忆本身不受影响，下次打开 DSH 时再试。`,
+        );
+      }
+      if (reviewResult !== null) {
+        const state = sessions.get(id);
+        if (state) {
+          state.modelReviewDue = true;
+          // M-1 (review-12): the review's fragment candidates were
+          // computed and then discarded (only a boolean was kept),
+          // so the model could never see them. Keep them on the
+          // session; the first pre-step hands them to the model with
+          // yesterday's messages (buildModelReviewPrompt).
+          state.modelReviewCandidates =
+            reviewResult.fragmentCandidates ?? [];
+        }
+      }
+    }
   });
 
   // Per-turn recall + injection (awaited waterfall). Persona windows
   // only; task windows get no recall injection at all.
   ctx.on(
     "agent/pre-step",
-    async (ev, next) => {
+    async (ev, next: () => unknown) => {
       const decision = ev as PreStepDecision;
       const userTexts = allUserTexts(decision);
       // No user text in this pre-step: it is not a real turn — do not
@@ -642,26 +978,85 @@ export function apply(
       const session = getSession(sid);
       currentTurnSessionId = sid;
       session.turns += 1;
-      if (userTexts.some((t) => isPersonaTrigger(t, triggerWords))) {
+      if (userTexts.some((t) => shouldMarkPersona(t, triggerWords))) {
         markPersona(sid);
       }
       if (!session.persona) {
         if (next) return next();
         return;
       }
+      // 0.3.0 daily model review: on the first turn after a due
+      // code review, hand yesterday's messages to the model. Once
+      // per session-open — the flag is set at agent/created (only
+      // for a restored persona session) and consumed here, so a
+      // fresh session never gets it (m-6) and a later turn never
+      // re-registers it. The review context is separate from the
+      // recall context below; the model submits via
+      // memory_daily_review, which disposes it.
+      if (session.modelReviewDue && !session.modelReviewDone) {
+        session.modelReviewDone = true;
+        registerModelReview(sid, agentCtx);
+      }
       // Recall failure degrades to "no injection this turn", never
       // kills the turn (audit M6 — same waterfall mechanics as the
-      // 0.1.1 decision.kind crash).
-      let result: RecallResult;
-      try {
-        result = core.recall(userTexts.join("\n"), { tokenCap });
-      } catch (err) {
-        warnOnce(
-          "recall-failed",
-          `本轮 recall 失败，不注入（${err instanceof Error ? err.message : String(err)}），对话继续。`,
+      // 0.1.1 decision.kind crash). 0.2.0: recall gets the session id
+      // (recall-link tracking + relationship factor) and the
+      // session's recent user texts (attention factor).
+      //
+      // 0.3.0 restrained mid-turn trigger: turn 1 is the
+      // session-start recall and is UNCHANGED. From turn 2 on, recall
+      // runs ONLY when the user is explicitly reaching for the past
+      // (a memory-cue substring in the message) or the words touch
+      // a high-significance memory (significance >= 0.8 in the
+      // index). Otherwise nothing is injected this turn and the
+      // conversation stays in the present — an ordinary message
+      // that merely shares a keyword with a light memory must not
+      // drag the past into the turn. When the gate opens, the recall
+      // is the same call as turn 1 (same token cap, same valve:
+      // top 5, max 2/topic) — no extra number or token cap is added
+      // here; the recall selects, and the model decides how many of
+      // the injected memories to actually mention. A gate failure
+      // degrades to "no injection", never kills the turn.
+      const query = userTexts.join("\n");
+      let skipRecall = false;
+      if (session.turns > 1) {
+        const wantsMemory = userTexts.some((t) =>
+          hasMemoryCue(t, memoryCueWords),
         );
-        result = { hits: [], layer1: null, estimatedTokens: 0, text: "" };
+        let heavyMatch = false;
+        if (!wantsMemory) {
+          try {
+            heavyMatch = core.hasHighSignificanceMatch(query);
+          } catch (err) {
+            warnOnce(
+              "midturn-gate-failed",
+              `中途触发判断失败，本轮不注入（${err instanceof Error ? err.message : String(err)}），对话继续。`,
+            );
+          }
+        }
+        skipRecall = !wantsMemory && !heavyMatch;
       }
+      let result: RecallResult;
+      if (skipRecall) {
+        result = { hits: [], layer1: null, estimatedTokens: 0, text: "" };
+      } else {
+        try {
+          result = core.recall(query, {
+            tokenCap,
+            sessionId: sid,
+            recentTexts: session.recentUserTexts,
+          });
+        } catch (err) {
+          warnOnce(
+            "recall-failed",
+            `本轮 recall 失败，不注入（${err instanceof Error ? err.message : String(err)}），对话继续。`,
+          );
+          result = { hits: [], layer1: null, estimatedTokens: 0, text: "" };
+        }
+      }
+      // Update the recent-texts list AFTER the recall: the current
+      // turn's own words must not feed its own attention factor.
+      session.recentUserTexts = [...session.recentUserTexts, ...userTexts].slice(-5);
       if (result.hits.length > 0) {
         // Turn 1: append directly — a context registered during
         // pre-step would otherwise not reach the first request.
@@ -767,8 +1162,9 @@ export function apply(
       // which is BEFORE pre-step runs for that turn — so the persona
       // flag set by pre-step is not visible yet for the very first
       // trigger message. Detect the trigger here too, so turn 1 is
-      // recorded. (Same rule as pre-step: the skill's own trigger.)
-      if (isPersonaTrigger(text, triggerWords)) {
+      // recorded. (Same rule as pre-step: the skill's own trigger,
+      // gated by the 0.3.1 task blocklist.)
+      if (shouldMarkPersona(text, triggerWords)) {
         markPersona(sid);
       }
       if (!session.persona) return;
@@ -938,12 +1334,23 @@ export function apply(
             return {
               layer1: result.layer1 ? formatLayer1(result.layer1) : "",
               hits: result.hits.map((h) => ({
+                // M-1 (review-12): the hit MUST carry the log entry
+                // id — memory_fragment's sourceIds come from these
+                // hits ("见 memory_search 的 hits"), and without an
+                // id the model could never create a fragment from a
+                // searched entry. The id is the log's ts-counter-hash.
+                id: h.entry.id,
                 date: h.entry.date,
                 time: h.entry.time,
                 role: h.entry.role,
                 window: h.entry.window,
                 importance: h.entry.importance,
-                text: h.entry.text,
+                // 0.3.0: a fragment hit shows the fragment text
+                // (with its tone) instead of the full original.
+                text: h.displayText ?? h.entry.text,
+                fragmentId: h.fragmentId ?? "",
+                fragmentTone: h.fragmentTone ?? "",
+                fragmentFallback: h.fragmentFallback === true,
               })),
             };
           } catch (err) {
@@ -959,7 +1366,7 @@ export function apply(
       registerTool({
         name: "memory_remember",
         description:
-          "把一条值得长期保留的事实、约定或偏好记进本地记忆 (重要)。只在人设窗口可用：任务窗口调用会被拒绝。",
+          `把一条值得长期保留的事实、约定或偏好记进本地记忆 (重要)。只在人设窗口可用：任务窗口调用会被拒绝。重要是指符合这些情形的：${MODEL_REVIEW_CATEGORIES.join("、")}。`,
         parameters: {
           text: {
             type: "string",
@@ -970,6 +1377,12 @@ export function apply(
             type: "string",
             required: false,
             description: "heavy 或 light, 默认 heavy",
+          },
+          emotion: {
+            type: "string",
+            required: false,
+            description:
+              "可选情绪标签，用你自己的词写就行，不限固定列表：比如 “温暖”“委屈”“傲娇”“忐忑”“宠溺”，想打什么心情就打什么心情；可加 :强度（如 “温暖:0.7”，强度 0–1，默认 0.5）。解析失败时当没传，按关键词词表兜底",
           },
         },
         output: {
@@ -1007,17 +1420,8 @@ export function apply(
           // agent. A task-window call is refused, not recorded — the
           // v1.6 "task windows never write memory" rule holds on the
           // plugin's own write path too.
-          const execSid = (
-            exec as
-              | { agent?: { session?: { id?: unknown } } }
-              | undefined
-          )?.agent?.session?.id;
-          const sid =
-            execSid !== undefined && execSid !== null && `${execSid}`.length > 0
-              ? `${execSid}`
-              : currentTurnSessionId;
-          const current = sid !== null ? sessions.get(sid) : undefined;
-          if (!current?.persona) {
+          const { sid, persona } = toolSession(exec);
+          if (!persona) {
             return {
               ok: false,
               id: "",
@@ -1035,9 +1439,221 @@ export function apply(
                 (args as { importance?: unknown }).importance === "light"
                   ? "light"
                   : "heavy",
+              // 0.2.0: model-supplied emotion tag; unparseable means
+              // "not passed" — the core's keyword lexicon guesses.
+              emotion: parseEmotion(
+                (args as { emotion?: unknown } | null)?.emotion,
+              ),
               sessionId: sid as string,
             });
             return { ok: true, id: entry.id };
+          } catch (err) {
+            return {
+              ok: false,
+              id: "",
+              error: `写入失败：${err instanceof Error ? err.message : String(err)}`,
+            };
+          }
+        },
+      });
+
+      // 0.3.0: daily model review — the model submits yesterday's
+      // important memory ids (from the memory-plugin:daily-review
+      // context). The core raises them to significance 0.9 and
+      // flags them modelMarked (never compressed). Strict parse:
+      // an unparseable output is skipped entirely — no partial
+      // apply, no crash — and the review context stays so the
+      // model can retry; a parsed result (even empty) disposes it.
+      // Gated to persona windows like the other write tools.
+      registerTool({
+        name: "memory_daily_review",
+        description:
+          "提交昨日记忆复盘的结果：把你认为值得长期记住的记忆的 id 列表交回来，插件会把它们的重要度提到最高（0.9），以后永不压缩。只在人设窗口可用。id 只能用复盘上下文里给的昨日消息列表里的 id，不要编；没有重要的就传空列表。",
+        parameters: {
+          ids: {
+            type: "array",
+            items: { type: "string" },
+            required: true,
+            description: "昨日消息里你认为重要的记忆 id 列表（从复盘上下文里抄过来，不要编）；没有重要的就传 []",
+          },
+        },
+        output: {
+          schema: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              applied: { type: "array" },
+              unknown: { type: "array" },
+              error: { type: "string" },
+            },
+          },
+          render: (value: unknown) => [
+            { type: "text", text: JSON.stringify(value) },
+          ],
+        },
+        execute: async (args: unknown, exec?: unknown) => {
+          const { sid, persona } = toolSession(exec);
+          if (!persona) {
+            return {
+              ok: false,
+              applied: [],
+              unknown: [],
+              error:
+                "memory_daily_review 只在人设窗口可用：当前会话不是人设窗口，本次不应用复盘结果。",
+            };
+          }
+          const ids = parseModelReviewIds(args);
+          if (ids === null) {
+            warnOnce(
+              "model-review-unparseable",
+              "模型复盘结果解析失败，本次跳过（不应用任何条目），请按 id 的 JSON 列表重新提交。",
+            );
+            return {
+              ok: false,
+              applied: [],
+              unknown: [],
+              error: "复盘结果解析失败：请传 id 的 JSON 列表。",
+            };
+          }
+          // Parsed (even empty): the review is done — dispose the
+          // context so yesterday's messages leave the prompt.
+          if (sid !== null) {
+            const state = sessions.get(sid);
+            if (state) {
+              try {
+                state.reviewDisposer?.();
+              } catch {
+                // Disposer failures must not break the tool call.
+              }
+              state.reviewDisposer = null;
+            }
+          }
+          try {
+            const res = core.applyModelMarks(ids);
+            return {
+              ok: true,
+              applied: res.applied,
+              unknown: res.unknown,
+              error: "",
+            };
+          } catch (err) {
+            return {
+              ok: false,
+              applied: [],
+              unknown: [],
+              error: `应用失败：${err instanceof Error ? err.message : String(err)}`,
+            };
+          }
+        },
+      });
+
+      // 0.3.0: create a fragment on top of the verbatim log. The
+      // model writes the summary + tone + quotes; the core verifies
+      // them against the source entries (key terms + verbatim quotes
+      // + tone) and REJECTS the fragment when they do not match —
+      // nothing is saved, and the reasons come back so the model can
+      // fix it. Gated to persona windows like the other write tools.
+      registerTool({
+        name: "memory_fragment",
+        description:
+          "把几条原文提炼成一条短片段（约 10 token），存在 fragments.json 里：以后召回时优先注入片段而不是整段原文，省 token；星空图里片段就是一颗星。片段必须注明来源（sourceIds，必填）、带 1–2 句从原文逐字抄来的引用（quotes，必填），语气（tone）用你自己的词写就行，不限固定列表（比如 “很喜欢”“嘴上嫌弃心里喜欢”“有点喜欢但不太确定”，可加 :强度如 很喜欢:0.9）。插件会用代码逐字核对：正文关键词、引用、语气都必须和来源对得上，对不上就拒绝保存并告诉你原因——不要编来源里没有的词，不要改写引用，不要把语气写得比来源更重。",
+        parameters: {
+          sourceIds: {
+            type: "array",
+            items: { type: "string" },
+            required: true,
+            description: "来源原文的条目 id 列表（必填，至少 1 条，见 memory_search 的 hits 或星空图）",
+          },
+          text: {
+            type: "string",
+            required: true,
+            description: "片段正文，一句短总结，约 10 token（关键词必须用来源原文里的词）",
+          },
+          tone: {
+            type: "string",
+            required: true,
+            description: "对这个话题的态度，用你自己的词写，不限固定列表（如 很喜欢 / 嘴上嫌弃心里喜欢 / 有点喜欢但不太确定；可加 :强度，如 很喜欢:0.9）",
+          },
+          quotes: {
+            type: "array",
+            items: { type: "string" },
+            required: true,
+            description: "1–2 句从来源原文逐字抄来的短语（必填，不能改写），用来保住原文的语气",
+          },
+          topic: {
+            type: "string",
+            required: false,
+            description: "话题词，如 酸梅汤；不填时从正文里取",
+          },
+          keywords: {
+            type: "array",
+            items: { type: "string" },
+            required: false,
+            description: "关键词列表；不填时从正文里取",
+          },
+        },
+        output: {
+          schema: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              id: { type: "string" },
+              error: { type: "string" },
+              reasons: { type: "array" },
+            },
+          },
+          render: (value: unknown) => [
+            { type: "text", text: JSON.stringify(value) },
+          ],
+        },
+        execute: async (args: unknown, exec?: unknown) => {
+          const { persona } = toolSession(exec);
+          if (!persona) {
+            return {
+              ok: false,
+              id: "",
+              error:
+                "memory_fragment 只在人设窗口可用：当前会话不是人设窗口（没有触发夏柠柒/柠柒），本次不写记忆。",
+            };
+          }
+          const a = (args ?? {}) as {
+            sourceIds?: unknown;
+            text?: unknown;
+            tone?: unknown;
+            quotes?: unknown;
+            topic?: unknown;
+            keywords?: unknown;
+          };
+          const sourceIds = Array.isArray(a.sourceIds)
+            ? a.sourceIds.filter((x): x is string => typeof x === "string")
+            : [];
+          const text = typeof a.text === "string" ? a.text : "";
+          const tone = typeof a.tone === "string" ? a.tone : "";
+          const quotes = Array.isArray(a.quotes)
+            ? a.quotes.filter((x): x is string => typeof x === "string")
+            : [];
+          const topic = typeof a.topic === "string" ? a.topic : undefined;
+          const keywords = Array.isArray(a.keywords)
+            ? a.keywords.filter((x): x is string => typeof x === "string")
+            : undefined;
+          try {
+            const result = core.createFragment({
+              sourceIds,
+              text,
+              tone,
+              quotes,
+              topic,
+              keywords,
+            });
+            if (!result.ok || !result.fragment) {
+              return {
+                ok: false,
+                id: "",
+                error: "片段被拒绝，未保存。",
+                reasons: result.reasons,
+              };
+            }
+            return { ok: true, id: result.fragment.id };
           } catch (err) {
             return {
               ok: false,
@@ -1147,7 +1763,7 @@ export function apply(
       registerTool({
         name: "memory_status",
         description:
-          "返回本地记忆的统计：总条数、最近 30 天条数、归档月份、索引词数、快照列表。",
+          "返回本地记忆的统计：总条数、最近 30 天条数、归档月份、索引词数、快照列表、图边数、属性条数、上次复盘时间（0.2.0）、片段数与存疑片段数（0.3.0）。",
         parameters: {},
         output: {
           schema: {
@@ -1159,6 +1775,11 @@ export function apply(
               archiveMonths: { type: "array" },
               indexTokens: { type: "number" },
               snapshots: { type: "array" },
+              graphEdges: { type: "number" },
+              attributes: { type: "number" },
+              lastReviewAt: { type: "number" },
+              fragments: { type: "number" },
+              suspectFragments: { type: "number" },
               error: { type: "string" },
             },
           },
@@ -1173,6 +1794,61 @@ export function apply(
             return {
               ok: false,
               error: `读取失败：${err instanceof Error ? err.message : String(err)}`,
+            };
+          }
+        },
+      });
+
+      // 0.3.1 拾光: regenerate the starmap (拾光星海) on demand. The
+      // HTML is a derived artifact — generated from the current
+      // graph + attributes + log, local only, excluded from
+      // snapshots, and also regenerated automatically after every
+      // daily review. Gated to persona windows like the other write
+      // tools: a task window must not trigger a write into the data
+      // dir.
+      registerTool({
+        name: "memory_starmap",
+        description:
+          "重新生成拾光星海（starmap.html，本地 HTML：记忆是星星，点星看详情，共享关键词的星连成星座）。只在人设窗口可用：任务窗口调用会被拒绝。",
+        parameters: {},
+        output: {
+          schema: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              path: { type: "string" },
+              nodes: { type: "number" },
+              edges: { type: "number" },
+              generatedAt: { type: "number" },
+              error: { type: "string" },
+            },
+          },
+          render: (value: unknown) => [
+            { type: "text", text: JSON.stringify(value, null, 2) },
+          ],
+        },
+        execute: async (_args: unknown, exec?: unknown) => {
+          const { persona } = toolSession(exec);
+          if (!persona) {
+            return {
+              ok: false,
+              error:
+                "memory_starmap 只在人设窗口可用：当前会话不是人设窗口（没有触发夏柠柒/柠柒），本次不生成星空图。",
+            };
+          }
+          try {
+            const r = core.generateStarmap();
+            return {
+              ok: true,
+              path: r.path,
+              nodes: r.nodes,
+              edges: r.edges,
+              generatedAt: r.generatedAt,
+            };
+          } catch (err) {
+            return {
+              ok: false,
+              error: `生成失败：${err instanceof Error ? err.message : String(err)}`,
             };
           }
         },

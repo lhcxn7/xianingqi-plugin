@@ -85,6 +85,29 @@ export interface RecallHit {
   entry: MemoryEntry;
   score: number;
   matchedTokens: string[];
+  /** 0.2.0 five-factor activation (content x relationship x
+   *  emotion x time x attention). 0 when the valve is off. */
+  activation: number;
+  /** 0.2.0: true when this hit arrived via a graph edge, not a
+   *  keyword match. */
+  viaGraph?: boolean;
+  /** 0.2.0: rarest matched token (valve topic). Graph hits inherit
+   *  their seed's topic. */
+  topic: string;
+  /** 0.2.0: compressed one-line summary injected instead of the
+   *  full text (review compressed this entry). */
+  displayText?: string;
+  /** 0.2.0: this entry was compressed by review. */
+  compressed?: boolean;
+  /** 0.3.0: this hit injects a fragment instead of the full entry
+   *  text (the fragment is ~10 tokens vs ~100 for its sources). */
+  fragmentId?: string;
+  /** 0.3.0: the fragment's tone label, e.g. 很喜欢. */
+  fragmentTone?: string;
+  /** 0.3.0: true when this hit's fragment failed its retrieval-
+   *  time re-check — the injected text is the verbatim source
+   *  instead, and the fragment is marked suspect. */
+  fragmentFallback?: boolean;
 }
 
 export interface RecallResult {
@@ -120,4 +143,110 @@ export interface CoreStats {
   archiveMonths: string[];
   indexTokens: number;
   snapshots: string[];
+  /** 0.2.0: graph edges / stored attribute rows / last review time. */
+  graphEdges: number;
+  attributes: number;
+  lastReviewAt: number | null;
+  /** 0.3.0: stored fragments / fragments marked suspect. */
+  fragments: number;
+  suspectFragments: number;
+}
+
+// ---- 0.2.0: graph + attributes + activation + review + starmap ----
+
+/** Emotion tag on a memory: type (e.g. 温暖) + intensity 0..1. */
+export interface EmotionTag {
+  type: string;
+  intensity: number;
+}
+
+/** Per-memory attributes (0.2.0), persisted in attributes.json.
+ *  Old log entries with no stored row get computed defaults —
+ *  nothing is ever lost. Retrievability is NOT stored: it is
+ *  computed from these fields (see attributes.ts). */
+export interface MemoryAttributes {
+  emotion?: EmotionTag;
+  /** 0..1. Fresh memories start at 1.0, decay with time, rise
+   *  when recalled. Never reaches 0 (details fade, never erase). */
+  clarity: number;
+  /** How many times recall surfaced this entry. */
+  recallCount: number;
+  /** 意义强度 0..1: heavy 0.9, light 0.4. Review raises it for
+   *  repeatedly recalled entries (≥3 → 0.8, ≥5 → 0.9) and the
+   *  daily model review raises model-marked entries to 0.9. No
+   *  keyword list decides it. */
+  significance: number;
+  /** True once review compressed this entry to a one-line summary
+   *  in summary-YYYY-MM.jsonl (original log entry untouched). */
+  compressed?: boolean;
+  /** 0.3.0: the daily model review marked this memory important.
+   *  The code review never compresses a model-marked entry. */
+  modelMarked?: boolean;
+  compressedAt?: number;
+  lastRecalledAt?: number;
+  lastReviewedAt?: number;
+}
+
+/** One undirected link between two log entries (0.2.0, graph.json).
+ *  Weight in (0, 1]: grows when traversed, decays slowly when
+ *  unused, never to zero. */
+export interface GraphEdge {
+  /** Canonical order: from < to (lexicographic), so (A,B) == (B,A). */
+  from: string;
+  to: string;
+  /** session: adjacent entries in one session; keyword: shared rare
+   *  keyword; recall: entry A was recalled and the conversation
+   *  then moved to B. */
+  type: "session" | "keyword" | "recall";
+  weight: number;
+  lastTraversedAt: number;
+}
+
+/** One compressed line for a light old memory (0.2.0), stored in
+ *  summary-YYYY-MM.jsonl. The original log entry is never touched. */
+export interface CompressedSummary {
+  entryId: string;
+  month: string;
+  summary: string;
+  ts: number;
+}
+
+/** Daily review state (0.2.0), persisted in review.json. */
+export interface ReviewState {
+  version: 1;
+  lastReviewedAt: number | null;
+  totalReviews: number;
+  lastSummary: string;
+  lastStats: {
+    decayed: number;
+    promoted: number;
+    compressed: number;
+    edgesAdded: number;
+    entries: number;
+  };
+}
+
+export interface ReviewResult extends ReviewState {
+  ran: boolean;
+  /** 0.3.0: clusters of related entries the review proposes for
+   *  fragmenting. The review only PROPOSES — a fragment is created
+   *  by the model through memory_fragment / createFragment, so both
+   *  paths share the same code verification. Not persisted. */
+  fragmentCandidates?: FragmentCandidate[];
+}
+
+/** One review-proposed fragment cluster (0.3.0): entries sharing a
+ *  rare topic token, none of them folded into a fragment yet. */
+export interface FragmentCandidate {
+  topic: string;
+  sourceIds: string[];
+  keywords: string[];
+}
+
+/** Result of generating the starmap HTML (0.2.0). */
+export interface StarmapResult {
+  path: string;
+  nodes: number;
+  edges: number;
+  generatedAt: number;
 }
