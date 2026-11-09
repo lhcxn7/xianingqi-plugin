@@ -13,8 +13,10 @@
 // Two file shapes are accepted (the skill's real format AND the
 // plugin's older hand-written format), so old fixtures keep working:
 // - Skill v2.4 (canonical): date headings `## 2026/11/02`, entries
-//   `[14:32] 事件一句话` (no dash, no metadata), layer-1 keys
-//   `喜好` / `厌恶` / `最后更新时间`, layer 3 titled `旧月份总结区`.
+//   `[14:32] 事件一句话` (no dash, no metadata) — and, as the model
+//   actually writes them (0.4.3 audit issue 1), `- [14:32] 事件一句话`
+//   (dash + bracketed time); layer-1 keys `喜好` / `厌恶` /
+//   `最后更新时间`, layer 3 titled `旧月份总结区`.
 // - Plugin format: date headings `### 2026/11/02`, entries
 //   `- HH:MM [role|window|importance] text`, layer-1 keys `喜欢` /
 //   `不喜欢`, layer 3 titled `月度归档`.
@@ -42,7 +44,14 @@ const DATE_HEADING = /^#{2,3}\s+(\d{4}\/\d{2}\/\d{2})\s*$/;
 const ENTRY_LINE =
   /^-\s+(\d{2}:\d{2})\s+(?:\[([^\]]+)\]\s+)?(.*)$/;
 // Skill v2.4 format: "[HH:MM] text" — no dash, no metadata.
-const SKILL_ENTRY_LINE = /^\[(\d{2}:\d{2})\]\s+(.*)$/;
+// Real files (what the model actually writes, 0.4.3 audit issue 1):
+// "- [HH:MM] text" — dash + bracketed time. Both shapes are
+// accepted, and so are "*" / "+" bullets and leading spaces — the
+// model writes the dash shape consistently, and the old regex only
+// matched the bare shape, so a real MEMORY.md parsed as 0 layer-2
+// entries. parseArchiveText shares this line parser, so archives
+// get the fix for free.
+const SKILL_ENTRY_LINE = /^\s*(?:[-*+]\s+)?\[(\d{2}:\d{2})\]\s+(.*)$/;
 // Layer-3 summary lines: "- YYYY-MM: ..." or bare "YYYY-MM: ...".
 const MONTH_LINE = /^(?:-\s+)?(\d{4}-\d{2})[:：]\s*(.*)$/;
 // Fallback summary line without a colon: "YYYY-MM 共 N 条 ...".

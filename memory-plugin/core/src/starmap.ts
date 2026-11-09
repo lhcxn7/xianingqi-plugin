@@ -10,11 +10,12 @@
 // UI: 拾光 (workspace/user/files/index.html, 655 lines, user-given,
 // 2026-11-08) — the user fixed this as THE starmap UI. The template
 // below (SHIGUANG_HEAD / SHIGUANG_TAIL) is that file verbatim
-// except for six marked patches, applied by
+// except for nine marked patches, applied by
 // test-evidence/gen-starmap-template.py
 // (P1–P6, each marked inline at its site below), plus dead-code
 // removal of three lines that are dead in the original too
-// (SELF_NAME, tMax, the DATA.demo branch — see m-6, review-15).
+// (SELF_NAME, tMax, the DATA.demo branch — see m-6, review-15),
+// plus 0.4.2 patches P7–P9 (marked inline at their sites).
 //   P1  DATA line: the file's 6 sample memories are replaced
 //       by a split point; renderStarmapHtml injects the real DATA
 //       there. Sample data never ships in the plugin — not one
@@ -35,6 +36,37 @@
 //       cat — toneLabel and sources would be dropped, so the P3
 //       panel patch would never fire. The star literal now also
 //       carries toneLabel and sources (empty when absent).
+//   P7  Original-sentence labels (0.4.2, user decision
+//       2026-11-09): every memory star carries a small pill
+//       with a two-line preview of its original text — 11px,
+//       one size smaller than the v6 preview's pills — shown
+//       only when the camera is close to that star (LABEL_DIST_MAX
+//       / LABEL_PS_* below), faded in/out by on-screen size.
+//       The pill is a preview only: textContent holds the whole
+//       sentence, but the CSS clamps it to two lines
+//       (-webkit-line-clamp:2); the full text lives in the
+//       bottom panel on star click. At most
+//       LABEL_MAX (24) labels are visible at once, nearest by
+//       depth; the pool is 24 reusable divs, no per-frame DOM
+//       churn. Labels never cover their star (pill sits above
+//       it) and never show for the hovered/selected star (that
+//       star already has its tooltip/panel). Drag/zoom/click/
+//       hover/panel are untouched.
+//   P8  Panel badge (0.4.2, user decision 2026-11-09): the
+//       bottom panel shows the keyword only — the "约定." /
+//       "ta." owner prefix is stripped for display (badgeText).
+//       The key itself is untouched: "ta.*" / "约定.*" still
+//       decide which arm/core a star belongs to (ownerOf).
+//   P9  Lone-star suffix (0.4.2, user decision 2026-11-09):
+//       keySuffix's fallback no longer takes the first short
+//       keyword (that was how "我以前不该欺负你的" became
+//       约定.我以). It now reads a separate fallback pool —
+//       curator fragment topic/keywords first, then clean
+//       content words (2–3 chars, clean at both boundaries,
+//       isCleanContentWord) — and falls back to the category
+//       name (画像/事件/情绪/其他, CAT_LABEL) when the pool is
+//       empty. The DF path is unchanged: a word shared by 2+
+//       stars is validated by repetition.
 // Nothing else is changed: no legend, no time slider, no recall
 // input, no dials — 拾光 has none of those, and the old
 // 0.2.0/0.3.0 starmap UI (SVG circles, toolbar, time slider,
@@ -74,12 +106,19 @@
 //           ta.今天 through their topic/keywords alone, so those
 //           go through the same overlap filter, against the
 //           fragment's own text (review-18).
-//           Only when every word occurs once does it fall back to
-//           the first short keyword (2–4 chars), else the first
-//           keyword. (A 3-char preference was tried for review-16
-//           N-2 and reverted — measured wash, see keySuffix.)
-//           Sanitised (no dots or whitespace, max 8 chars,
-//           fallback "记忆").
+//           Only when every word occurs once does it fall back
+//           to the fallback pool (0.4.2 P9): curator fragment
+//           topic/keywords first, then clean content words
+//           (2–3 chars, clean at both boundaries — no word
+//           starting with a pronoun/demonstrative or ending
+//           with a pronoun/particle, so 我以/我拿/你的 can no
+//           longer win); trigrams never enter the pool. When
+//           the pool is empty the suffix is the category name
+//           (画像/事件/情绪/其他). (A 3-char preference was tried
+//           for review-16 N-2 and reverted — measured wash, see
+//           keySuffix; the 0.4.2 pool rule replaces it: the old
+//           "first short keyword" fallback is gone, and with it
+//           the lone-star slices it produced.)
 //           In 拾光's code, key "ta.*" maps to owner 'her' (the
 //           DATA.user side, right core) and "约定|我|项目.*"
 //           maps to owner 'me' (the DATA.self side, left core).
@@ -250,6 +289,59 @@ function dedupCap(words: readonly string[], cap = 8): string[] {
   return out;
 }
 
+/** Lone-star fallback words must be genuine content words, not
+ *  slices. A candidate fails when it starts with a pronoun /
+ *  demonstrative (我/你/他/她/它/们/这/那 — 我以, 我拿, 我吃,
+ *  我爬, 我很) or a sentence particle (了/的/吗/呢/吧/啊/哦/
+ *  嗯/呀/么 — 了拉, 的对: a real word almost never starts
+ *  with one), or ends with a pronoun / sentence particle
+ *  (我/你/他/她/它/们/的/了/吗/呢/吧/啊/哦/嗯/呀/么 —
+ *  你的, 吃了, 想你). This is the rule that kills the
+ *  reported case: "我以前不该欺负你的" used to fall back to 我以
+ *  (the first bigram); under this rule 我以 is out and 以前
+ *  wins. Words starting with a direction verb or 不/很 (下雨,
+ *  不该, 很想) are kept — they are real words, not boundary
+ *  slices. A whole short memory (2–3 chars, e.g. 了不起) is the
+ *  first fallback candidate outright (see badgeWords) — without
+ *  that, adding 了 to the first-char ban would turn a lone
+ *  了不起 into 不起. Residual: a 4+-char memory whose every
+ *  content word is dirty at an end falls to the category name,
+ *  which is still honest; a particle-first word that IS real
+ *  (了当/了然) is lost as a fallback candidate, DF path
+ *  unaffected.
+ *  Trigrams never enter the fallback pool at all (they are
+ *  slices by construction — review-16 N-2 was reverted for
+ *  exactly this reason); curator fragment topic/keywords
+ *  bypass the boundary rule, they are chosen, not sliced. */
+const BAD_FIRST = new Set([
+  "我", "你", "他", "她", "它", "们", "这", "那",
+  "了", "的", "吗", "呢", "吧", "啊", "哦", "嗯", "呀", "么",
+]);
+const BAD_LAST = new Set([
+  "我", "你", "他", "她", "它", "们",
+  "的", "了", "吗", "呢", "吧", "啊", "哦", "嗯", "呀", "么",
+]);
+
+/** A content-token candidate for the lone-star fallback:
+ *  2–3 chars, not a COMMON_TOKENS word (contentTokens already
+ *  guarantees that), and clean at both boundaries (above). */
+function isCleanContentWord(w: string): boolean {
+  if (w.length < 2 || w.length > 3) return false;
+  if (BAD_FIRST.has(w[0])) return false;
+  if (BAD_LAST.has(w[w.length - 1])) return false;
+  return true;
+}
+
+/** Panel badge category names, by cat (0.4.2 item 3): when a
+ *  lone star has no clean content word at all, its badge shows
+ *  the category instead of a sliced bigram. */
+export const CAT_LABEL: Record<ShiguangCat, string> = {
+  stable_profile: "画像",
+  event: "事件",
+  emotion: "情绪",
+  other: "其他",
+};
+
 /** Key suffix (review-15 m-2, review-16 N-1/N-2): pick by document
  *  frequency across this batch of stars — the most-shared word of
  *  the star's word list wins. Ties break by longest, then
@@ -267,26 +359,25 @@ function dedupCap(words: readonly string[], cap = 8): string[] {
  *  overlapping one are dropped before they reach this function —
  *  see coveredRuns / hasClearOccurrence for the rule (review-16
  *  N-1, review-17, review-18).
- *  Only when every word occurs once does it fall back to the
- *  first short keyword (2–4 chars), else the first keyword.
- *  (Review-16 N-2 proposed preferring a 3-char candidate here
- *  instead — 酸梅汤 over 酸梅. It was implemented, measured, and
- *  REVERTED in this package, because the measurement showed a
- *  wash, not a fix: on the two sample pages the sliced-badge
- *  count stayed 3 -> 3 (酸梅 fixed to 酸梅汤, but 今晚 -> 今晚吃
- *  and 雨天 -> 雨天你 regressed, and 明天要去爬山 -> 要去爬,
- *  not the whole run the review predicted — after the N-1 filter
- *  the surviving trigrams are 要去爬 / 去爬山, and the first
- *  3-char candidate is 要去爬). A lone short memory whose own
- *  trigrams are all slices cannot be fixed by preferring
- *  trigrams; telling a complete 3-char word (酸梅汤) from a
- *  sliced one (今晚吃) needs a lexicon, which this plugin does
- *  not have. So the fallback stays first-short-keyword, and
- *  lone-star slices remain a known limit — see the checklist.
+ *  0.4.2 item 3 — the lone-star fallback changed. The old rule
+ *  ("first short keyword, else first keyword") took whatever
+ *  bigram came first, so a lone "我以前不该欺负你的" fell back
+ *  to 我以 and a lone "今天我很想你" to 我很. The fallback now
+ *  reads `fallbackPool` instead of `words`: curator fragment
+ *  topic/keywords first, then clean content words
+ *  (isCleanContentWord — 2–3 chars, clean at both boundaries);
+ *  trigrams never enter the pool. When the pool is empty the
+ *  suffix is `fallbackLabel` — the star's category name
+ *  (画像/事件/情绪/其他) — never a sliced bigram. The DF path
+ *  above is unchanged: a word shared by 2+ stars is validated
+ *  by repetition, so 要去 still wins a shared 明天要去 group
+ *  while a lone 明天要去爬山 now falls back to 爬山.
  *  No dots/whitespace, max 8 chars, fallback "记忆". */
 function keySuffix(
   words: readonly string[],
   docFreq?: Map<string, number>,
+  fallbackPool: readonly string[] = [],
+  fallbackLabel = "记忆",
 ): string {
   const trimmed: string[] = [];
   for (const w of words) {
@@ -316,10 +407,25 @@ function keySuffix(
       if (clean) return clean;
     }
   }
-  const short = trimmed.find((w) => w.length >= 2 && w.length <= 4);
-  const raw = short ?? trimmed[0] ?? "";
+  const cleanPool = fallbackPool
+    .map((w) => (typeof w === "string" ? w.trim() : ""))
+    .filter(Boolean)
+    // 0.4.3 P9: strip punctuation here too, so a curator word
+    // carrying a full stop ("好。") is read as the 1-char word
+    // it is — and then filtered out below, not badged with
+    // its punctuation attached.
+    .map((w) => w.replace(/[\s./\\\p{P}]+/gu, "").slice(0, 8))
+    .filter(Boolean)
+    // 0.4.3 P9: 1-char words never win a suffix — a lone fragment
+    // topic of one char ("说") or a 1-char content word would
+    // otherwise become the badge outright (short ?? cleanPool[0]
+    // below). Filtered here, so an all-1-char pool falls through
+    // to the category name (fallbackLabel) instead.
+    .filter((w) => w.length >= 2);
+  const short = cleanPool.find((w) => w.length >= 2 && w.length <= 4);
+  const raw = short ?? cleanPool[0] ?? "";
   const clean = raw.replace(/[\s./\\]+/g, "").slice(0, 8);
-  return clean || "记忆";
+  return clean || fallbackLabel.replace(/[\s./\\]+/g, "").slice(0, 8) || "记忆";
 }
 
 /** One CJK run plus the positions in it covered by a COMMON_TOKENS
@@ -571,10 +677,25 @@ export function buildStarmapData(
   // passed to cjkTrigrams (review-18) — before this round
   // badgeWords computed them and cjkTrigrams recomputed them,
   // so "once per text" was twice.
-  const badgeWords = (e: Item): string[] => {
-    const words: string[] = [];
-    const push = (w: string) => {
-      if (w && !words.includes(w)) words.push(w);
+  // 0.4.2 item 3: returns two lists now. `all` is the DF pool
+  // (unchanged — trigrams included, they are validated by
+  // repetition). `fallback` is the lone-star pool: curator
+  // fragment topic/keywords first (chosen, not sliced — no
+  // boundary filter), then clean content words only
+  // (isCleanContentWord); trigrams never enter it, so a lone
+  // star can no longer fall back to a sliced bigram/trigram.
+  interface BadgeWords {
+    all: string[];
+    fallback: string[];
+  }
+  const badgeWords = (e: Item): BadgeWords => {
+    const all: string[] = [];
+    const fallback: string[] = [];
+    const pushAll = (w: string) => {
+      if (w && !all.includes(w)) all.push(w);
+    };
+    const pushFallback = (w: string) => {
+      if (w && !fallback.includes(w)) fallback.push(w);
     };
     const runs = coveredRuns(e.text);
     if (e.kind === "fragment") {
@@ -590,33 +711,59 @@ export function buildStarmapData(
       // occurs in the fragment text has nothing to overlap
       // (hasClearOccurrence returns true when !found), so an
       // explicitly passed topic/keyword is kept, not injured.
-      if (e.topic && hasClearOccurrence(runs, e.topic)) push(e.topic);
+      if (e.topic && hasClearOccurrence(runs, e.topic)) {
+        pushAll(e.topic);
+        pushFallback(e.topic);
+      }
       for (const w of e.keywords) {
-        if (hasClearOccurrence(runs, w)) push(w);
+        if (hasClearOccurrence(runs, w)) {
+          pushAll(w);
+          pushFallback(w);
+        }
+      }
+      for (const w of contentTokens(e.text)) {
+        if (hasClearOccurrence(runs, w)) {
+          pushAll(w);
+          if (isCleanContentWord(w)) pushFallback(w);
+        }
       }
     } else {
+      // A whole short memory (2–3 chars) is the first fallback
+      // candidate outright: it cannot be a slice of anything
+      // else, it IS the memory (了不起, 下雨). Without this,
+      // adding 了/的 to BAD_FIRST would turn a lone 了不起
+      // into 不起. 0.4.3 P9: strip punctuation first — "好。"
+      // is a 1-char memory with a full stop, not a 2-char one,
+      // and must not become 约定.好。; "走吧！" keeps 走吧.
+      const whole = e.text.trim().replace(/\p{P}/gu, "");
+      if (whole.length >= 2 && whole.length <= 3) pushFallback(whole);
       // Review-17: content tokens go through the same overlap
       // filter as the trigrams — a token whose every occurrence
       // overlaps a COMMON_TOKENS word (天我 of 今天我, 天要 of
       // 明天要) is a slice, not a badge word.
       for (const w of contentTokens(e.text)) {
-        if (hasClearOccurrence(runs, w)) push(w);
+        if (hasClearOccurrence(runs, w)) {
+          pushAll(w);
+          if (isCleanContentWord(w)) pushFallback(w);
+        }
       }
     }
-    for (const w of cjkTrigrams(e.text, runs)) push(w);
-    return words;
+    for (const w of cjkTrigrams(e.text, runs)) pushAll(w);
+    return { all, fallback };
   };
   // Document frequency of each badge word across the picked stars,
   // for the key-suffix rule (review-15 m-2). One count per star.
   const docFreq = new Map<string, number>();
   for (const e of picked) {
-    for (const w of new Set(badgeWords(e))) {
+    for (const w of new Set(badgeWords(e).all)) {
       docFreq.set(w, (docFreq.get(w) ?? 0) + 1);
     }
   }
   const memories: ShiguangMemory[] = picked.map((e) => {
     const keywords = dedupCap(e.keywords);
-    const suffix = keySuffix(badgeWords(e), docFreq);
+    const cat = shiguangCat(e.kind, e.emotion);
+    const { all, fallback } = badgeWords(e);
+    const suffix = keySuffix(all, docFreq, fallback, CAT_LABEL[cat]);
     // Key / owner (heuristic, see header): fragments and
     // assistant (夏柠柒's own) lines -> "ta.*"; user lines ->
     // "约定.*". 拾光 maps "ta.*" to the DATA.user core and
@@ -630,7 +777,7 @@ export function buildStarmapData(
       text: e.text,
       imp: Math.round(clamp01(e.significance) * 100) / 100,
       at: localIso(e.date, e.time),
-      cat: shiguangCat(e.kind, e.emotion),
+      cat,
       tags: keywords,
       related: keywords,
       key,
@@ -695,9 +842,22 @@ const SHIGUANG_HEAD = `<!doctype html>
         letter-spacing:.08em;color:#413a5c;pointer-events:none}
   #tools{position:absolute;right:22px;bottom:20px;display:flex;gap:8px;transition:opacity .6s}
   #tools.idle{opacity:.18}
+  /* P7: 原句标签层（0.4.2）——小药丸，11px，比 v6 预览小一号；
+     平时看不见，只有相机靠近那颗星时才淡入。pointer-events 全关，
+     标签永远点不到、也挡不住星星。 */
+  #labels{position:absolute;inset:0;overflow:hidden;pointer-events:none}
+  #labels .lbl{position:absolute;left:0;top:0;max-width:240px;
+        transform:translate(-50%,-100%);
+        padding:3px 9px;border:1px solid rgba(190,170,255,.28);border-radius:999px;
+        background:rgba(10,6,24,.66);color:#e8e2ff;
+        font:11px/1.5 ui-sans-serif,system-ui,"Microsoft YaHei",sans-serif;letter-spacing:.02em;
+        text-align:center;white-space:normal;
+        display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+        opacity:0;will-change:left,top,opacity}
   /* 沉浸模式（H）：只留星空，界面全藏起来 */
   body.no-ui #stat,
   body.no-ui #hint,
+  body.no-ui #labels,
   body.no-ui #tools{opacity:0;pointer-events:none}
   #tools button{padding:7px 14px;cursor:pointer;
         background:rgba(20,14,38,.55);border:1px solid rgba(150,130,220,.35);border-radius:999px;
@@ -724,6 +884,7 @@ const SHIGUANG_HEAD = `<!doctype html>
 <body>
 <div id="stage">
 <canvas id="c"></canvas>
+<div id="labels"></div>
 <div id="stat"></div>
 <div id="hint">拖动 · 环视　　滚轮 · 靠近　　点一颗星，点亮它的星座</div>
 <div id="tools">
@@ -760,6 +921,7 @@ const SHIGUANG_TAIL = `;
   const pDate = document.getElementById('pDate');
   const pBadge = document.getElementById('pBadge');
   const pBody = document.getElementById('pBody');
+  const labelsEl = document.getElementById('labels');
 
   // P5: fallback counterpart name is 你. (The SELF_NAME line was
   // here in the original and is deleted: never read, dead code.)
@@ -1168,6 +1330,69 @@ const SHIGUANG_TAIL = `;
     ctx.fillRect(0, 0, W, H);
   }
 
+  // ── 原句标签 P7（0.4.2） ────────────────────────────────────
+  // 每颗星旁边一个小药丸，写它的原句两行预览（不是关键词）。
+  // textContent 是整句原文，但 CSS 只显示两行
+  // （-webkit-line-clamp:2）；全文在点星星后的底部面板里看。
+  // 平时看不见：只有相机靠得够近（dist 小）且这颗星在屏幕上
+  // 够大（ps 大）时才淡入，离远了淡出。24 个复用 div，不新建，
+  // 每帧只改 24 个以内的位置/透明度；星星再多（800 颗）也不怕。
+  const LABEL_MAX = 24;          // 同时可见的标签上限
+  const LABEL_DIST_MAX = 7.5;    // 相机距离超过它，一个标签也不出
+  const LABEL_PS_MIN = 1.5;      // 屏幕尺寸小于它，全透明
+  const LABEL_PS_FULL = 2.5;     // 屏幕尺寸到它，全显
+  const labelPool = [];
+  for (let i = 0; i < LABEL_MAX; i++) {
+    const d = document.createElement('div');
+    d.className = 'lbl';
+    labelsEl.appendChild(d);
+    labelPool.push({ el: d, star: null });
+  }
+  function labelAlpha(ps) {
+    if (ps <= LABEL_PS_MIN) return 0;
+    if (ps >= LABEL_PS_FULL) return 1;
+    return (ps - LABEL_PS_MIN) / (LABEL_PS_FULL - LABEL_PS_MIN);
+  }
+  function updateLabels() {
+    // 开场运镜没完、相机还远：全部藏起来。
+    if (intro <= 4.2 || dist > LABEL_DIST_MAX) {
+      labelPool.forEach(function (s) {
+        if (s.star !== null) { s.star = null; s.el.textContent = ''; }
+        s.el.style.opacity = '0';
+      });
+      return;
+    }
+    const cands = [];
+    for (let i = 0; i < stars.length; i++) {
+      const n = stars[i];
+      if (n === hovered || n === selected) continue;   // 已有提示/面板的星不重复贴
+      const q = project(n.x, n.y, n.z);
+      if (!q) continue;
+      if (q.x < -20 || q.x > W + 20 || q.y < -20 || q.y > H + 20) continue;
+      const ps = q.s / REF;
+      const a = labelAlpha(ps);
+      if (a <= 0) continue;
+      cands.push({ n: n, q: q, a: a, vz: q.vz, ps: ps });
+    }
+    cands.sort(function (a, b) { return a.vz - b.vz; });   // 最近的先
+    const shown = cands.slice(0, LABEL_MAX);
+    for (let i = 0; i < LABEL_MAX; i++) {
+      const slot = labelPool[i];
+      const c = shown[i];
+      if (!c) {
+        if (slot.star !== null) { slot.star = null; slot.el.textContent = ''; }
+        slot.el.style.opacity = '0';
+        continue;
+      }
+      if (slot.star !== c.n) { slot.star = c.n; slot.el.textContent = c.n.text; }
+      // 药丸贴在星星正上方，不盖住星本身。
+      const off = Math.max(10, c.n.size * c.ps * 0.9 + 6);
+      slot.el.style.left = c.q.x + 'px';
+      slot.el.style.top = (c.q.y - off) + 'px';
+      slot.el.style.opacity = c.a.toFixed(3);
+    }
+  }
+
   // ── 交互 ────────────────────────────────────────────────
   function pick(mx, my) {
     let best = null, bd = 1e9;
@@ -1183,11 +1408,17 @@ const SHIGUANG_TAIL = `;
     return best;
   }
 
+  // P8: 面板徽标只显示关键词 — "约定." / "ta." 前缀不显示
+  // （key 本身不动，ownerOf 仍用它分臂）。
+  function badgeText(k) {
+    return String(k || '').replace(/^(ta|约定)\\./, '');
+  }
+
   function showPanel(n) {
     if (!n) { panel.classList.remove('on'); return; }
     pTitle.textContent = n.text.length > 24 ? n.text.slice(0, 24) + '…' : n.text;
     pDate.textContent = new Date(n.at).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\\//g, '.');
-    pBadge.textContent = n.key ? n.key : (n.owner === 'her' ? '关于' + USER_NAME : '关于我');
+    pBadge.textContent = badgeText(n.key) || (n.owner === 'her' ? '关于' + USER_NAME : '关于我');
     pBody.textContent = n.text;
     // P3: fragment stars append tone + source entries to the body.
     // 0.3.1 拾光适配：碎片星要能看到原文来源，拾光原版只显示正文。
@@ -1323,6 +1554,7 @@ const SHIGUANG_TAIL = `;
     dist = ((13.5 - 4.3 * ease) + (distGoal - 9.2) * ease) * (vmode ? 1.5 : 1);   // 推近之后交回滚轮
 
     draw(now / 1000);
+    updateLabels();
     requestAnimationFrame(loop);
   }
 
@@ -1332,7 +1564,7 @@ const SHIGUANG_TAIL = `;
   document.getElementById('stat').textContent =
     stars.length + ' 颗记忆' + (DATA.capped ? ' · 全部 ' + DATA.total + ' 颗（只显示前 ' + stars.length + ' 颗）' : '');
 
-  window.__map = { stars: stars, project: project, state: function () { return { theta: theta, phi: phi, dist: dist, intro: intro }; } };
+  window.__map = { stars: stars, project: project, state: function () { return { theta: theta, phi: phi, dist: dist, intro: intro }; }, setDist: function (d) { distGoal = clamp(d, 3.4, 20); } };
 
   resize();
   // 兜底：窗格刚开 / 刚从后台切回来时，尺寸可能量早了

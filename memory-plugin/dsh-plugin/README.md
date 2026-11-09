@@ -133,6 +133,224 @@ still never writes MEMORY.md.
   an exact type match to a coarse polarity match, and the starmap
   colours unknown types by polarity or the neutral default.
 
+## 0.4.7: 0.4.6 re-review pre-ship fixes (new issues 1–2) — reflection marking, proact overflow count
+
+Same 13 tools, same parameters and return shapes. What changed
+under them:
+
+- **Merged recent section marks what a reflection save would
+  refuse (core + shell).** The merged section shows every 24 h
+  entry, including already-reflected ones, but the reflection
+  gate excludes them — the model used to cite one and be refused.
+  `registerModelReview` now calls `core.reflectionCheck()` when
+  the section carries the reflection instruction (in try/catch —
+  a failure degrades to no marking, never breaks the round) and
+  passes its `sourceIds` as `reflectableIds` to
+  `buildModelReviewPrompt`; shown entries outside the set carry
+  "（本次反思不可引用）" and the instruction explains the mark.
+  The same call sets the gate snapshot for the review path
+  (0.4.3 item 8, same root). Tests: mock reproduces the audit's
+  25-entry scenario end to end — the mark is present, a save
+  citing the marked entry is refused, and a save citing an
+  unmarked shown entry still succeeds 5 h later, past the 24 h
+  boundary.
+- **Standalone proact prompt counts its overflow (core).** The
+  cap used to happen before `buildProactPrompt`, so the gate
+  prompt never saw the overflow. The full 24 h list now goes in
+  and the cap happens once inside; the prompt reports "另有 N 条
+  未列出" (160 on a 200-entry day, plus 20 summary lines).
+  Source ids are unchanged — still exactly the 20 shown entries.
+  Tests: core 193 PASS (was 191), mock 161 PASS (was 157).
+
+## 0.4.6: 0.4.5 re-review fixes (new issues 1–4) + 0.4.3 items 15–16 — merged recent section, entriesByIds guarded
+
+Same 13 tools, same parameters and return shapes. What changed
+under them:
+
+- **Daily-review prompt: reflection + proact are one merged
+  section now (core).** The two pasted prompts each listed all
+  24 h of memories verbatim (~37k chars each on a chatty day);
+  the merged section lists the notable entries once (top 20 /
+  3000 chars, rest as id + summary). The shell carries the
+  review's new `recentEntryIds` / `recentKinds` on the session
+  from `agent/created` and resolves the ids at the first
+  pre-step. The old pasted prompts remain as a fallback when no
+  recent entries were carried.
+- **A failing id-resolution read degrades, never breaks the
+  round.** Both `core.entriesByIds` calls in
+  `registerModelReview` are wrapped in try/catch degrading to
+  `[]` (same rule as `yesterdayEntries`); a failed read warns
+  once and the review context still registers.
+- **Invalidation section capped (core).** At most 10 entries /
+  2000 chars, overflow as id + summary — one oversized entry
+  cannot blow the prompt (the first-entry truncation rule
+  applies to all four sections).
+- **Log + lock fixes (core).** Appends terminate a torn line
+  first; a failing stale-lock reclaim yields and times out with
+  a counted error instead of tight-looping (see core README
+  0.4.6).
+- **Mock test hour-proof (new issue 3).** The reflect-ctx block
+  pins the clock to a fixed morning; the suite passes at any
+  hour. Tests: mock 157 PASS (was 156: +1 entriesByIds), core
+  191 PASS (was 184).
+
+## 0.4.5: 0.4.3 review fixes, items 4 and 5 — review context capped, graph backfill idempotent
+
+Same 13 tools, same parameters and return shapes. What changed
+under them:
+
+- **Daily-review prompt is capped (core).** Yesterday's entries
+  are ranked by significance (the shell passes
+  `core.significanceOf`), at most 60 entries / 8000 characters
+  of entry text, shown chronologically; when the list is cut the
+  prompt says only the important part is listed.
+- **Review context auto-releases after 3 turns.** The
+  daily-review context used to live in every request until the
+  model called `memory_daily_review` — a chatty day pinned ten
+  thousand words into the prompt indefinitely. Now the shell
+  disposes it itself after `MODEL_REVIEW_AUTO_RELEASE_TURNS = 3`
+  pre-step turns without a submission (the registration turn is
+  turn 0: the model sees the context on 3 turns, then it is
+  gone). Submitting via `memory_daily_review` still disposes on
+  success; the auto-release is only the backstop, and it never
+  fires on the registration turn itself.
+- **Graph backfill is idempotent (core).** The daily review's
+  backfill call is unchanged — it just stops growing the graph:
+  the keyword-edge cap counts a node's existing live keyword
+  edges, a second backfill adds no edges, and a session edge
+  that also shares a rare keyword upgrades to keyword in place
+  (type only, weight and clock untouched). Existing over-grown
+  edges are NOT pruned in this release (prevent future growth
+  only; pruning is a later decision).
+
+## 0.4.4: 0.4.3 review fixes, items 1 and 2 — review proposals reach the model
+
+Same 13 tools, same parameters and return shapes, except
+`memory_status` gains one field. What changed under them:
+
+- **Daily review carries the proactivity proposal.** The code
+  review's `proactPrompt` used to be computed and discarded
+  (no reader in this shell at all). It now travels on the
+  session from `agent/created` and is pasted into the
+  daily-review prompt next to the fragment / belief /
+  reflection sections. The pasted text is the proposal's
+  content; its token line is about a live gate call, not this
+  review prompt — the prompt says so explicitly, so to act she
+  calls `memory_proact` with `{}` first and gets a fresh
+  prompt+token; not acting needs no call and consumes nothing.
+- **Daily review carries the invalidation checks.** The review's
+  `invalidationChecks` used to be only a flag in
+  `attributes.json` that nothing ever read. The ids now travel
+  on the session, are resolved to entries at the first pre-step
+  (`core.entriesByIds`), and are pasted into the daily-review
+  prompt with id + text; the model confirms via
+  `memory_invalidate`, or leaves a check alone to be proposed
+  again at the next review.
+- **`memory_status` gains `pendingInvalidationChecks`.** The
+  count of memories flagged for invalidation review and not yet
+  invalidated — the same set the daily-review prompt draws its
+  invalidation section from. The flag clears when the model
+  invalidates the entry, when the opposing statement ages past
+  the 30-day window, or when the entry drops out of the check's
+  population; there is no explicit "still valid" confirmation
+  (`memory_invalidate` has no keep-action — inaction + lapse is
+  the answer).
+- **Parser fix (core).** `- [HH:MM]` entries in MEMORY.md and
+  archives now parse (see core README 0.4.4).
+
+## 0.4.3: 0.4.2 review fixes — no tool changes
+
+Same 13 tools, same parameters and return shapes. What changed
+under them:
+
+- **`memory_search`**: `layer1` now follows `profile.json` —
+  after `memory_profile` writes a name/stage, the search
+  result's `layer1` and `profileText` describe the same person
+  (core `mergeProfile` change; no tool code changed).
+- **`memory_reflect` save**: validates its sources against the
+  snapshot of the gate prompt the model was shown, not a
+  freshly recomputed gate — a source that crossed the 24 h
+  boundary while the model was thinking is no longer refused.
+  With no snapshot (never gated, or last gate below the floor)
+  the save falls back to a fresh check.
+- **`memory_proact`**: the prompt now tells the model to carry
+  the gate's `promptToken` on the decision, `act: false`
+  included (voids the prompt). `core.proactSave` takes no token
+  parameter by decision: the token is enforced at this tool
+  layer, core direct calls stay test-compatible.
+- **Starmap labels**: two-line preview by product decision —
+  the pill shows at most two lines of the original sentence,
+  the full text is in the bottom panel on star click.
+- **`memory_snapshot` / `memory_restore`**: `profile.json`
+  is now snapshotted and restored with the log; audit trail,
+  beliefs and loop state still are not.
+
+## 0.4.2: starmap labels only — no tool changes
+
+`memory_starmap` behaviour, parameters and return shape are
+unchanged. The generated page now shows a two-line preview of each
+star's original sentence beside it when the camera is close (11px
+pill, max 24 visible, fades with distance; the pill text is
+CSS-clamped to two lines — click the star for the full text in the
+bottom panel), the bottom-panel badge shows the keyword
+without its `约定.` / `ta.` prefix, and lone-star badges never
+slice bigrams off the text (clean content word, else the category
+name). See `core/README.md` for the rules.
+
+## 0.4.1: merge of 4 increments from the independent 0.4.1 build
+
+- **`memory_profile`** (persona only, 13th tool): writes name /
+  stage / relationshipStage to `profile.json`; read call (`{}`)
+  returns the current profile + `profileText` without writing.
+  Profile injection still rides recall hits only.
+- **`memory_proact` now carries a prompt token**: the gate returns
+  `{prompt, promptToken}` (15 min TTL); a decision must carry the
+  token and its trigger must be one of that prompt's sourceIds.
+  Issuing a prompt spends no quota; `act: false` spends nothing
+  and voids the token.
+- **Core persona-source checks**: belief and reflection writes now
+  require persona-window source entries at the core layer.
+- **`recentTriggers`**: dropped actions' triggers stay cooled for
+  7 days.
+- **`memory_reflect` save enforces gate sources**: a save may only
+  cite the ids in the current gate's prompt (`ReflectionCheck`
+  carries `sourceIds`); out-of-gate sources are refused before
+  any quote check.
+
+## 0.4.0: four new tools (judgement to the model, arithmetic to code)
+
+- **`memory_invalidate`** (persona only): marks entries and their
+  graph edges expired by id; recall filters them out. Review only
+  proposes; the model confirms — and since 0.4.4 the proposal
+  reaches the model in the daily-review prompt (id + text), is
+  re-listed at every review while the opposition is live, and
+  `memory_status` shows the pending count. Audit trail in
+  `invalidation-audit.jsonl` (append-only, not snapshotted).
+- **`memory_belief`** (persona only): `create` / `support` /
+  `contradict` / `get` over the safety / trust / closeness beliefs.
+  `delta` is set by the model from evidence strength (required for
+  support/contradict, clamped to ±0.2, strength stays 0..1); every
+  quote must be verbatim from the log; the same contradicting entry
+  deducts only once. `get` returns the three dimensions (strength /
+  uncertainty / proofCount), no full quotes. `memory_status` also
+  shows the three dimensions.
+- **`memory_reflect`** (persona only): `{}` checks the tiny
+  anti-disturbance floor (last-24 h new significance < 5 →
+  `{triggered: false}`, no prompt, no model call); above the floor
+  it hands the model the prompt and the model decides whether and
+  what to reflect; a second call with `{text, sourceIds}` saves the
+  conclusion as a `type: "reflection"` fragment (gold
+  `stable_profile` star), 「」 quotes verified verbatim.
+- **`memory_proact`** (persona only): `{}` checks the guardrails
+  (1 action/day, same trigger once per 7 days, max 3 pending) and
+  returns the prompt; a second call hands back the model's decision
+  (`act` / `judgment` / `actionText` / `trigger`), which is parsed,
+  re-checked against the guardrails and stored in `loop.json`.
+  `act: false` or an unparseable decision means no action, no crash,
+  no fallback sentence. `channel` is `"session"` only — `"qq"`
+  returns `qq_not_connected`. Action text is always the model's own
+  words; `loop.ts` contains no fixed sentences.
+
 ## Persona vs task windows
 
 The plugin uses the skill's own trigger: a session becomes a persona

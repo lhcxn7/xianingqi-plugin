@@ -117,12 +117,15 @@ export class MemoryGraph {
 
   /** Load graph.json. Missing or corrupt starts empty (the graph
    *  is derived — backfill rebuilds it from the log). Hand-edited
-   *  rows are sanitised: the type must be one of the three, the
-   *  weight must be a finite number in (0, 1] (clamped, never
-   *  trusted — a weight of 5 must never reach traversal), a missing
-   *  or non-numeric lastTraversedAt defaults to 0 (never traversed),
-   *  endpoints are canonicalised, and duplicate (from, to) pairs
-   *  keep only the first valid row. */
+   *  rows are sanitised: the type must be one of the three, a
+   *  finite weight in (0, 1] is clamped, never trusted — a weight
+   *  of 5 must never reach traversal; a missing or non-numeric
+   *  weight (0.4.0 item 5: old graph.json) defaults to the type's
+   *  initial weight instead of dropping the edge; a finite weight
+   *  <= 0 still drops the row. A missing or non-numeric
+   *  lastTraversedAt defaults to 0 (never traversed), endpoints
+   *  are canonicalised, and duplicate (from, to) pairs keep only
+   *  the first valid row. */
   private load(): boolean {
     try {
       if (!existsSync(this.file)) return false;
@@ -137,8 +140,7 @@ export class MemoryGraph {
           typeof e.to !== "string" ||
           e.from === e.to ||
           !VALID_EDGE_TYPES.has(e.type) ||
-          !Number.isFinite(e.weight) ||
-          e.weight <= 0
+          (typeof e.weight === "number" && e.weight <= 0)
         ) {
           continue;
         }
@@ -146,16 +148,35 @@ export class MemoryGraph {
         const key = edgeKey(from, to);
         if (seen.has(key)) continue;
         seen.add(key);
+        // 0.4.0 item 5: an old/hand-edited row without a usable
+        // weight defaults to the type's initial weight instead of
+        // dropping the edge — the link itself is the data, the
+        // weight is only a prior. A finite weight <= 0 is still
+        // dropped (see the guard above); a finite weight > 1 is
+        // still clamped to 1 below.
+        const weight =
+          typeof e.weight === "number" && Number.isFinite(e.weight)
+            ? Math.min(1, e.weight)
+            : EDGE_INITIAL_WEIGHT[e.type as GraphEdge["type"]];
+        // 0.4.0 item 1: keep a finite validTo (or an explicit null =
+        // still valid). Old rows without the field load unchanged —
+        // absent validTo = never invalidated.
+        let validTo: number | null | undefined;
+        if (e.validTo === null) validTo = null;
+        else if (typeof e.validTo === "number" && Number.isFinite(e.validTo)) {
+          validTo = e.validTo;
+        }
         clean.push({
           from,
           to,
           type: e.type as GraphEdge["type"],
-          weight: Math.min(1, e.weight),
+          weight,
           lastTraversedAt:
             typeof e.lastTraversedAt === "number" &&
             Number.isFinite(e.lastTraversedAt)
               ? e.lastTraversedAt
               : 0,
+          ...(validTo !== undefined ? { validTo } : {}),
         });
       }
       this.edges = clean;
@@ -260,6 +281,25 @@ export class MemoryGraph {
     edge.lastTraversedAt = now;
   }
 
+  /** 0.4.0 item 1: mark every edge touching one of `ids` invalid
+   *  from `at` — an invalidated memory's links must not diffuse it
+   *  into recall. Only writes validTo; weight, type and clock are
+   *  untouched, and an already-invalid edge is never re-stamped.
+   *  In-memory only — the caller persists. Returns how many edges
+   *  were stamped. */
+  invalidate(ids: string[], at: number): number {
+    const set = new Set(ids);
+    let stamped = 0;
+    for (const e of this.edges) {
+      if (e.validTo != null && e.validTo <= at) continue;
+      if (set.has(e.from) || set.has(e.to)) {
+        e.validTo = at;
+        stamped += 1;
+      }
+    }
+    return stamped;
+  }
+
   /** Slow fade for edges nobody walked lately. Never below the
    *  floor, never to zero — a link never dies. Decay is per TIME,
    *  not per call: after an edge decays, its clock restarts at now,
@@ -279,13 +319,28 @@ export class MemoryGraph {
     return changed;
   }
 
-  /** Link a fresh entry: a session edge to the previous entry in
-   *  the same session, plus keyword edges to entries sharing a rare
-   *  token (rarest first, capped). Returns the edges created.
+  /** Link a fresh entry: keyword edges to entries sharing a rare
+   *  token (rarest first, capped), plus a session edge to the
+   *  previous entry in the same session. Returns the edges created.
    *  onlyNew (backfill): create only edges that do not exist yet —
    *  never strengthen an existing one. A per-review backfill that
    *  re-strengthened decayed edges would pin their weight at the
-   *  initial value and neutralise decay entirely. */
+   *  initial value and neutralise decay entirely.
+   *
+   *  0.4.5 (0.4.3 audit item 5): two fixes. (1) The cap counts the
+   *  node's EXISTING live keyword edges, not just the ones made in
+   *  this call — the old code counted only `made`, so every daily
+   *  backfill added up to 3 more edges to colder tokens (real data:
+   *  156 edges, one node at keyword degree 15, design cap 3).
+   *  Expired (invalidated) edges do not diffuse, so they do not
+   *  consume the budget either. (2) In onlyNew mode a stronger
+   *  evidence type may upgrade the type in place — weight and clock
+   *  untouched, so decay survives — so a session neighbour that
+   *  also shares a rare keyword becomes a traversable keyword edge
+   *  instead of staying a session edge forever. Keyword edges are
+   *  built before the session edge, so a fresh pair gets the
+   *  keyword edge at keyword weight directly instead of a session
+   *  edge upgraded afterwards. */
   linkNewEntry(
     entry: MemoryEntry,
     index: KeywordIndex,
@@ -294,43 +349,85 @@ export class MemoryGraph {
     onlyNew = false,
   ): GraphEdge[] {
     const made: GraphEdge[] = [];
+    // Returns the edge when the pair ends up linked, plus whether
+    // this call created it and whether it became a keyword edge
+    // that was not one before (the cap counter below counts live
+    // keyword edges, so a new or upgraded one must be counted
+    // once, and an already-keyword one must not be counted twice).
     const linkOne = (
       a: string,
       b: string,
       type: GraphEdge["type"],
-    ): GraphEdge | undefined => {
-      if (onlyNew && this.find(a, b)) return undefined;
-      return this.link(a, b, type, now);
-    };
-    if (prevInSession && prevInSession.id !== entry.id) {
-      const e = linkOne(entry.id, prevInSession.id, "session");
-      if (e) made.push(e);
-    }
-    const tokens = tokenize(entry.text);
-    if (tokens.length === 0) return made;
-    const byToken = index.lookup(tokens);
-    // Rarest token first: its sharers are the most specific links.
-    // Single-character tokens never create a keyword edge: a lone
-    // 好 / 天 / 人 is shared by half of all chat lines, so it says
-    // nothing about two memories being on the same topic — and (M4)
-    // it would upgrade their session edge to a traversable keyword
-    // edge on generic evidence. Multi-char tokens (bigrams, whole
-    // runs) carry the topical signal. Single chars still work for
-    // direct query matching (the index), just not for graph links.
-    const ranked = [...byToken.entries()]
-      .map(([token, ids]) => ({ token, ids: ids.filter((id) => id !== entry.id) }))
-      .filter((t) => t.token.length >= 2 && t.ids.length > 0 && t.ids.length <= MAX_RARE_DF)
-      .sort((a, b) => a.ids.length - b.ids.length || a.token.localeCompare(b.token));
-    const linked = new Set<string>();
-    for (const { ids } of ranked) {
-      for (const id of ids) {
-        if (made.filter((e) => e.type === "keyword").length >= MAX_KEYWORD_EDGES_PER_ENTRY) break;
-        if (linked.has(id)) continue;
-        linked.add(id);
-        const e = linkOne(entry.id, id, "keyword");
-        if (e) made.push(e);
+    ): {
+      edge: GraphEdge | undefined;
+      created: boolean;
+      becameKeyword: boolean;
+    } => {
+      const existing = this.find(a, b);
+      if (existing) {
+        if (onlyNew) {
+          if (TYPE_RANK[type] > TYPE_RANK[existing.type]) {
+            const wasKeyword = existing.type === "keyword";
+            existing.type = type;
+            return {
+              edge: existing,
+              created: false,
+              becameKeyword: type === "keyword" && !wasKeyword,
+            };
+          }
+          return { edge: undefined, created: false, becameKeyword: false };
+        }
+        const wasKeyword = existing.type === "keyword";
+        const e = this.link(a, b, type, now);
+        return {
+          edge: e,
+          created: false,
+          becameKeyword: !!e && type === "keyword" && !wasKeyword && e.type === "keyword",
+        };
       }
-      if (made.filter((e) => e.type === "keyword").length >= MAX_KEYWORD_EDGES_PER_ENTRY) break;
+      const e = this.link(a, b, type, now);
+      return { edge: e, created: !!e, becameKeyword: !!e && type === "keyword" };
+    };
+    const tokens = tokenize(entry.text);
+    if (tokens.length > 0) {
+      const byToken = index.lookup(tokens);
+      // Rarest token first: its sharers are the most specific links.
+      // Single-character tokens never create a keyword edge: a lone
+      // 好 / 天 / 人 is shared by half of all chat lines, so it says
+      // nothing about two memories being on the same topic — and (M4)
+      // it would upgrade their session edge to a traversable keyword
+      // edge on generic evidence. Multi-char tokens (bigrams, whole
+      // runs) carry the topical signal. Single chars still work for
+      // direct query matching (the index), just not for graph links.
+      const ranked = [...byToken.entries()]
+        .map(([token, ids]) => ({ token, ids: ids.filter((id) => id !== entry.id) }))
+        .filter((t) => t.token.length >= 2 && t.ids.length > 0 && t.ids.length <= MAX_RARE_DF)
+        .sort((a, b) => a.ids.length - b.ids.length || a.token.localeCompare(b.token));
+      // 0.4.5: the cap counts live keyword edges already touching
+      // this entry. (An expired edge is checked the same way recall
+      // checks it: a validTo at or before now means invalid; null
+      // or absent means still valid.)
+      let keywordCount = this.neighbors(entry.id).filter(
+        (e) => e.type === "keyword" && (e.validTo == null || e.validTo > now),
+      ).length;
+      const linked = new Set<string>();
+      for (const { ids } of ranked) {
+        for (const id of ids) {
+          if (keywordCount >= MAX_KEYWORD_EDGES_PER_ENTRY) break;
+          if (linked.has(id)) continue;
+          linked.add(id);
+          const res = linkOne(entry.id, id, "keyword");
+          if (res.edge) {
+            if (res.created) made.push(res.edge);
+            if (res.becameKeyword) keywordCount += 1;
+          }
+        }
+        if (keywordCount >= MAX_KEYWORD_EDGES_PER_ENTRY) break;
+      }
+    }
+    if (prevInSession && prevInSession.id !== entry.id) {
+      const res = linkOne(entry.id, prevInSession.id, "session");
+      if (res.edge && res.created) made.push(res.edge);
     }
     return made;
   }
@@ -338,9 +435,12 @@ export class MemoryGraph {
   /** One-time backfill for a log that predates the graph: walk
    *  entries in ts order and link each one as if just recorded.
    *  Only creates edges that do not exist yet — re-running it (every
-   *  review does) must never touch an existing edge's weight, type
-   *  or clock, or decay would be undone. Returns the number of NEW
-   *  edges created. */
+   *  review does) must never touch an existing edge's weight or
+   *  clock, or decay would be undone. The one exception (0.4.5):
+   *  a stronger evidence type may upgrade the type in place (a
+   *  session edge becoming a keyword edge) — type only, weight and
+   *  clock untouched. Returns the number of NEW edges created
+   *  (upgrades are not new edges). */
   backfill(entries: MemoryEntry[], index: KeywordIndex, now: number): number {
     const before = this.edges.length;
     const sorted = [...entries].sort((a, b) => a.ts - b.ts);

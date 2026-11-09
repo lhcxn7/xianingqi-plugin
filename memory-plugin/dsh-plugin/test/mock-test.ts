@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MemoryCore } from "../../core/src/index.ts";
-import { apply, hasTaskBlocklistWord, inject, isPersonaTrigger, name, parseEmotion, shouldMarkPersona } from "../src/index.ts";
+import { apply, hasTaskBlocklistWord, inject, INVALIDATION_AUDIT_FILE, isPersonaTrigger, MODEL_REVIEW_AUTO_RELEASE_TURNS, name, parseEmotion, shouldMarkPersona } from "../src/index.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -289,12 +289,13 @@ check("apply never reads ctx.config (real-DSH regression)", () => {
   apply(strictProxy as never, { dataDir: strictDir } as never);
 });
 
-check("registers directives section and all eight fallback tools (compiled JSON Schema)", () => {
+check("registers directives section and all thirteen fallback tools (compiled JSON Schema)", () => {
   assert.ok(
     ctx.sections.some((s) => s.name === "memory-plugin:directives"),
   );
   const names = ctx.registeredTools.map((t) => t.name as string);
   for (const n of [
+    "memory_profile",
     "memory_search",
     "memory_remember",
     "memory_fragment",
@@ -303,6 +304,10 @@ check("registers directives section and all eight fallback tools (compiled JSON 
     "memory_restore",
     "memory_status",
     "memory_starmap",
+    "memory_invalidate",
+    "memory_belief",
+    "memory_reflect",
+    "memory_proact",
   ]) {
     assert.ok(names.includes(n), `tool ${n} registered`);
   }
@@ -513,6 +518,59 @@ check("turn 3 refreshes the context (old disposed)", () => {
   assert.equal(rec.length, 2, "context refreshed on turn 3");
   assert.equal(rec[0].disposed, true, "old context disposed");
   assert.ok(rec[1].text.includes("好呀"));
+});
+
+// ---- 0.4.0 item 4: profile block rides with the recall injection ---
+check("0.4.0 item 4: turn-1 append starts with the profile block", () => {
+  const text = (d3messages[1].content as Array<{ text: string }>)[0].text;
+  assert.ok(
+    text.startsWith("她：夏柠柒\n阶段：1"),
+    "profile block is the head of the turn-1 append",
+  );
+  assert.ok(text.includes("查岗"), "recall text follows the profile block");
+});
+
+check("0.4.0 item 4: refreshed context starts with the profile block", () => {
+  const rec = ctx
+    .agentCtx("s3")
+    .contexts.filter((c) => c.name === "memory-plugin:recall");
+  assert.ok(
+    rec[1].text.startsWith("她：夏柠柒\n阶段：1"),
+    "profile block is the head of the refreshed context",
+  );
+});
+
+const noneDir = mkdtempSync(join(tmpdir(), "memory-plugin-profile-none-"));
+writeFileSync(join(noneDir, "MEMORY.md"), fixtureMemory, "utf8");
+const noneCtx = new MockContext(noneDir);
+apply(noneCtx as never, { dataDir: noneDir } as never);
+await sleep(50); // tools register async (loadDefineTool)
+const dNone = {
+  agent: { id: "s-none", ctx: noneCtx.agentCtx("s-none") },
+  messages: [
+    {
+      role: "user",
+      content: "夏柠柒，量子纠缠实验怎么做",
+      source: { kind: "user" },
+    },
+  ],
+};
+await noneCtx.emit("agent/pre-step", dNone);
+
+check("0.4.0 item 4: no hits means no injection — the profile never leaks on its own", () => {
+  assert.equal(
+    (dNone.messages as unknown[]).length,
+    1,
+    "nothing appended without hits",
+  );
+  const rec = noneCtx
+    .agentCtx("s-none")
+    .contexts.filter((c) => c.name === "memory-plugin:recall");
+  assert.equal(
+    rec.length,
+    0,
+    "no recall context without hits — profile does not inject alone",
+  );
 });
 
 // ---- restrained mid-turn trigger (0.3.0) ---------------------------
@@ -772,6 +830,237 @@ check("minor 3: memory_restore rejects names containing /", () => {
 const restoreBackslash = await restoreTool.execute({ name: "a\\b" });
 check("minor 3: memory_restore rejects names containing \\", () => {
   assert.equal(restoreBackslash.ok, false);
+});
+
+// ---- 0.4.1 item 1: memory_profile (profile.json write path) --------
+// Isolated data dir + context, like the noneDir/midDir sections: the
+// profile write must not disturb the main dir's later checks (log
+// counts, snapshots, MEMORY.md bytes).
+const profDir = mkdtempSync(join(tmpdir(), "memory-plugin-profile-"));
+writeFileSync(join(profDir, "MEMORY.md"), fixtureMemory, "utf8");
+const profMemoryBefore = readFileSync(join(profDir, "MEMORY.md"), "utf8");
+const profCtx = new MockContext(profDir);
+apply(profCtx as never, { dataDir: profDir } as never);
+await sleep(50); // tools register async (loadDefineTool)
+const profDecision = (
+  id: string,
+  content: string,
+): Record<string, unknown> => ({
+  agent: { id, ctx: profCtx.agentCtx(id) },
+  messages: [{ role: "user", content, source: { kind: "user" } }],
+});
+const profTool = profCtx.registeredTools.find(
+  (t) => t.name === "memory_profile",
+) as unknown as {
+  execute: (
+    args: Record<string, unknown>,
+    exec?: unknown,
+  ) => Promise<{
+    ok: boolean;
+    profile?: Record<string, unknown>;
+    profileText?: string;
+    error?: string;
+  }>;
+};
+
+// s-prof goes persona (trigger word in the turn-1 pre-step), then
+// records one turn so log.jsonl exists before the profile write —
+// the write must leave both the log and MEMORY.md byte-identical.
+await profCtx.emit("agent/created", { agent: { id: "s-prof" } });
+await profCtx.emit("agent/pre-step", profDecision("s-prof", "夏柠柒，在吗"));
+await profCtx.emit("session/event", {
+  type: "user/message",
+  sessionId: "s-prof",
+  source: { kind: "user" },
+  message: {
+    content: "夏柠柒，今天好吗",
+    source: { kind: "user" },
+  },
+});
+
+const profLogBefore = readFileSync(join(profDir, "log.jsonl"), "utf8");
+const profWritten = await profTool.execute(
+  { name: "夏柠柒", stage: "稳定期", relationshipStage: "熟悉陪伴" },
+  { agent: { session: { id: "s-prof" } } },
+);
+check("0.4.1 item 1: memory_profile writes then reads back the same profile (persona window)", () => {
+  assert.equal(profWritten.ok, true);
+  assert.equal(profWritten.profile?.name, "夏柠柒");
+  assert.equal(profWritten.profile?.stage, "稳定期");
+  assert.equal(profWritten.profile?.relationshipStage, "熟悉陪伴");
+  assert.ok(
+    typeof profWritten.profile?.updatedAt === "number",
+    "write stamps updatedAt",
+  );
+  assert.ok(
+    profWritten.profileText?.includes("阶段：稳定期"),
+    "read-back block shows the new stage",
+  );
+  assert.ok(
+    profWritten.profileText?.includes("关系：熟悉陪伴"),
+    "read-back block shows the new relationship",
+  );
+  assert.ok(
+    profWritten.profileText?.includes("喜欢：银口琴"),
+    "likes still come from layer 1",
+  );
+  assert.ok(
+    (profWritten.profileText?.split("\n").length ?? 99) <= 5,
+    "block stays within B's 5 lines",
+  );
+  // The file on disk is the same profile the tool returned.
+  const onDisk = JSON.parse(
+    readFileSync(join(profDir, "profile.json"), "utf8"),
+  ) as Record<string, unknown>;
+  assert.equal(onDisk.name, "夏柠柒");
+  assert.equal(onDisk.stage, "稳定期");
+  assert.equal(onDisk.relationshipStage, "熟悉陪伴");
+  assert.equal(
+    onDisk.updatedAt,
+    profWritten.profile?.updatedAt,
+    "disk and read-back agree on updatedAt",
+  );
+  // The write touched neither the append-only log nor MEMORY.md.
+  assert.equal(
+    readFileSync(join(profDir, "log.jsonl"), "utf8"),
+    profLogBefore,
+    "profile write never edits the log",
+  );
+  assert.equal(
+    readFileSync(join(profDir, "MEMORY.md"), "utf8"),
+    profMemoryBefore,
+    "profile write never edits MEMORY.md",
+  );
+});
+
+// A partial update merges over the stored profile (untouched fields
+// survive), and a read-only call ({}) returns the current profile
+// without writing anything.
+const profJsonBeforePartial = readFileSync(
+  join(profDir, "profile.json"),
+  "utf8",
+);
+const profPartial = await profTool.execute(
+  { stage: "中期" },
+  { agent: { session: { id: "s-prof" } } },
+);
+const profReadBack = await profTool.execute(
+  {},
+  { agent: { session: { id: "s-prof" } } },
+);
+check("0.4.1 item 1: memory_profile partial update merges over the stored profile", () => {
+  assert.equal(profPartial.ok, true);
+  assert.equal(profPartial.profile?.name, "夏柠柒", "name survives a partial update");
+  assert.equal(profPartial.profile?.stage, "中期", "stage is updated");
+  assert.equal(
+    profPartial.profile?.relationshipStage,
+    "熟悉陪伴",
+    "relationship survives a partial update",
+  );
+  assert.ok(
+    profPartial.profileText?.includes("阶段：中期"),
+    "read-back block shows the merged stage",
+  );
+  assert.equal(profReadBack.ok, true);
+  assert.equal(profReadBack.profile?.stage, "中期", "read-back sees the merged stage");
+  assert.equal(
+    profReadBack.profileText,
+    profPartial.profileText,
+    "read-back block is identical to the update's",
+  );
+  assert.notEqual(
+    readFileSync(join(profDir, "profile.json"), "utf8"),
+    profJsonBeforePartial,
+    "the partial update did write (sanity: bytes changed)",
+  );
+});
+
+const profJsonBeforeReadOnly = readFileSync(
+  join(profDir, "profile.json"),
+  "utf8",
+);
+const profReadOnly = await profTool.execute(
+  {},
+  { agent: { session: { id: "s-prof" } } },
+);
+check("0.4.1 item 1: memory_profile read-only call returns the profile and leaves the file alone", () => {
+  assert.equal(profReadOnly.ok, true);
+  assert.equal(profReadOnly.profile?.stage, "中期");
+  assert.equal(
+    readFileSync(join(profDir, "profile.json"), "utf8"),
+    profJsonBeforeReadOnly,
+    "a {} call writes nothing to profile.json",
+  );
+});
+
+const profTask = await profTool.execute(
+  { name: "不应写入" },
+  { agent: { session: { id: "s-task" } } },
+);
+check("0.4.1 item 1: memory_profile refuses in a task window", () => {
+  assert.equal(profTask.ok, false);
+  assert.ok(profTask.error?.includes("人设窗口"));
+  assert.ok(
+    !readFileSync(join(profDir, "profile.json"), "utf8").includes("不应写入"),
+    "task-window call writes nothing",
+  );
+});
+
+const profJsonBeforeBad = readFileSync(join(profDir, "profile.json"), "utf8");
+const profBad = await profTool.execute(
+  { name: 123 },
+  { agent: { session: { id: "s-prof" } } },
+);
+check("0.4.1 item 1: memory_profile rejects a non-string field, writes nothing", () => {
+  assert.equal(profBad.ok, false);
+  assert.ok(profBad.error?.includes("profile_fields_must_be_strings"));
+  assert.equal(
+    readFileSync(join(profDir, "profile.json"), "utf8"),
+    profJsonBeforeBad,
+    "a rejected call writes nothing",
+  );
+});
+
+// Regression lock (the A always-on bug, at the injection level): a
+// profile.json profile exists, but a turn with no recall hits still
+// injects nothing — no append, no recall context. Separate dir with
+// the profile seeded as a fixture (like MEMORY.md above), so the
+// lock does not depend on the tool calls above.
+const profNoneDir = mkdtempSync(join(tmpdir(), "memory-plugin-profile-none-"));
+writeFileSync(join(profNoneDir, "MEMORY.md"), fixtureMemory, "utf8");
+writeFileSync(
+  join(profNoneDir, "profile.json"),
+  JSON.stringify({ name: "夏柠柒", stage: "稳定期", relationshipStage: "熟悉陪伴" }),
+  "utf8",
+);
+const profNoneCtx = new MockContext(profNoneDir);
+apply(profNoneCtx as never, { dataDir: profNoneDir } as never);
+await sleep(50); // tools register async (loadDefineTool)
+const dProfNone = {
+  agent: { id: "s-prof-none", ctx: profNoneCtx.agentCtx("s-prof-none") },
+  messages: [
+    {
+      role: "user",
+      content: "夏柠柒，量子纠缠实验怎么做",
+      source: { kind: "user" },
+    },
+  ],
+};
+await profNoneCtx.emit("agent/pre-step", dProfNone);
+check("0.4.1 item 1 (regression lock): profile.json present + no hits → still no injection", () => {
+  assert.equal(
+    (dProfNone.messages as unknown[]).length,
+    1,
+    "nothing appended without hits, profile or not",
+  );
+  const rec = profNoneCtx
+    .agentCtx("s-prof-none")
+    .contexts.filter((c) => c.name === "memory-plugin:recall");
+  assert.equal(
+    rec.length,
+    0,
+    "no recall context without hits — the profile never leaks on its own",
+  );
 });
 
 // ---- task window: no recall injection, memory_remember refused -----
@@ -2073,7 +2362,16 @@ check("model review: restored session's first turn registers the review context 
   assert.equal(live.length, 1, "one live review context");
   assert.ok(live[0].text.includes("昨天去爬山了"), "yesterday's messages are in the context");
   assert.ok(live[0].text.includes("昨天吃了拉面"));
-  assert.ok(!live[0].text.includes("今天要去买菜"), "today's messages are not in the review");
+  // 0.4.4: today's messages are not in yesterday's list — but they
+  // MAY appear in the proact proposal section (the review's
+  // proactivity proposal is built from today's memories), so the
+  // check is positional: "今天要去买菜" must not appear before
+  // the proact section marker.
+  assert.ok(
+    live[0].text.indexOf("今天要去买菜") === -1 ||
+      live[0].text.indexOf("今天要去买菜") > live[0].text.indexOf("主动提议"),
+    "today's messages are not in yesterday's list (only in the proact proposal)",
+  );
   assert.ok(live[0].text.includes("情绪"), "the 20 categories guide the model");
   assert.ok(live[0].text.includes(revE1.id), "entry ids are citable");
 });
@@ -2121,6 +2419,1648 @@ check("model review: task window cannot submit a review", () => {
   assert.equal(taskRefused.ok, false);
 });
 for (const dispose of revCtx.disposers) dispose();
+
+// ---- 0.4.4 (0.4.3 audit issue 2): the review's proactivity
+// proposal and invalidation checks reach the model --------------
+// Before this the code review computed both and then discarded
+// them (proactPrompt had no reader in dsh-plugin at all;
+// invalidationChecks were only a flag in attributes.json that
+// nothing ever read), so the model could never act on either.
+// Seed: yesterday's entries (the review prompt itself), an old
+// heavy memory contradicted by a line from today, and a today
+// entry so the day is non-empty for the proactivity proposal.
+const rev2Dir = mkdtempSync(join(tmpdir(), "memory-plugin-review-outlet-"));
+writeFileSync(join(rev2Dir, "MEMORY.md"), fixtureMemory, "utf8");
+const seed2Core = new MemoryCore({ dataDir: rev2Dir });
+seed2Core.record({ role: "user", text: "昨天去爬山了", window: "persona", sessionId: "s-rev2", ts: yTs });
+seed2Core.record({ role: "assistant", text: "昨天吃了拉面", window: "persona", sessionId: "s-rev2", ts: yTs + 60000 });
+const rev2Old = seed2Core.record({ role: "user", text: "他喜欢吃辣", window: "persona", importance: "heavy", sessionId: "s-rev2", ts: Date.now() - 40 * 24 * 60 * 60 * 1000 });
+seed2Core.record({ role: "user", text: "他不吃辣了", window: "persona", sessionId: "s-rev2", ts: Date.now() });
+seed2Core.flush();
+
+const rev2Ctx = new MockContext(rev2Dir);
+apply(rev2Ctx as never, { dataDir: rev2Dir } as never);
+await sleep(50);
+const rev2Decision = (id: string, content: string): Record<string, unknown> => ({
+  agent: { id, ctx: rev2Ctx.agentCtx(id) },
+  messages: [{ role: "user", content, source: { kind: "user" } }],
+});
+const rev2LiveContexts = (id: string) =>
+  rev2Ctx
+    .agentCtx(id)
+    .contexts.filter(
+      (c) => c.name === "memory-plugin:daily-review" && !c.disposed,
+    );
+
+// Fresh open: no review (m-6).
+await rev2Ctx.emit("agent/created", { agent: { id: "s-rev2" } });
+await rev2Ctx.emit("agent/pre-step", rev2Decision("s-rev2", "夏柠柒，在吗"));
+// Reopen: restored persona -> code review runs -> the next turn
+// hands yesterday's messages PLUS the proactivity proposal and
+// the invalidation checks to the model.
+await rev2Ctx.emit("agent/created", { agent: { id: "s-rev2" } });
+await rev2Ctx.emit("agent/pre-step", rev2Decision("s-rev2", "夏柠柒，在吗"));
+check("0.4.4: daily-review context carries the proact proposal and the invalidation checks", () => {
+  const live = rev2LiveContexts("s-rev2");
+  assert.equal(live.length, 1, "one live review context");
+  assert.ok(live[0].text.includes("昨天去爬山了"), "yesterday's messages still in the context");
+  assert.ok(live[0].text.includes("主动提议"), "proact section present");
+  assert.ok(live[0].text.includes("要不要主动找他说句话"), "proact proposal text pasted in");
+  assert.ok(live[0].text.includes("memory_proact"), "tells her how to act (fresh gate call for the token)");
+  assert.ok(live[0].text.includes("可能已经过时"), "invalidation section present");
+  assert.ok(live[0].text.includes(rev2Old.id), "invalidation entry id citable");
+  assert.ok(live[0].text.includes("他喜欢吃辣"), "invalidation entry text present");
+  assert.ok(live[0].text.includes("memory_invalidate"), "tells her how to confirm");
+});
+const rev2StatusTool = rev2Ctx.registeredTools.find(
+  (t) => t.name === "memory_status",
+) as unknown as {
+  execute: () => Promise<{ ok: boolean; pendingInvalidationChecks?: number }>;
+};
+const rev2Status = await rev2StatusTool.execute();
+check("0.4.4: memory_status returns the pending invalidation-check count", () => {
+  assert.equal(rev2Status.ok, true);
+  assert.equal(rev2Status.pendingInvalidationChecks, 1, "one check awaiting model review");
+});
+for (const dispose of rev2Ctx.disposers) dispose();
+
+// ---- 0.4.5 (0.4.3 audit item 4): the review context auto-releases
+// after 3 turns without a submission — before this it lived in
+// every request until the model called memory_daily_review.
+// Fresh dir so the code review is due on reopen.
+const rev3Dir = mkdtempSync(join(tmpdir(), "memory-plugin-review-autorelease-"));
+writeFileSync(join(rev3Dir, "MEMORY.md"), fixtureMemory, "utf8");
+const seed3Core = new MemoryCore({ dataDir: rev3Dir });
+seed3Core.record({ role: "user", text: "昨天去爬山了", window: "persona", sessionId: "s-rev3", ts: yTs });
+seed3Core.record({ role: "assistant", text: "昨天吃了拉面", window: "persona", sessionId: "s-rev3", ts: yTs + 60000 });
+seed3Core.flush();
+
+const rev3Ctx = new MockContext(rev3Dir);
+apply(rev3Ctx as never, { dataDir: rev3Dir } as never);
+await sleep(50);
+const rev3Decision = (id: string, content: string): Record<string, unknown> => ({
+  agent: { id, ctx: rev3Ctx.agentCtx(id) },
+  messages: [{ role: "user", content, source: { kind: "user" } }],
+});
+const rev3LiveContexts = (id: string) =>
+  rev3Ctx
+    .agentCtx(id)
+    .contexts.filter(
+      (c) => c.name === "memory-plugin:daily-review" && !c.disposed,
+    );
+
+// Fresh open + trigger, then reopen: restored persona -> code
+// review runs -> the next turn registers the review context.
+await rev3Ctx.emit("agent/created", { agent: { id: "s-rev3" } });
+await rev3Ctx.emit("agent/pre-step", rev3Decision("s-rev3", "夏柠柒，在吗"));
+await rev3Ctx.emit("agent/created", { agent: { id: "s-rev3" } });
+await rev3Ctx.emit("agent/pre-step", rev3Decision("s-rev3", "夏柠柒，在吗"));
+check("0.4.5: review context registers on the restored session's first turn", () => {
+  assert.equal(rev3LiveContexts("s-rev3").length, 1, "one live review context");
+});
+// Two more turns without submitting: still live.
+for (let i = 0; i < MODEL_REVIEW_AUTO_RELEASE_TURNS - 1; i++) {
+  await rev3Ctx.emit("agent/pre-step", rev3Decision("s-rev3", "夏柠柒，在吗"));
+}
+check("0.4.5: review context survives turns without a submission until the limit", () => {
+  assert.equal(rev3LiveContexts("s-rev3").length, 1, "still live before the limit");
+});
+// One more turn (the 3rd since registration): auto-released.
+await rev3Ctx.emit("agent/pre-step", rev3Decision("s-rev3", "夏柠柒，在吗"));
+check("0.4.5: review context auto-releases after 3 turns without a submission", () => {
+  assert.equal(rev3LiveContexts("s-rev3").length, 0, "disposed on the 3rd turn");
+});
+for (const dispose of rev3Ctx.disposers) dispose();
+
+// ---- 0.4.0 item 1: memory_invalidate tool ---------------------------
+// Reuses ctx020 / s-edge (persona). The invalidated entry is the
+// warm-sweater one recorded via memory_remember above (never
+// fragmented, so a search for 毛衣 must come back empty afterwards);
+// the task-refusal probe uses an untouched 蓝莓蛋糕 entry.
+const invalidate020 = ctx020.registeredTools.find(
+  (t) => t.name === "memory_invalidate",
+) as unknown as {
+  execute: (
+    args: Record<string, unknown>,
+    exec?: unknown,
+  ) => Promise<{
+    ok: boolean;
+    invalidated?: string[];
+    unknown?: string[];
+    error?: string;
+  }>;
+};
+const search020b = ctx020.registeredTools.find(
+  (t) => t.name === "memory_search",
+) as unknown as {
+  execute: (args: Record<string, unknown>) => Promise<{
+    hits: Array<{ id: string; text: string }>;
+  }>;
+};
+const readAttrs020b = () =>
+  JSON.parse(readFileSync(join(dir020, "attributes.json"), "utf8")) as {
+    entries: Record<string, Record<string, unknown>>;
+  };
+const auditLines020 = (): Array<Record<string, unknown>> => {
+  const f = join(dir020, INVALIDATION_AUDIT_FILE);
+  if (!existsSync(f)) return [];
+  return readFileSync(f, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+};
+const sweaterId = (remWarm as { id: string }).id;
+assert.ok(sweaterId, "warm-sweater entry id to invalidate");
+
+const invRes = await invalidate020.execute(
+  { entryIds: [sweaterId], reason: "他后来改口说不喜欢暖阳色的毛衣了" },
+  execEdge,
+);
+const searchAfterInv = await search020b.execute({ query: "毛衣" });
+check("0.4.0 item 1: memory_invalidate marks the entry invalid, writes the audit line, log untouched", () => {
+  assert.equal(invRes.ok, true);
+  assert.deepEqual(invRes.invalidated, [sweaterId]);
+  assert.deepEqual(invRes.unknown, []);
+  assert.equal(
+    typeof readAttrs020b().entries[sweaterId].validTo,
+    "number",
+    "validTo persisted to attributes.json",
+  );
+  const lines = auditLines020();
+  assert.equal(lines.length, 1, "one audit line");
+  assert.equal(lines[0].sessionId, "s-edge", "audit names the calling session (who)");
+  assert.equal(typeof lines[0].at, "number", "audit carries when");
+  assert.equal(lines[0].reason, "他后来改口说不喜欢暖阳色的毛衣了", "audit carries why");
+  assert.deepEqual(lines[0].entryIds, [sweaterId]);
+  assert.ok(
+    !searchAfterInv.hits.some((h) => h.id === sweaterId),
+    "invalidated entry no longer recalls through memory_search",
+  );
+  assert.ok(
+    readFileSync(join(dir020, "log.jsonl"), "utf8").includes("暖阳色的毛衣"),
+    "log.jsonl original still there — skipped, not deleted",
+  );
+});
+
+const auditBeforeRefusal = auditLines020().length;
+const cakeSecondId = (cakeEntries[1] as { id: string }).id;
+const refusedInv = await invalidate020.execute(
+  { entryIds: [cakeSecondId], reason: "任务窗口偷偷失效" },
+  { agent: { session: { id: "s-never-triggered" } } },
+);
+const badIdsInv = await invalidate020.execute({ entryIds: [], reason: "x" }, execEdge);
+const badReasonInv = await invalidate020.execute(
+  { entryIds: [cakeSecondId], reason: "  " },
+  execEdge,
+);
+check("0.4.0 item 1: memory_invalidate refuses in a task window and writes no audit line", () => {
+  assert.equal(refusedInv.ok, false);
+  assert.equal(
+    readAttrs020b().entries[cakeSecondId]?.validTo,
+    undefined,
+    "task-window call invalidated nothing",
+  );
+  assert.equal(auditLines020().length, auditBeforeRefusal, "no audit line for a refused call");
+});
+check("0.4.0 item 1: memory_invalidate refuses empty entryIds / empty reason without writing", () => {
+  assert.equal(badIdsInv.ok, false);
+  assert.equal(badReasonInv.ok, false);
+  assert.equal(
+    readAttrs020b().entries[cakeSecondId]?.validTo,
+    undefined,
+    "invalid args invalidated nothing",
+  );
+  assert.equal(auditLines020().length, auditBeforeRefusal, "no audit line for invalid args");
+});
+
+check("0.4.0 item 1: old data — attributes.json without the new fields loads, invalidate works", () => {
+  const dirOld = mkdtempSync(join(tmpdir(), "memory-plugin-invalidate-old-"));
+  writeFileSync(join(dirOld, "MEMORY.md"), "# MEMORY\n", "utf8");
+  const coreOld = new MemoryCore({ dataDir: dirOld });
+  const eOld = coreOld.record({
+    role: "user",
+    text: "他喜欢吃辣",
+    window: "persona",
+    importance: "heavy",
+    sessionId: "s1",
+  });
+  // Simulate pre-0.4.0 data: strip the new fields from attributes.json.
+  const attrsPath = join(dirOld, "attributes.json");
+  const raw = JSON.parse(readFileSync(attrsPath, "utf8")) as {
+    entries: Record<string, Record<string, unknown>>;
+  };
+  for (const row of Object.values(raw.entries)) {
+    delete row.validFrom;
+    delete row.validTo;
+    delete row.needsInvalidationCheck;
+  }
+  writeFileSync(attrsPath, JSON.stringify(raw), "utf8");
+  const coreOld2 = new MemoryCore({ dataDir: dirOld });
+  assert.ok(
+    coreOld2.recall("吃辣").hits.some((h) => h.entry.id === eOld.id),
+    "old attributes recall fine",
+  );
+  const res = coreOld2.invalidateEntries([eOld.id]);
+  assert.deepEqual(res.invalidated, [eOld.id]);
+  assert.ok(
+    !coreOld2.recall("吃辣").hits.some((h) => h.entry.id === eOld.id),
+    "invalidate works on old data",
+  );
+});
+
+// ---- 0.4.0 item 2: memory_belief tool -------------------------------
+// Fresh dir/ctx; two persona entries recorded through session/event
+// (the same path real DSH uses), so the tool's verbatim checks run
+// against real log text.
+const dirBel = mkdtempSync(join(tmpdir(), "memory-plugin-belief-"));
+writeFileSync(join(dirBel, "MEMORY.md"), fixtureMemory, "utf8");
+const ctxBel = new MockContext(dirBel);
+apply(ctxBel as never, { dataDir: dirBel } as never);
+await sleep(50); // tools register async (loadDefineTool)
+const decisionBel = (id: string, content: string): Record<string, unknown> => ({
+  agent: { id, ctx: ctxBel.agentCtx(id) },
+  messages: [{ role: "user", content, source: { kind: "user" } }],
+});
+await ctxBel.emit("agent/created", { agent: { id: "s-bel" } });
+await ctxBel.emit("agent/pre-step", decisionBel("s-bel", "夏柠柒"));
+await ctxBel.emit("session/event", {
+  type: "user/message",
+  sessionId: "s-bel",
+  source: { kind: "user" },
+  message: { content: "夏柠柒，昨晚难过的时候第一个想到的就是你", source: { kind: "user" } },
+});
+await ctxBel.emit("session/event", {
+  type: "user/message",
+  sessionId: "s-bel",
+  source: { kind: "user" },
+  message: { content: "夏柠柒，答应陪你看星星结果没去成", source: { kind: "user" } },
+});
+const logEntriesBel = (): Array<Record<string, unknown>> => {
+  const file = join(dirBel, "log.jsonl");
+  if (!existsSync(file)) return [];
+  return readFileSync(file, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+};
+const belEntry1 = logEntriesBel().find(
+  (e) => (e.text as string).includes("昨晚难过的时候第一个想到的就是你"),
+) as { id: string };
+const belEntry2 = logEntriesBel().find(
+  (e) => (e.text as string).includes("答应陪你看星星结果没去成"),
+) as { id: string };
+assert.ok(belEntry1 && belEntry2, "both belief evidence entries recorded");
+const execBel = { agent: { session: { id: "s-bel" } } };
+type BeliefToolResult = {
+  ok: boolean;
+  belief?: { id: string; strength: number; proofCount: number };
+  dimensions?: Record<string, { strength: number; uncertainty: number; proofCount: number }>;
+  beliefs?: Array<Record<string, unknown>>;
+  duplicate?: boolean;
+  error?: string;
+  reasons?: string[];
+};
+const beliefBel = ctxBel.registeredTools.find(
+  (t) => t.name === "memory_belief",
+) as unknown as {
+  execute: (args: Record<string, unknown>, exec?: unknown) => Promise<BeliefToolResult>;
+};
+assert.ok(beliefBel, "memory_belief is registered (9th tool)");
+
+const createBel = await beliefBel.execute(
+  {
+    action: "create",
+    dimension: "trust",
+    statement: "他难过时会来找我",
+    entryId: belEntry1.id,
+    quote: "昨晚难过的时候第一个想到的就是你",
+  },
+  execBel,
+);
+check("0.4.0 item 2: memory_belief create writes a belief, non-verbatim quote is rejected", () => {
+  assert.equal(createBel.ok, true, JSON.stringify(createBel));
+  assert.equal(createBel.belief?.id, "BEL_TRUST_001");
+  assert.equal(createBel.belief?.strength, 0.5);
+  assert.equal(createBel.belief?.proofCount, 1);
+  const stored = JSON.parse(readFileSync(join(dirBel, "beliefs.json"), "utf8")) as {
+    beliefs: Array<{ id: string; statement: string }>;
+  };
+  assert.equal(stored.beliefs.length, 1, "one belief persisted");
+  assert.equal(stored.beliefs[0].statement, "他难过时会来找我");
+});
+
+const badQuoteCreate = await beliefBel.execute(
+  {
+    action: "create",
+    dimension: "trust",
+    statement: "他难过时第一个想到我",
+    entryId: belEntry1.id,
+    quote: "昨晚难过第一个想到你",
+  },
+  execBel,
+);
+check("0.4.0 item 2: memory_belief create with a paraphrased quote is rejected and writes nothing", () => {
+  assert.equal(badQuoteCreate.ok, false, "paraphrase must be rejected");
+  assert.ok((badQuoteCreate.reasons?.length ?? 0) > 0, "rejection carries reasons");
+  const stored = JSON.parse(readFileSync(join(dirBel, "beliefs.json"), "utf8")) as {
+    beliefs: Array<unknown>;
+  };
+  assert.equal(stored.beliefs.length, 1, "rejected create writes nothing");
+});
+
+// support without delta: the tool must ask the model to supply it.
+const noDelta = await beliefBel.execute(
+  { action: "support", beliefId: "BEL_TRUST_001", entryId: belEntry1.id, quote: "昨晚难过的时候第一个想到的就是你" },
+  execBel,
+);
+const overCap = await beliefBel.execute(
+  { action: "support", beliefId: "BEL_TRUST_001", entryId: belEntry1.id, quote: "昨晚难过的时候第一个想到的就是你", delta: 0.5 },
+  execBel,
+);
+check("0.4.0 item 2: memory_belief support requires delta, clamps an over-cap delta to 0.2 without erroring", () => {
+  assert.equal(noDelta.ok, false, "missing delta is an error, not a silent default");
+  assert.ok((noDelta.error ?? "").includes("delta"), "error tells the model to supply delta");
+  assert.equal(overCap.ok, true, "over-cap delta is clamped, not an error");
+  assert.ok(
+    Math.abs((overCap.belief?.strength ?? 0) - 0.7) < 1e-9,
+    `0.5 clamped to +0.2 (got ${overCap.belief?.strength})`,
+  );
+});
+
+// Contradict twice with the same entry: only the first deducts.
+const contra1 = await beliefBel.execute(
+  { action: "contradict", beliefId: "BEL_TRUST_001", entryId: belEntry2.id, quote: "答应陪你看星星结果没去成", delta: 0.1 },
+  execBel,
+);
+const contra2 = await beliefBel.execute(
+  { action: "contradict", beliefId: "BEL_TRUST_001", entryId: belEntry2.id, quote: "答应陪你看星星结果没去成", delta: 0.1 },
+  execBel,
+);
+const getBel = await beliefBel.execute({ action: "get" }, execBel);
+check("0.4.0 item 2: memory_belief contradict deducts once per entry; get returns three dimensions without full quotes", () => {
+  assert.equal(contra1.ok, true);
+  assert.ok(Math.abs((contra1.belief?.strength ?? 0) - 0.6) < 1e-9, "first contradict deducts 0.1");
+  assert.equal(contra2.ok, true);
+  assert.equal(contra2.duplicate, true, "repeat contradict is flagged duplicate");
+  assert.ok(Math.abs((contra2.belief?.strength ?? 0) - 0.6) < 1e-9, "duplicate deducts nothing");
+  assert.equal(getBel.ok, true);
+  assert.ok(getBel.dimensions, "get returns dimensions");
+  assert.ok(Math.abs((getBel.dimensions?.trust.strength ?? 0) - 0.6) < 1e-9, "trust reads 0.6");
+  assert.equal(getBel.dimensions?.trust.proofCount, 2, "trust proofCount counts the two supports");
+  assert.equal(getBel.dimensions?.safety.proofCount, 0, "empty safety reads 0 proofs");
+  assert.equal(getBel.dimensions?.safety.uncertainty, 1, "empty safety reads uncertainty 1");
+  assert.ok(
+    !JSON.stringify(getBel).includes("昨晚难过的时候第一个想到的就是你"),
+    "get never returns the full verbatim quote",
+  );
+  assert.ok(
+    (getBel.beliefs ?? []).some((b) => b.id === "BEL_TRUST_001"),
+    "get lists the belief (id + statement + numbers, no evidence text)",
+  );
+});
+
+const statusBel = ctxBel.registeredTools.find(
+  (t) => t.name === "memory_status",
+) as unknown as {
+  execute: (args: Record<string, unknown>) => Promise<{
+    ok: boolean;
+    beliefs?: number;
+    beliefDimensions?: Record<string, { strength: number; proofCount: number }>;
+  }>;
+};
+const statusBelRes = await statusBel.execute({});
+check("0.4.0 item 2: memory_status shows beliefs + three dimensions", () => {
+  assert.equal(statusBelRes.ok, true);
+  assert.equal(statusBelRes.beliefs, 1, "status counts the belief");
+  assert.ok(
+    Math.abs((statusBelRes.beliefDimensions?.trust.strength ?? 0) - 0.6) < 1e-9,
+    "status shows the trust value",
+  );
+  assert.equal(statusBelRes.beliefDimensions?.trust.proofCount, 2);
+});
+
+// Turn 2+ refresh: a memory-cue pre-step re-runs recall and the
+// refreshed context must carry the same belief line as the turn-1
+// append (the shell's formatRecallBlock call, not just core.recall).
+await ctxBel.emit(
+  "agent/pre-step",
+  decisionBel("s-bel", "夏柠柒，你还记得昨晚难过的时候吗"),
+);
+check("0.4.0 item 2: turn-2 refresh context carries the belief line", () => {
+  const rec = ctxBel
+    .agentCtx("s-bel")
+    .contexts.filter((c) => c.name === "memory-plugin:recall");
+  assert.ok(rec.length >= 1, "a recall context was registered");
+  const text = rec.map((c) => c.text).join("\n");
+  assert.ok(
+    text.includes("关系：信任 0.6（证据 2 条）"),
+    `belief line rides the refresh (got: ${JSON.stringify(text)})`,
+  );
+});
+
+const refusedBel = await beliefBel.execute(
+  { action: "get" },
+  { agent: { session: { id: "s-never-triggered" } } },
+);
+const badActionBel = await beliefBel.execute({ action: "dance" }, execBel);
+check("0.4.0 item 2: memory_belief refuses in a task window; unknown action is an error", () => {
+  assert.equal(refusedBel.ok, false, "task window gets no belief read or write");
+  assert.equal(badActionBel.ok, false, "unknown action is rejected");
+  const stored = JSON.parse(readFileSync(join(dirBel, "beliefs.json"), "utf8")) as {
+    beliefs: Array<unknown>;
+  };
+  assert.equal(stored.beliefs.length, 1, "refused calls write nothing");
+});
+
+{
+  const dirBelOld = mkdtempSync(join(tmpdir(), "memory-plugin-belief-old-"));
+  writeFileSync(join(dirBelOld, "MEMORY.md"), fixtureMemory, "utf8");
+  const ctxBelOld = new MockContext(dirBelOld);
+  apply(ctxBelOld as never, { dataDir: dirBelOld } as never);
+  await sleep(50);
+  const beliefOld = ctxBelOld.registeredTools.find(
+    (t) => t.name === "memory_belief",
+  ) as unknown as {
+    execute: (args: Record<string, unknown>, exec?: unknown) => Promise<BeliefToolResult>;
+  };
+  await ctxBelOld.emit("agent/created", { agent: { id: "s-bel-old" } });
+  await ctxBelOld.emit("agent/pre-step", {
+    agent: { id: "s-bel-old", ctx: ctxBelOld.agentCtx("s-bel-old") },
+    messages: [{ role: "user", content: "夏柠柒", source: { kind: "user" } }],
+  });
+  const getOld = await beliefOld.execute(
+    { action: "get" },
+    { agent: { session: { id: "s-bel-old" } } },
+  );
+  check("0.4.0 item 2: old data — no beliefs.json starts empty, get works", () => {
+    assert.equal(getOld.ok, true);
+    assert.deepEqual(getOld.dimensions?.trust, { strength: 0, uncertainty: 1, proofCount: 0, beliefs: 0 });
+    assert.deepEqual(getOld.beliefs, []);
+    assert.equal(existsSync(join(dirBelOld, "beliefs.json")), false, "get does not create the file");
+  });
+}
+
+// ---- 0.4.0 item 3: memory_reflect tool -----------------------------
+// Fresh dir/ctx; six heavy "累" entries recorded through
+// memory_remember (the same path the model uses), so the gate
+// opens on real log text: 6 x 0.9 = 5.4 >= 5.
+const dirRef = mkdtempSync(join(tmpdir(), "memory-plugin-reflect-"));
+writeFileSync(join(dirRef, "MEMORY.md"), fixtureMemory, "utf8");
+const ctxRef = new MockContext(dirRef);
+apply(ctxRef as never, { dataDir: dirRef } as never);
+await sleep(50); // tools register async (loadDefineTool)
+const decisionRef = (id: string, content: string): Record<string, unknown> => ({
+  agent: { id, ctx: ctxRef.agentCtx(id) },
+  messages: [{ role: "user", content, source: { kind: "user" } }],
+});
+await ctxRef.emit("agent/created", { agent: { id: "s-ref" } });
+await ctxRef.emit("agent/pre-step", decisionRef("s-ref", "夏柠柒"));
+const execRef = { agent: { session: { id: "s-ref" } } };
+type ReflectToolResult = {
+  ok: boolean;
+  triggered: boolean;
+  reflectionId?: string;
+  text?: string;
+  error?: string;
+  reasons?: string[];
+};
+const rememberRef = ctxRef.registeredTools.find(
+  (t) => t.name === "memory_remember",
+) as unknown as {
+  execute: (
+    args: Record<string, unknown>,
+    exec?: unknown,
+  ) => Promise<{ ok: boolean; id: string }>;
+};
+const reflectRef = ctxRef.registeredTools.find(
+  (t) => t.name === "memory_reflect",
+) as unknown as {
+  execute: (
+    args: Record<string, unknown>,
+    exec?: unknown,
+  ) => Promise<ReflectToolResult>;
+};
+assert.ok(reflectRef, "memory_reflect is registered (10th tool)");
+const refTexts = [
+  "今天好累",
+  "昨天也说好累",
+  "前天累得不想动",
+  "今天又说累",
+  "累得睡不着",
+  "好累，什么都不想干",
+];
+const refIds: string[] = [];
+for (const text of refTexts) {
+  const r = await rememberRef.execute({ text }, execRef);
+  assert.ok(r.ok, `remember ${text}`);
+  refIds.push(r.id);
+}
+const readFragmentsRef = (): Array<Record<string, unknown>> => {
+  const f = join(dirRef, "fragments.json");
+  if (!existsSync(f)) return [];
+  return (
+    JSON.parse(readFileSync(f, "utf8")) as {
+      fragments: Array<Record<string, unknown>>;
+    }
+  ).fragments;
+};
+
+const gateOpen = await reflectRef.execute({}, execRef);
+check("0.4.0 item 3: memory_reflect gate opens above the floor and hands the model the prompt", () => {
+  assert.equal(gateOpen.ok, true);
+  assert.equal(gateOpen.triggered, true, "6 heavy in 24 h clears the floor");
+  assert.ok(
+    (gateOpen.text ?? "").includes("今天好累"),
+    "the prompt carries the triggering memories",
+  );
+  assert.ok(
+    (gateOpen.text ?? "").includes("你自己决定"),
+    "the prompt says the decision is the model's",
+  );
+  assert.equal(gateOpen.reflectionId, undefined, "the gate call saves nothing, so no id");
+  assert.equal(readFragmentsRef().length, 0, "the gate call writes nothing");
+});
+
+const saveRef = await reflectRef.execute(
+  {
+    text: "他最近压力大，「今天好累」「昨天也说好累」",
+    sourceIds: refIds.slice(0, 3),
+  },
+  execRef,
+);
+check("0.4.0 item 3: memory_reflect saves the conclusion as a reflection fragment", () => {
+  assert.equal(saveRef.ok, true, JSON.stringify(saveRef));
+  assert.equal(saveRef.triggered, true);
+  assert.ok(
+    (saveRef.reflectionId ?? "").startsWith("refl-"),
+    "save returns the reflection id",
+  );
+  assert.equal(saveRef.text, "他最近压力大，「今天好累」「昨天也说好累」");
+  const stored = readFragmentsRef();
+  assert.equal(stored.length, 1, "one fragment persisted");
+  assert.equal(stored[0].type, "reflection", "stored as a reflection fragment");
+  assert.equal(stored[0].id, saveRef.reflectionId);
+});
+
+// The three reflected entries no longer count: the remaining three
+// heavies (2.7 < 5) leave the gate closed — no reflecting twice
+// on the same day about the same memories.
+const gateAfterSave = await reflectRef.execute({}, execRef);
+check("0.4.0 item 3: memory_reflect gate closes once the entries are already reflected", () => {
+  assert.equal(gateAfterSave.triggered, false, "already-reflected entries do not re-trigger");
+  assert.equal(gateAfterSave.text, undefined, "below the floor there is no prompt at all");
+});
+
+// Reopen the gate with six fresh heavy entries, then try to save a
+// fabricated quote: the whole reflection is void, nothing is stored.
+const refTexts2 = [
+  "今天累坏了",
+  "昨天累得够呛",
+  "前天也累",
+  "今天还是累",
+  "累得不想说话",
+  "好累啊好累啊",
+];
+const refIds2: string[] = [];
+for (const text of refTexts2) {
+  const r = await rememberRef.execute({ text }, execRef);
+  assert.ok(r.ok, `remember ${text}`);
+  refIds2.push(r.id);
+}
+const gateOpen2 = await reflectRef.execute({}, execRef);
+assert.equal(gateOpen2.triggered, true, "fresh entries reopen the gate");
+const fabricatedSave = await reflectRef.execute(
+  {
+    text: "他最近压力大，「今天一点都不累」",
+    sourceIds: refIds2.slice(0, 3),
+  },
+  execRef,
+);
+const noSourceSave = await reflectRef.execute(
+  { text: "他最近压力大，「今天累坏了」" },
+  execRef,
+);
+check("0.4.0 item 3: memory_reflect rejects a fabricated quote — whole reflection void, nothing stored", () => {
+  assert.equal(fabricatedSave.ok, false, "fabricated quote must be rejected");
+  assert.ok((fabricatedSave.reasons?.length ?? 0) > 0, "rejection carries reasons");
+  assert.ok(
+    (fabricatedSave.reasons ?? []).some((r) => r.includes("今天一点都不累")),
+    "the reason names the fabricated quote",
+  );
+  assert.equal(readFragmentsRef().length, 1, "rejected save stores nothing");
+  assert.equal(noSourceSave.ok, false, "save without sourceIds is refused");
+  assert.ok(
+    (noSourceSave.error ?? "").includes("sourceIds"),
+    "the error tells the model to supply sourceIds",
+  );
+  assert.equal(readFragmentsRef().length, 1, "refused save stores nothing");
+});
+
+// 0.4.1 follow-up: sources must come from the CURRENT gate.
+// refIds[0] is a real persona entry and the quote is verbatim
+// from it — but it was already reflected in the first save, so
+// it is not in the gate the model was just shown (refIds2).
+// The save must be refused before any quote check, nothing stored.
+const staleSourceSave = await reflectRef.execute(
+  {
+    text: "他最近压力大，「今天好累」",
+    sourceIds: [refIds[0]],
+  },
+  execRef,
+);
+check("0.4.1 follow-up: memory_reflect refuses a source outside the current gate — even a real persona entry with a verbatim quote", () => {
+  assert.equal(staleSourceSave.ok, false, "an out-of-gate source is refused");
+  assert.ok(
+    (staleSourceSave.error ?? "").includes("不在本次反思提示里"),
+    "the error names the gate rule",
+  );
+  assert.equal(readFragmentsRef().length, 1, "refused save stores nothing");
+});
+
+const refusedRefGate = await reflectRef.execute(
+  {},
+  { agent: { session: { id: "s-never-triggered" } } },
+);
+const refusedRefSave = await reflectRef.execute(
+  {
+    text: "他最近压力大，「今天累坏了」",
+    sourceIds: refIds2.slice(0, 3),
+  },
+  { agent: { session: { id: "s-never-triggered" } } },
+);
+check("0.4.0 item 3: memory_reflect refuses in a task window — gate and save alike, nothing written", () => {
+  assert.equal(refusedRefGate.ok, false, "task window gets no gate check");
+  assert.equal(refusedRefGate.triggered, false);
+  assert.equal(refusedRefSave.ok, false, "task window gets no save");
+  assert.equal(readFragmentsRef().length, 1, "refused calls write nothing");
+});
+
+// Below the floor: one heavy entry (0.9 < 5) — no prompt, no model
+// call. Five more reopen it. The dir has no fragments.json at all,
+// so this also covers old data (no reflection rows, no crash).
+const dirRefLow = mkdtempSync(join(tmpdir(), "memory-plugin-reflect-low-"));
+writeFileSync(join(dirRefLow, "MEMORY.md"), fixtureMemory, "utf8");
+const ctxRefLow = new MockContext(dirRefLow);
+apply(ctxRefLow as never, { dataDir: dirRefLow } as never);
+await sleep(50);
+await ctxRefLow.emit("agent/created", { agent: { id: "s-low" } });
+await ctxRefLow.emit("agent/pre-step", {
+  agent: { id: "s-low", ctx: ctxRefLow.agentCtx("s-low") },
+  messages: [{ role: "user", content: "夏柠柒", source: { kind: "user" } }],
+});
+const execLow = { agent: { session: { id: "s-low" } } };
+const rememberLow = ctxRefLow.registeredTools.find(
+  (t) => t.name === "memory_remember",
+) as unknown as {
+  execute: (
+    args: Record<string, unknown>,
+    exec?: unknown,
+  ) => Promise<{ ok: boolean; id: string }>;
+};
+const reflectLow = ctxRefLow.registeredTools.find(
+  (t) => t.name === "memory_reflect",
+) as unknown as {
+  execute: (
+    args: Record<string, unknown>,
+    exec?: unknown,
+  ) => Promise<ReflectToolResult>;
+};
+const lowFirst = await rememberLow.execute({ text: "今天好累" }, execLow);
+assert.ok(lowFirst.ok, "low-dir first entry recorded");
+const gateLow = await reflectLow.execute({}, execLow);
+check("0.4.0 item 3: below the floor the tool returns triggered:false with no prompt", () => {
+  assert.equal(gateLow.ok, true);
+  assert.equal(gateLow.triggered, false, "one heavy entry (0.9) is below the floor");
+  assert.equal(gateLow.text, undefined, "no prompt is built below the floor");
+  assert.equal(existsSync(join(dirRefLow, "fragments.json")), false, "no prompt means no write");
+});
+for (const text of refTexts.slice(1)) {
+  const r = await rememberLow.execute({ text }, execLow);
+  assert.ok(r.ok, `remember ${text}`);
+}
+const gateLowOpen = await reflectLow.execute({}, execLow);
+check("0.4.0 item 3: old data — no fragments.json starts empty, the gate still opens at six heavies", () => {
+  assert.equal(gateLowOpen.triggered, true, "six heavies reopen the gate on old data");
+  assert.ok((gateLowOpen.text ?? "").includes("今天好累"));
+});
+
+// Coordinator fix: the save call's text/sourceIds must be declared
+// in the schema (optional), not just read leniently — a strict host
+// strips undeclared parameters, which would have made saving
+// unreachable. The gate call still passes {}.
+check("0.4.0 item 3: memory_reflect schema declares optional text and sourceIds for the save call", () => {
+  const tool = ctxRefLow.registeredTools.find(
+    (t) => t.name === "memory_reflect",
+  ) as unknown as {
+    parameters: {
+      type?: string;
+      properties?: Record<string, unknown>;
+      required?: string[];
+    };
+  };
+  assert.ok(tool, "memory_reflect is registered");
+  assert.equal(tool.parameters?.type, "object");
+  assert.ok("text" in (tool.parameters?.properties ?? {}), "text is declared");
+  assert.ok("sourceIds" in (tool.parameters?.properties ?? {}), "sourceIds is declared");
+  assert.ok(!(tool.parameters?.required ?? []).includes("text"), "text is optional — {} still gates");
+  assert.ok(!(tool.parameters?.required ?? []).includes("sourceIds"), "sourceIds is optional — {} still gates");
+});
+
+// 0.4.3 reflection gate snapshot (tool level): the save
+// validates against the snapshot of the gate prompt the model
+// was shown, not a freshly recomputed gate. The clock is stubbed
+// (Date.now), never a real 24 h wait: six heavies recorded at
+// T0, gate at T0, then the clock jumps to T0 + 25 h before the
+// model hands the conclusion back — a fresh recompute at
+// T0 + 25 h would find no sources in the window and refuse.
+{
+  const dirSnap = mkdtempSync(join(tmpdir(), "memory-plugin-reflect-snap-"));
+  writeFileSync(join(dirSnap, "MEMORY.md"), fixtureMemory, "utf8");
+  const ctxSnap = new MockContext(dirSnap);
+  apply(ctxSnap as never, { dataDir: dirSnap } as never);
+  await sleep(50);
+  await ctxSnap.emit("agent/created", { agent: { id: "s-snap" } });
+  await ctxSnap.emit("agent/pre-step", {
+    agent: { id: "s-snap", ctx: ctxSnap.agentCtx("s-snap") },
+    messages: [{ role: "user", content: "夏柠柒", source: { kind: "user" } }],
+  });
+  const execSnap = { agent: { session: { id: "s-snap" } } };
+  const rememberSnap = ctxSnap.registeredTools.find(
+    (t) => t.name === "memory_remember",
+  ) as unknown as {
+    execute: (
+      args: Record<string, unknown>,
+      exec?: unknown,
+    ) => Promise<{ ok: boolean; id: string }>;
+  };
+  const reflectSnap = ctxSnap.registeredTools.find(
+    (t) => t.name === "memory_reflect",
+  ) as unknown as {
+    execute: (
+      args: Record<string, unknown>,
+      exec?: unknown,
+    ) => Promise<ReflectToolResult>;
+  };
+  const readFragmentsSnap = (): Array<Record<string, unknown>> => {
+    const f = join(dirSnap, "fragments.json");
+    if (!existsSync(f)) return [];
+    return (
+      JSON.parse(readFileSync(f, "utf8")) as {
+        fragments: Array<Record<string, unknown>>;
+      }
+    ).fragments;
+  };
+  const realNow = Date.now;
+  let fakeNow = realNow();
+  Date.now = () => fakeNow;
+  try {
+    const snapIds: string[] = [];
+    for (const text of refTexts) {
+      const r = await rememberSnap.execute({ text }, execSnap);
+      assert.ok(r.ok, `remember ${text}`);
+      snapIds.push(r.id);
+    }
+    const gateSnap = await reflectSnap.execute({}, execSnap);
+    assert.equal(gateSnap.triggered, true, "gate opens at T0");
+    // 25 h pass before the model hands the conclusion back: every
+    // source has crossed the 24 h boundary by now.
+    fakeNow += 25 * 60 * 60 * 1000;
+    const saveSnap = await reflectSnap.execute(
+      {
+        text: "他最近压力大，「今天好累」「昨天也说好累」",
+        sourceIds: snapIds.slice(0, 3),
+      },
+      execSnap,
+    );
+    check("0.4.3 reflection snapshot: save succeeds after its sources crossed the 24 h boundary", () => {
+      assert.equal(saveSnap.ok, true, JSON.stringify(saveSnap));
+      assert.ok(
+        (saveSnap.reflectionId ?? "").startsWith("refl-"),
+        "save returns the reflection id",
+      );
+      assert.equal(readFragmentsSnap().length, 1, "one reflection fragment persisted");
+      assert.equal(
+        readFragmentsSnap()[0].id,
+        saveSnap.reflectionId,
+        "stored fragment is the saved one",
+      );
+    });
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// The reflection prompt rides the daily-review context: a restored
+// persona session with six heavy entries from yesterday gets its
+// code review at agent/created, and the first pre-step hands the
+// model the reflection prompt with yesterday's messages.
+// 0.4.6 (0.4.5 audit new issue 3): this block used
+// `Date.now() - 20h` for "yesterday's memory" — at 20:00–24:00
+// local that lands today 00:00–04:00, so yesterdayEntries()
+// returns 0 and the suite aborts. The clock is pinned to a fixed
+// morning instead (like core's local()): yesterday 14:00 is
+// yesterday at any hour, and the 24 h reflection gate still sees
+// the entries (20 h old). Restored in finally, like the snapshot
+// block above.
+{
+  const refCtxRealNow = Date.now;
+  const refCtxFakeNow = new Date(2026, 10, 7, 10, 0, 0, 0).getTime();
+  Date.now = () => refCtxFakeNow;
+  try {
+  const dirRefCtx = mkdtempSync(join(tmpdir(), "memory-plugin-reflect-ctx-"));
+  writeFileSync(join(dirRefCtx, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreRefCtx = new MemoryCore({ dataDir: dirRefCtx });
+  const yest = Date.now() - 20 * 60 * 60 * 1000;
+  for (let i = 0; i < 6; i++) {
+    coreRefCtx.record({
+      role: "user",
+      text: refTexts[i],
+      window: "persona",
+      importance: "heavy",
+      sessionId: "s-ref2",
+      ts: yest + i * 60 * 1000,
+    });
+  }
+  writeFileSync(
+    join(dirRefCtx, "persona-sessions.json"),
+    JSON.stringify(["s-ref2"]),
+    "utf8",
+  );
+  const ctxRef2 = new MockContext(dirRefCtx);
+  apply(ctxRef2 as never, { dataDir: dirRefCtx } as never);
+  await sleep(50);
+  await ctxRef2.emit("agent/created", { agent: { id: "s-ref2" } });
+  await ctxRef2.emit("agent/pre-step", {
+    agent: { id: "s-ref2", ctx: ctxRef2.agentCtx("s-ref2") },
+    messages: [{ role: "user", content: "夏柠柒，在吗", source: { kind: "user" } }],
+  });
+  check("0.4.0 item 3: restored session's first turn registers the review context with the reflection prompt", () => {
+    const reviewCtx = ctxRef2
+      .agentCtx("s-ref2")
+      .contexts.filter((c) => c.name === "memory-plugin:daily-review");
+    assert.ok(reviewCtx.length >= 1, "a daily-review context was registered");
+    const text = reviewCtx.map((c) => c.text).join("\n");
+    assert.ok(text.includes("memory_reflect"), "review context carries the reflection prompt");
+    assert.ok(text.includes("今天好累"), "review context carries the triggering memories");
+    assert.ok(text.includes("你自己决定"), "review context says the decision is the model's");
+  });
+  for (const dispose of ctxRef2.disposers) dispose();
+  } finally {
+    Date.now = refCtxRealNow;
+  }
+}
+
+// 0.4.6 (0.4.5 audit new issue 4): entriesByIds throwing inside
+// registerModelReview degrades to no recent section, never breaks
+// the round. Same shape as the reflect-ctx block above, but
+// MemoryCore.prototype.entriesByIds is stubbed to throw between
+// agent/created (which computes the review and its recent ids)
+// and the first pre-step (which resolves those ids to entries).
+// The stub is on the prototype, so the shell's own core instance
+// — created inside apply(), unreachable from the test — hits it
+// too. Restored in finally, with the clock and console.warn.
+{
+  const dir4 = mkdtempSync(join(tmpdir(), "memory-plugin-review-entriesbyids-"));
+  writeFileSync(join(dir4, "MEMORY.md"), fixtureMemory, "utf8");
+  const core4 = new MemoryCore({ dataDir: dir4 });
+  const realNow4 = Date.now;
+  const fakeNow4 = new Date(2026, 10, 7, 10, 0, 0, 0).getTime();
+  Date.now = () => fakeNow4;
+  const origEntriesByIds = MemoryCore.prototype.entriesByIds;
+  const warns4: string[] = [];
+  const origWarn4 = console.warn;
+  try {
+    const yest4 = Date.now() - 20 * 60 * 60 * 1000;
+    for (let i = 0; i < 6; i++) {
+      core4.record({
+        role: "user",
+        text: refTexts[i],
+        window: "persona",
+        importance: "heavy",
+        sessionId: "s-ref4",
+        ts: yest4 + i * 60 * 1000,
+      });
+    }
+    writeFileSync(
+      join(dir4, "persona-sessions.json"),
+      JSON.stringify(["s-ref4"]),
+      "utf8",
+    );
+    const ctx4 = new MockContext(dir4);
+    apply(ctx4 as never, { dataDir: dir4 } as never);
+    await sleep(50);
+    await ctx4.emit("agent/created", { agent: { id: "s-ref4" } });
+    // From here on the id-resolution read fails.
+    MemoryCore.prototype.entriesByIds = (): never => {
+      throw new Error("entriesByIds boom");
+    };
+    console.warn = (...args: unknown[]) => {
+      warns4.push(args.map(String).join(" "));
+    };
+    const fake4 = { kind: "proceed" };
+    const ret4 = await (ctx4.preStep as Handler).handler(
+      {
+        agent: { id: "s-ref4", ctx: ctx4.agentCtx("s-ref4") },
+        messages: [{ role: "user", content: "夏柠柒，在吗", source: { kind: "user" } }],
+      },
+      async () => fake4,
+    );
+    check("0.4.6 new issue 4: entriesByIds throws -> review context still registers, round survives", () => {
+      assert.equal(ret4, fake4, "pre-step still returns next()'s value");
+      const reviewCtx = ctx4
+        .agentCtx("s-ref4")
+        .contexts.filter((c) => c.name === "memory-plugin:daily-review");
+      assert.ok(reviewCtx.length >= 1, "a daily-review context was registered despite the failed read");
+      const text = reviewCtx.map((c) => c.text).join("\n");
+      assert.ok(text.includes("昨天的对话"), "yesterday's section is still in the prompt");
+      assert.ok(text.includes("今天好累"), "yesterday's entries are still listed");
+      assert.ok(
+        text.includes("今天没有值得注意的新对话"),
+        "the merged recent section degrades to its empty note instead of breaking the round",
+      );
+      assert.ok(
+        warns4.some((w) => w.includes("最近记忆读取失败")),
+        "a warn names the failed read",
+      );
+    });
+    for (const dispose of ctx4.disposers) dispose();
+  } finally {
+    console.warn = origWarn4;
+    MemoryCore.prototype.entriesByIds = origEntriesByIds;
+    Date.now = realNow4;
+  }
+}
+
+// 0.4.7 (0.4.6 audit new issue 1 + 0.4.3 item 8): the audit's
+// scenario end to end — 25 fresh 24 h memories, the top one
+// already reflected. The merged review section shows it in full
+// AND marked; a save citing it is refused, and a save citing an
+// unmarked shown entry still succeeds after the entries cross
+// the 24 h boundary, because the review path now sets the gate
+// snapshot instead of recomputing.
+{
+  const dirR7 = mkdtempSync(join(tmpdir(), "memory-plugin-review-reflect-mark-"));
+  writeFileSync(join(dirR7, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreR7 = new MemoryCore({ dataDir: dirR7 });
+  const realNowR7 = Date.now;
+  const fakeNowR7 = new Date(2026, 10, 7, 10, 0, 0, 0).getTime();
+  Date.now = () => fakeNowR7;
+  try {
+    const yestR7 = Date.now() - 20 * 60 * 60 * 1000;
+    const idsR7: string[] = [];
+    for (let i = 0; i < 25; i++) {
+      const e = coreR7.record({
+        role: "user",
+        text: `今天好累${i}，聊了好多事`,
+        window: "persona",
+        importance: "heavy",
+        sessionId: "s-r7",
+        ts: yestR7 + i * 60 * 1000,
+      });
+      idsR7.push(e.id);
+    }
+    const savedR7 = coreR7.saveReflection("他最近很累，「今天好累0」。", [idsR7[0]]);
+    assert.equal(savedR7.ok, true, "setup: the first reflection saves");
+    // saveReflection does not flush — the shell's core (created
+    // inside apply) must read the fragment from fragments.json.
+    coreR7.flush();
+    writeFileSync(
+      join(dirR7, "persona-sessions.json"),
+      JSON.stringify(["s-r7"]),
+      "utf8",
+    );
+    const ctxR7 = new MockContext(dirR7);
+    apply(ctxR7 as never, { dataDir: dirR7 } as never);
+    await sleep(50);
+    await ctxR7.emit("agent/created", { agent: { id: "s-r7" } });
+    await ctxR7.emit("agent/pre-step", {
+      agent: { id: "s-r7", ctx: ctxR7.agentCtx("s-r7") },
+      messages: [{ role: "user", content: "夏柠柒，在吗", source: { kind: "user" } }],
+    });
+    const reflectToolR7 = ctxR7.registeredTools.find(
+      (t) => t.name === "memory_reflect",
+    ) as {
+      execute: (args: unknown, exec?: unknown) => Promise<Record<string, unknown>>;
+    };
+    check("0.4.7 new issue 1: merged review section marks the reflected entry; the prompt explains the mark", () => {
+      const reviewCtx = ctxR7
+        .agentCtx("s-r7")
+        .contexts.filter((c) => c.name === "memory-plugin:daily-review");
+      assert.ok(reviewCtx.length >= 1, "a daily-review context was registered");
+      const text = reviewCtx.map((c) => c.text).join("\n");
+      const merged = text.slice(text.indexOf("最近 24 小时里值得注意的几条"));
+      const reflectedLine = merged
+        .split("\n")
+        .find((l) => l.includes(`[${idsR7[0]}]`));
+      assert.ok(
+        reflectedLine?.includes("（本次反思不可引用）"),
+        "the reflected entry is shown in full AND marked not citable",
+      );
+      assert.ok(
+        text.includes("带“本次反思不可引用”标记的条目这次不能当引用来源"),
+        "the reflection instruction explains the mark",
+      );
+    });
+    // A save citing the marked entry is refused — the prompt told
+    // the model not to cite it, and the snapshot enforces it. A
+    // failed save keeps the snapshot for the next attempt.
+    const refusedR7 = await reflectToolR7.execute(
+      { text: "他最近很累，「今天好累0」。", sourceIds: [idsR7[0]] },
+      { agent: { session: { id: "s-r7" } } },
+    );
+    check("0.4.7 new issue 1: citing the marked entry is refused", () => {
+      assert.equal(refusedR7.ok, false, "the marked source is refused");
+      assert.ok(
+        String(refusedR7.error ?? "").includes("不在本次反思提示里"),
+        "the refusal names the prompt",
+      );
+    });
+    // Item 8: advance the clock 5 h — the entries are now 25 h
+    // old, so a freshly recomputed gate would be empty and
+    // refuse. The review-path snapshot must carry the save.
+    Date.now = () => fakeNowR7 + 5 * 60 * 60 * 1000;
+    const lateR7 = await reflectToolR7.execute(
+      { text: "他最近压力大，「今天好累1」。", sourceIds: [idsR7[1]] },
+      { agent: { session: { id: "s-r7" } } },
+    );
+    check("0.4.7 (0.4.3 item 8): the review-path gate snapshot carries a save past the 24 h boundary", () => {
+      assert.equal(
+        lateR7.ok,
+        true,
+        "the unmarked shown entry saves via the snapshot, not a recompute",
+      );
+    });
+    for (const dispose of ctxR7.disposers) dispose();
+  } finally {
+    Date.now = realNowR7;
+  }
+}
+
+// 0.4.7 (0.4.6 audit new issue 2): the standalone memory_proact
+// gate prompt tells the model about the overflow — 200 memories
+// in 24 h: 20 shown, 20 as summaries, 160 counted.
+{
+  const dirP7 = mkdtempSync(join(tmpdir(), "memory-plugin-proact-overflow-"));
+  writeFileSync(join(dirP7, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreP7 = new MemoryCore({ dataDir: dirP7 });
+  const nowP7 = Date.now();
+  for (let i = 0; i < 200; i++) {
+    coreP7.record({
+      role: "user",
+      text: `今天好累${i}，聊了好多事`,
+      window: "persona",
+      importance: "heavy",
+      sessionId: "s-p7",
+      ts: nowP7 - i * 60_000,
+    });
+  }
+  writeFileSync(
+    join(dirP7, "persona-sessions.json"),
+    JSON.stringify(["s-p7"]),
+    "utf8",
+  );
+  const ctxP7 = new MockContext(dirP7);
+  apply(ctxP7 as never, { dataDir: dirP7 } as never);
+  await sleep(50);
+  await ctxP7.emit("agent/created", { agent: { id: "s-p7" } });
+  await ctxP7.emit("agent/pre-step", {
+    agent: { id: "s-p7", ctx: ctxP7.agentCtx("s-p7") },
+    messages: [{ role: "user", content: "夏柠柒，在吗", source: { kind: "user" } }],
+  });
+  const proactToolP7 = ctxP7.registeredTools.find(
+    (t) => t.name === "memory_proact",
+  ) as {
+    execute: (args: unknown, exec?: unknown) => Promise<Record<string, unknown>>;
+  };
+  const gateP7 = await proactToolP7.execute(
+    {},
+    { agent: { session: { id: "s-p7" } } },
+  );
+  check("0.4.7 new issue 2: the proact gate prompt counts the overflow", () => {
+    assert.equal(gateP7.ok, true, "a prompt is issued");
+    const prompt = String(gateP7.prompt ?? "");
+    assert.ok(prompt.includes("另有 160 条未列出"), "the gate prompt counts the hidden overflow");
+    assert.equal(
+      prompt.split("（摘要）").length - 1,
+      20,
+      "20 overflow entries are listed as summaries",
+    );
+  });
+  for (const dispose of ctxP7.disposers) dispose();
+}
+
+// ---- 0.4.0 item 7: memory_proact tool ----------------------------
+// Fresh dir/ctx; two entries recorded through memory_remember (the
+// same path the model uses), so the gate prompt carries real log
+// text from the last 24 h. Two-call shape, like memory_reflect:
+// {} gates + prompts, the second call carries the decision.
+const dirPro = mkdtempSync(join(tmpdir(), "memory-plugin-proact-"));
+writeFileSync(join(dirPro, "MEMORY.md"), fixtureMemory, "utf8");
+const ctxPro = new MockContext(dirPro);
+apply(ctxPro as never, { dataDir: dirPro } as never);
+await sleep(50); // tools register async (loadDefineTool)
+await ctxPro.emit("agent/created", { agent: { id: "s-pro" } });
+await ctxPro.emit("agent/pre-step", {
+  agent: { id: "s-pro", ctx: ctxPro.agentCtx("s-pro") },
+  messages: [{ role: "user", content: "夏柠柒", source: { kind: "user" } }],
+});
+const execPro = { agent: { session: { id: "s-pro" } } };
+type ProactToolResult = {
+  ok: boolean;
+  action?: Record<string, unknown> | null;
+  prompt?: string;
+  promptToken?: string;
+  text?: string;
+  reason?: string;
+  error?: string;
+};
+const rememberPro = ctxPro.registeredTools.find(
+  (t) => t.name === "memory_remember",
+) as unknown as {
+  execute: (
+    args: Record<string, unknown>,
+    exec?: unknown,
+  ) => Promise<{ ok: boolean; id: string }>;
+};
+const proactRef = ctxPro.registeredTools.find(
+  (t) => t.name === "memory_proact",
+) as unknown as {
+  execute: (
+    args: Record<string, unknown>,
+    exec?: unknown,
+  ) => Promise<ProactToolResult>;
+};
+assert.ok(proactRef, "memory_proact is registered (12th tool)");
+const proEntry1 = await rememberPro.execute(
+  { text: "明天有考试，今晚得早点睡" },
+  execPro,
+);
+assert.ok(proEntry1.ok, "remember proact entry 1");
+const proEntry2 = await rememberPro.execute(
+  { text: "考完想吃顿好的" },
+  execPro,
+);
+assert.ok(proEntry2.ok, "remember proact entry 2");
+const readLoopPro = (): Array<Record<string, unknown>> => {
+  const f = join(dirPro, "loop.json");
+  if (!existsSync(f)) return [];
+  return (
+    JSON.parse(readFileSync(f, "utf8")) as {
+      pendingActions: Array<Record<string, unknown>>;
+    }
+  ).pendingActions;
+};
+
+const gatePro = await proactRef.execute({}, execPro);
+check("0.4.1 item 7 (merge 2): memory_proact gate returns the prompt and its token, and stores no action", () => {
+  assert.equal(gatePro.ok, true);
+  assert.equal(gatePro.action, null, "the gate call stores no action");
+  assert.ok(
+    (gatePro.prompt ?? "").includes("明天有考试，今晚得早点睡"),
+    "the prompt carries today's memory",
+  );
+  assert.ok(
+    (gatePro.prompt ?? "").includes("不要为了主动而主动"),
+    "the prompt says not to act for acting's sake",
+  );
+  assert.ok(
+    (gatePro.prompt ?? "").includes("不行动是完全可以接受的回答"),
+    "the prompt says not acting is fine",
+  );
+  assert.ok(
+    (gatePro.prompt ?? "").includes(proEntry1.id),
+    "the prompt carries the entry id for the trigger",
+  );
+  assert.ok(
+    (gatePro.promptToken ?? "").startsWith("PROACT_"),
+    "the gate returns a prompt token",
+  );
+  const loopAfterGate = JSON.parse(
+    readFileSync(join(dirPro, "loop.json"), "utf8"),
+  ) as {
+    pendingActions: unknown[];
+    lastJudgedAt: number;
+    pendingPrompt?: { token: string; sourceIds: string[] };
+  };
+  assert.deepEqual(loopAfterGate.pendingActions, [], "the gate stores no action");
+  assert.equal(
+    loopAfterGate.lastJudgedAt,
+    0,
+    "issuing the prompt writes no lastJudgedAt",
+  );
+  assert.equal(
+    loopAfterGate.pendingPrompt?.token,
+    gatePro.promptToken,
+    "the issued token is persisted",
+  );
+  assert.ok(
+    loopAfterGate.pendingPrompt?.sourceIds.includes(proEntry1.id),
+    "the persisted prompt lists the entry id",
+  );
+});
+
+// channel "qq" is rejected before anything is stored — the
+// placeholder must never let a qq action into loop.json.
+const qqPro = await proactRef.execute(
+  {
+    act: true,
+    judgment: "模型判断",
+    actionText: "模型写的话",
+    trigger: proEntry1.id,
+    channel: "qq",
+  },
+  execPro,
+);
+check("0.4.0 item 7: memory_proact channel qq returns qq_not_connected and stores nothing", () => {
+  assert.equal(qqPro.ok, false, "qq is an error, not a stored action");
+  assert.equal(qqPro.error, "qq_not_connected", "the error names the missing connection");
+  assert.equal(qqPro.action, null);
+  assert.equal(readLoopPro().length, 0, "a rejected qq call stores nothing");
+});
+
+const savePro = await proactRef.execute(
+  {
+    act: true,
+    judgment: "他明天有考试，今晚会紧张",
+    actionText: "模型自己写的一句话",
+    trigger: proEntry1.id,
+    promptToken: gatePro.promptToken,
+  },
+  execPro,
+);
+check("0.4.0 item 7: memory_proact decision call stores the action and hands the words back", () => {
+  assert.equal(savePro.ok, true, JSON.stringify(savePro));
+  assert.ok(savePro.action, "the decision stores an action");
+  assert.equal(savePro.action?.trigger, proEntry1.id, "the trigger is the entry id");
+  assert.equal(savePro.action?.judgment, "他明天有考试，今晚会紧张");
+  assert.equal(savePro.action?.actionText, "模型自己写的一句话");
+  assert.equal(savePro.action?.channel, "session", "channel defaults to session");
+  assert.equal(savePro.action?.status, "pending", "a fresh action is pending");
+  assert.equal(savePro.text, "模型自己写的一句话", "the tool hands the model's words back for the chat");
+  const stored = readLoopPro();
+  assert.equal(stored.length, 1, "one action persisted in loop.json");
+  assert.equal(stored[0].id, savePro.action?.id, "the persisted row is the returned action");
+});
+
+// The day's one action is spent: a second decision (another
+// trigger) and a second gate call are both refused, with the
+// daily-limit reason — and neither writes anything new.
+const secondPro = await proactRef.execute(
+  {
+    act: true,
+    judgment: "模型判断",
+    actionText: "模型写的话",
+    trigger: proEntry2.id,
+  },
+  execPro,
+);
+const gateAfterPro = await proactRef.execute({}, execPro);
+check("0.4.0 item 7: memory_proact refuses a second action the same day — decision and gate alike", () => {
+  assert.equal(secondPro.ok, true, "a refused decision is still ok:true — it just stores nothing");
+  assert.equal(secondPro.action, null, "the second decision stores no action");
+  assert.ok(
+    (secondPro.reason ?? "").includes("今天已经主动过一次"),
+    "the refusal names the daily limit",
+  );
+  assert.equal(gateAfterPro.action, null, "the gate after an action returns no prompt");
+  assert.ok(
+    (gateAfterPro.reason ?? "").includes("今天已经主动过一次"),
+    "the gate refusal names the daily limit too",
+  );
+  assert.equal(readLoopPro().length, 1, "refused calls write nothing new");
+});
+
+// act:false and a malformed decision both mean "do nothing": no
+// action, no crash. (Same dir, same day — the daily limit is
+// already spent, but act:false must not even reach it: it returns
+// action:null on its own merits.)
+const noActPro = await proactRef.execute({ act: false }, execPro);
+const malformedPro = await proactRef.execute(
+  { act: true, judgment: "模型判断", trigger: proEntry2.id },
+  execPro,
+);
+check("0.4.0 item 7: memory_proact act:false or a malformed decision stores nothing and never crashes", () => {
+  assert.equal(noActPro.ok, true);
+  assert.equal(noActPro.action, null, "act:false stores nothing");
+  assert.equal(malformedPro.ok, true);
+  assert.equal(malformedPro.action, null, "a decision without actionText stores nothing");
+  assert.equal(readLoopPro().length, 1, "neither call writes anything");
+});
+
+const refusedProGate = await proactRef.execute(
+  {},
+  { agent: { session: { id: "s-never-triggered" } } },
+);
+const refusedProSave = await proactRef.execute(
+  {
+    act: true,
+    judgment: "模型判断",
+    actionText: "模型写的话",
+    trigger: proEntry1.id,
+  },
+  { agent: { session: { id: "s-never-triggered" } } },
+);
+check("0.4.0 item 7: memory_proact refuses in a task window — gate and save alike, nothing written", () => {
+  assert.equal(refusedProGate.ok, false, "task window gets no gate check");
+  assert.equal(refusedProGate.action, null);
+  assert.equal(refusedProSave.ok, false, "task window gets no save");
+  assert.equal(readLoopPro().length, 1, "refused calls write nothing");
+});
+
+// Coordinator fix (same as memory_reflect): the decision fields
+// must be declared in the schema (optional), not just read
+// leniently — a strict host strips undeclared parameters, which
+// would have made the second call unreachable. The gate call
+// still passes {}.
+check("0.4.1 item 7 (merge 2): memory_proact schema declares optional act/judgment/actionText/trigger/promptToken/channel", () => {
+  const tool = ctxPro.registeredTools.find(
+    (t) => t.name === "memory_proact",
+  ) as unknown as {
+    parameters: {
+      type?: string;
+      properties?: Record<string, unknown>;
+      required?: string[];
+    };
+  };
+  assert.ok(tool, "memory_proact is registered");
+  assert.equal(tool.parameters?.type, "object");
+  for (const field of ["act", "judgment", "actionText", "trigger", "promptToken", "channel"]) {
+    assert.ok(field in (tool.parameters?.properties ?? {}), `${field} is declared`);
+    assert.ok(!(tool.parameters?.required ?? []).includes(field), `${field} is optional — {} still gates`);
+  }
+});
+
+// Old data: a fresh dir with no loop.json at all — the gate still
+// opens on today's entries, and act:false on an empty day stores
+// nothing and creates no file.
+{
+  const dirProOld = mkdtempSync(join(tmpdir(), "memory-plugin-proact-old-"));
+  writeFileSync(join(dirProOld, "MEMORY.md"), fixtureMemory, "utf8");
+  const ctxProOld = new MockContext(dirProOld);
+  apply(ctxProOld as never, { dataDir: dirProOld } as never);
+  await sleep(50);
+  await ctxProOld.emit("agent/created", { agent: { id: "s-old" } });
+  await ctxProOld.emit("agent/pre-step", {
+    agent: { id: "s-old", ctx: ctxProOld.agentCtx("s-old") },
+    messages: [{ role: "user", content: "夏柠柒", source: { kind: "user" } }],
+  });
+  const execOld = { agent: { session: { id: "s-old" } } };
+  const rememberOld = ctxProOld.registeredTools.find(
+    (t) => t.name === "memory_remember",
+  ) as unknown as {
+    execute: (
+      args: Record<string, unknown>,
+      exec?: unknown,
+    ) => Promise<{ ok: boolean; id: string }>;
+  };
+  const proactOld = ctxProOld.registeredTools.find(
+    (t) => t.name === "memory_proact",
+  ) as unknown as {
+    execute: (
+      args: Record<string, unknown>,
+      exec?: unknown,
+    ) => Promise<ProactToolResult>;
+  };
+  const oldEntry = await rememberOld.execute({ text: "明天有考试，今晚得早点睡" }, execOld);
+  assert.ok(oldEntry.ok, "old-dir entry recorded");
+  const gateOld = await proactOld.execute({}, execOld);
+  check("0.4.0 item 7: old data — no loop.json starts empty, the gate still opens on today's entries and issues a token", () => {
+    assert.equal(gateOld.ok, true);
+    assert.equal(gateOld.action, null);
+    assert.ok((gateOld.prompt ?? "").includes("明天有考试，今晚得早点睡"));
+    assert.ok(
+      (gateOld.promptToken ?? "").startsWith("PROACT_"),
+      "the gate issues a token on old data too",
+    );
+    const loopOld = JSON.parse(
+      readFileSync(join(dirProOld, "loop.json"), "utf8"),
+    ) as { pendingActions: unknown[]; pendingPrompt?: { token: string } };
+    assert.deepEqual(loopOld.pendingActions, [], "the gate stores no action");
+    assert.equal(loopOld.pendingPrompt?.token, gateOld.promptToken);
+  });
+  const noActOld = await proactOld.execute(
+    { act: false, promptToken: gateOld.promptToken },
+    execOld,
+  );
+  check("0.4.1 item 7 (merge 2): old data — act:false on a fresh dir stores nothing and voids the token", () => {
+    assert.equal(noActOld.ok, true);
+    assert.equal(noActOld.action, null);
+    const loopOldAfter = JSON.parse(
+      readFileSync(join(dirProOld, "loop.json"), "utf8"),
+    ) as { pendingActions: unknown[]; pendingPrompt?: unknown };
+    assert.deepEqual(loopOldAfter.pendingActions, [], "act:false stores nothing");
+    assert.equal(
+      loopOldAfter.pendingPrompt,
+      undefined,
+      "act:false voids the prompt token",
+    );
+  });
+}
+
+// ---- 0.4.1 merge (items 2 + 4): the token at the tool level --------
+// A decision must carry the gate's token; a missing/wrong token, or
+// a trigger the prompt never showed, stores nothing. act:false with
+// the token voids it — the same token can never store afterwards.
+// (Token expiry is covered at the core level with explicit clocks;
+// the tool always uses Date.now().)
+{
+  const dirTok = mkdtempSync(join(tmpdir(), "memory-plugin-proact-token-"));
+  writeFileSync(join(dirTok, "MEMORY.md"), fixtureMemory, "utf8");
+  const ctxTok = new MockContext(dirTok);
+  apply(ctxTok as never, { dataDir: dirTok } as never);
+  await sleep(50);
+  await ctxTok.emit("agent/created", { agent: { id: "s-tok" } });
+  await ctxTok.emit("agent/pre-step", {
+    agent: { id: "s-tok", ctx: ctxTok.agentCtx("s-tok") },
+    messages: [{ role: "user", content: "夏柠柒", source: { kind: "user" } }],
+  });
+  const execTok = { agent: { session: { id: "s-tok" } } };
+  const rememberTok = ctxTok.registeredTools.find(
+    (t) => t.name === "memory_remember",
+  ) as unknown as {
+    execute: (
+      args: Record<string, unknown>,
+      exec?: unknown,
+    ) => Promise<{ ok: boolean; id: string }>;
+  };
+  const proactTok = ctxTok.registeredTools.find(
+    (t) => t.name === "memory_proact",
+  ) as unknown as {
+    execute: (
+      args: Record<string, unknown>,
+      exec?: unknown,
+    ) => Promise<ProactToolResult>;
+  };
+  const readLoopTok = (): Array<Record<string, unknown>> => {
+    const f = join(dirTok, "loop.json");
+    if (!existsSync(f)) return [];
+    return (
+      JSON.parse(readFileSync(f, "utf8")) as {
+        pendingActions: Array<Record<string, unknown>>;
+      }
+    ).pendingActions;
+  };
+  const tokEntry = await rememberTok.execute(
+    { text: "明天有考试，今晚得早点睡" },
+    execTok,
+  );
+  assert.ok(tokEntry.ok, "token-dir entry recorded");
+  const gateTok = await proactTok.execute({}, execTok);
+  // act:false with the token voids it; the same token then refuses.
+  const noActTok = await proactTok.execute(
+    { act: false, promptToken: gateTok.promptToken },
+    execTok,
+  );
+  const deadTok = await proactTok.execute(
+    {
+      act: true,
+      judgment: "模型判断",
+      actionText: "模型写的话",
+      trigger: tokEntry.id,
+      promptToken: gateTok.promptToken,
+    },
+    execTok,
+  );
+  check("0.4.1 item 7 (merge 2): act:false voids its prompt token — the same token stores nothing afterwards", () => {
+    assert.equal(noActTok.ok, true);
+    assert.equal(noActTok.action, null, "act:false stores nothing");
+    assert.equal(deadTok.ok, true);
+    assert.equal(deadTok.action, null, "a voided token stores nothing");
+    assert.equal(
+      deadTok.reason,
+      "proact_prompt_not_found",
+      "the refusal names the missing prompt",
+    );
+    assert.equal(readLoopTok().length, 0, "no action was stored");
+  });
+  // A fresh gate issues a fresh token; decisions without one, with
+  // a wrong one, or with a trigger outside the prompt are refused.
+  const gateTok2 = await proactTok.execute({}, execTok);
+  const noToken = await proactTok.execute(
+    {
+      act: true,
+      judgment: "模型判断",
+      actionText: "模型写的话",
+      trigger: tokEntry.id,
+    },
+    execTok,
+  );
+  const wrongToken = await proactTok.execute(
+    {
+      act: true,
+      judgment: "模型判断",
+      actionText: "模型写的话",
+      trigger: tokEntry.id,
+      promptToken: "PROACT_bogus",
+    },
+    execTok,
+  );
+  const outsideTrigger = await proactTok.execute(
+    {
+      act: true,
+      judgment: "模型判断",
+      actionText: "模型写的话",
+      trigger: "mem-never-shown",
+      promptToken: gateTok2.promptToken,
+    },
+    execTok,
+  );
+  check("0.4.1 item 7 (merge 2): a decision without the token, with a wrong token, or with a trigger outside the prompt is refused", () => {
+    assert.notEqual(
+      gateTok2.promptToken,
+      gateTok.promptToken,
+      "a fresh gate issues a fresh token",
+    );
+    assert.equal(noToken.action, null, "no token stores nothing");
+    assert.equal(noToken.reason, "proact_prompt_not_found");
+    assert.equal(wrongToken.action, null, "a wrong token stores nothing");
+    assert.equal(wrongToken.reason, "proact_prompt_not_found");
+    assert.equal(outsideTrigger.action, null, "a trigger outside the prompt stores nothing");
+    assert.equal(outsideTrigger.reason, "proact_trigger_not_in_prompt");
+    assert.equal(readLoopTok().length, 0, "refused decisions store nothing");
+  });
+  // The right token stores — and issuing it spent no quota: the
+  // gate before it and the store after it both ran on the same day.
+  const saveTok = await proactTok.execute(
+    {
+      act: true,
+      judgment: "他明天有考试，今晚会紧张",
+      actionText: "模型自己写的一句话",
+      trigger: tokEntry.id,
+      promptToken: gateTok2.promptToken,
+    },
+    execTok,
+  );
+  check("0.4.1 item 7 (merge 2): the issued token stores the action; issuing the prompt spent no quota", () => {
+    assert.equal(saveTok.ok, true, JSON.stringify(saveTok));
+    assert.ok(saveTok.action, "the decision stores an action");
+    assert.equal(saveTok.text, "模型自己写的一句话", "the tool hands the model's words back");
+    assert.equal(readLoopTok().length, 1, "one action persisted");
+  });
+}
+
+// ---- 0.4.0 item 5: spotlight rides the existing single recall —
+// no extra model round, no extra tool call. The ☆ candidates and
+// the prompt line travel inside the one recall the pre-step already
+// runs; the pre-step must therefore trigger zero memory_search tool
+// executions, before and after the change (counted, not assumed).
+const dirSpot = mkdtempSync(join(tmpdir(), "memory-plugin-spotlight-"));
+writeFileSync(join(dirSpot, "MEMORY.md"), fixtureMemory, "utf8");
+const ctxSpot = new MockContext(dirSpot);
+apply(ctxSpot as never, { dataDir: dirSpot } as never);
+await sleep(50); // tools register async (loadDefineTool)
+const decisionSpot = (id: string, content: string): Record<string, unknown> => ({
+  agent: { id, ctx: ctxSpot.agentCtx(id) },
+  messages: [{ role: "user", content, source: { kind: "user" } }],
+});
+// Seed one persona memory, the way the main flow does.
+await ctxSpot.emit("agent/created", { agent: { id: "sp1" } });
+await ctxSpot.emit("agent/pre-step", decisionSpot("sp1", "夏柠柒，在吗"));
+await ctxSpot.emit("session/event", {
+  type: "user/message",
+  sessionId: "sp1",
+  source: { kind: "user" },
+  message: { content: "以后每周五查岗", source: { kind: "user" } },
+});
+const searchSpot = ctxSpot.tools.get("memory_search") as unknown as {
+  execute: (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+};
+let searchCalls = 0;
+const origSearchExecute = searchSpot.execute;
+searchSpot.execute = async (args: Record<string, unknown>) => {
+  searchCalls += 1;
+  return origSearchExecute(args);
+};
+
+await ctxSpot.emit("agent/created", { agent: { id: "sp2" } });
+const dSpot = decisionSpot("sp2", "夏柠柒，查岗的事还记得吗");
+await ctxSpot.emit("agent/pre-step", dSpot);
+
+check("0.4.0 item 5: one pre-step trigger makes zero memory_search tool calls and appends exactly once, with ☆ candidates", () => {
+  assert.equal(searchCalls, 0, "pre-step never calls the memory_search tool");
+  const msgs = dSpot.messages as Array<Record<string, unknown>>;
+  assert.equal(msgs.length, 2, "exactly one append — the single recall");
+  const text = (msgs[1].content as Array<{ text: string }>)[0].text;
+  assert.ok(text.includes("查岗"), "recall carried");
+  assert.ok(text.includes("☆"), "candidate marked ☆ in the append");
+  assert.ok(text.includes("不用调工具"), "prompt line rides the same append");
+  const rec = ctxSpot
+    .agentCtx("sp2")
+    .contexts.filter((c) => c.name === "memory-plugin:recall");
+  assert.equal(rec.length, 0, "turn 1 registers no extra recall context (m16)");
+});
+
+// A direct tool call counts once; a following pre-step must add zero.
+await searchSpot.execute({ query: "查岗" });
+assert.equal(searchCalls, 1, "one direct tool call counts once");
+const dSpot2 = decisionSpot("sp2", "你还记得查岗吗");
+await ctxSpot.emit("agent/pre-step", dSpot2);
+
+check("0.4.0 item 5: a pre-step after a direct search adds no further tool calls", () => {
+  assert.equal(searchCalls, 1, "pre-step adds zero tool calls on top of the direct one");
+});
+for (const dispose of ctxSpot.disposers) dispose();
 
 // ---- unload + MEMORY.md untouched ---------------------------------------
 for (const dispose of ctx.disposers) dispose();

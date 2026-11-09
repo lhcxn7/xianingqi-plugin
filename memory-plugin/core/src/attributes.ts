@@ -142,9 +142,53 @@ export function initialSignificance(entry: {
   return 0.4;
 }
 
-/** Clarity decay rate per day: important memories fade slower. */
+/** 0.4.0 item 6 (分速率衰减): three decay rates, one per track.
+ *  The numbers are TRUE half-lives (unlike the old retrievability
+ *  code, whose "halflife" was an e-folding time — see the note on
+ *  retrievability below): lambda = ln2 / halfLifeDays, so after
+ *  exactly one half-life a track is at 0.5.
+ *  - detail: half-life 14 + 30*S days — details fade fast
+ *    (S=0.4 -> 26d, S=0.9 -> 41d).
+ *  - emotion: half-life 60 + 120*S days — feelings linger
+ *    (S=0.4 -> 108d, S=0.9 -> 168d), always slower than detail
+ *    at the same significance.
+ *  - fact: 0 — stable facts / likes never decay (Layer1State
+ *    likes/dislikes/agreements are not decayed at all, by design).
+ *  clarityLambda() below is kept as an alias of detailLambda so
+ *  existing callers keep working. */
+export function detailLambda(significance: number): number {
+  return Math.LN2 / (14 + 30 * significance);
+}
+
+export function emotionLambda(significance: number): number {
+  return Math.LN2 / (60 + 120 * significance);
+}
+
+export function factLambda(): number {
+  return 0;
+}
+
+/** Detail decay rate per day: important memories fade slower.
+ *  Kept as an alias of detailLambda (0.4.0 item 6 split the old
+ *  step function 0.01/0.03 into the three rates above); the old
+ *  name still resolves so existing callers do not break. */
 export function clarityLambda(significance: number): number {
-  return significance >= 0.7 ? 0.01 : 0.03;
+  return detailLambda(significance);
+}
+
+/** Emotion retention after `ageDays(entry.ts, now)` at the emotion
+ *  rate: exp(-emotionLambda * age). Pure function of age (like the
+ *  time-decay part of retrievability) — the stored `emotionRetain`
+ *  field is review's persisted snapshot of the same quantity, and
+ *  this is the fallback when a row has none yet. No floor here;
+ *  the 0.3 floor lives in timeFactor, the 0.05 floor in
+ *  decayClarity. */
+export function emotionRetain(
+  attrs: MemoryAttributes,
+  entry: MemoryEntry,
+  now: number,
+): number {
+  return Math.exp(-emotionLambda(attrs.significance) * ageDays(entry.ts, now));
 }
 
 /** Default clarity for an entry with no stored row: fresh is 1.0,
@@ -158,20 +202,22 @@ export function defaultClarity(
 }
 
 /** Retrievability R = time decay x recall boost x emotion
- *  strength. The decay constant ("halflife" below) grows with
- *  significance (30 + 60*S days: S=0.9 -> 84d, S=0.4 -> 54d) —
- *  it is the e-folding time, NOT a half-life: the code is
- *  exp(-age/halflife), so the true half-life is halflife*ln2
- *  (≈58d at S=0.9, ≈37d at S=0.4). Recall boost is 1 + 0.15 per
- *  recall, capped at 10 recalls (max 2.5x). Emotion holds a
- *  memory: strong emotion up to 1.0x, none detected 0.7x. */
+ *  strength. 0.4.0 item 6: the time decay now runs at the DETAIL
+ *  rate (detailLambda) — the old single curve (e-folding time
+ *  30 + 60*S days, i.e. a true half-life of (30+60S)*ln2) is
+ *  replaced by the detail half-life 14 + 30*S days, so R fades
+ *  as fast as the details do; the emotion track lives separately
+ *  in emotionRetain() / timeFactor's 0.3 blend. Recall boost is
+ *  1 + 0.15 per recall, capped at 10 recalls (max 2.5x). Emotion
+ *  holds a memory: strong emotion up to 1.0x, none detected 0.7x. */
 export function retrievability(
   attrs: MemoryAttributes,
   entry: MemoryEntry,
   now: number,
 ): number {
-  const halflife = 30 + 60 * attrs.significance;
-  const timeDecay = Math.exp(-ageDays(entry.ts, now) / halflife);
+  const timeDecay = Math.exp(
+    -detailLambda(attrs.significance) * ageDays(entry.ts, now),
+  );
   const recallBoost = 1 + 0.15 * Math.min(attrs.recallCount, 10);
   const emotionFactor = attrs.emotion
     ? 0.4 + 0.6 * attrs.emotion.intensity
@@ -276,6 +322,43 @@ export class AttributeStore {
         if (Number.isFinite(attrs.lastReviewedAt)) {
           clean.lastReviewedAt = attrs.lastReviewedAt;
         }
+        // 0.4.0 item 1: validity window. A non-finite value is
+        // dropped (never trusted); an explicit null validTo means
+        // "still valid" and is kept. Old rows without these fields
+        // load unchanged — absent validTo = never invalidated.
+        if (Number.isFinite(attrs.validFrom)) {
+          clean.validFrom = attrs.validFrom;
+        }
+        if (attrs.validTo === null) {
+          clean.validTo = null;
+        } else if (Number.isFinite(attrs.validTo)) {
+          clean.validTo = attrs.validTo;
+        }
+        if (typeof attrs.needsInvalidationCheck === "boolean") {
+          clean.needsInvalidationCheck = attrs.needsInvalidationCheck;
+        }
+        // 0.4.0 item 6: two clarity tracks. Old rows have neither:
+        // detail defaults to the stored clarity (the old single
+        // clarity IS the detail track), emotion defaults to 1.0
+        // (fresh feeling). Corrupt values are dropped to the same
+        // defaults, out-of-range numbers are clamped — never a
+        // crash, never a NaN reaching the decay math.
+        if (
+          typeof attrs.detailClarity === "number" &&
+          Number.isFinite(attrs.detailClarity)
+        ) {
+          clean.detailClarity = clampFinite(attrs.detailClarity, 0, 1);
+        } else {
+          clean.detailClarity = clean.clarity;
+        }
+        if (
+          typeof attrs.emotionRetain === "number" &&
+          Number.isFinite(attrs.emotionRetain)
+        ) {
+          clean.emotionRetain = clampFinite(attrs.emotionRetain, 0, 1);
+        } else {
+          clean.emotionRetain = 1.0;
+        }
         this.map.set(id, clean);
       }
     } catch {
@@ -313,11 +396,28 @@ export class AttributeStore {
       if (emotion && !existing.emotion) existing.emotion = emotion;
       return existing;
     }
+    const clarity = defaultClarity(entry, now);
+    const significance = initialSignificance(entry);
     const attrs: MemoryAttributes = {
       emotion: emotion ?? tagEmotion(entry.text),
-      clarity: defaultClarity(entry, now),
+      clarity,
+      // 0.4.0 item 6: a new row starts with detail = clarity and
+      // emotion aged the same way — fresh (age 0) is 1.0, an old
+      // entry recorded late starts at the age-computed value,
+      // exactly like defaultClarity does for the detail track.
+      // ("默认 1.0" is the fresh value, not a free pass for old
+      // rows: a 1.0 stamped on a 64-day-old entry would prop its
+      // time factor up until the first review runs.)
+      detailClarity: clarity,
+      emotionRetain: Math.exp(
+        -emotionLambda(significance) * ageDays(entry.ts, now),
+      ),
       recallCount: 0,
-      significance: initialSignificance(entry),
+      significance,
+      // 0.4.0 item 1: the validity window opens at the entry's own
+      // time. (Old rows loaded from disk keep whatever they had —
+      // absent validFrom is read as "since the entry's ts".)
+      validFrom: entry.ts,
       // defaultClarity already aged this row by entry.ts -> now, so
       // the review clock starts HERE. Without this, decayClarity()
       // sees lastReviewedAt empty and decays again from entry.ts —
@@ -329,17 +429,56 @@ export class AttributeStore {
     return attrs;
   }
 
-  /** A recall surfaced this entry: count it, refresh it, sharpen it. */
+  /** 0.4.0 item 1: mark entries invalid from `at` — write ONLY
+   *  validTo, nothing else (the log text and every other field are
+   *  untouched). Unknown ids are reported, never created: without
+   *  the entry there is no ts to default validFrom from. In-memory
+   *  only — the caller persists (save()). 0.4.4: invalidating also
+   *  clears needsInvalidationCheck — the check is resolved by the
+   *  invalidation itself, and a dead entry must not stay counted
+   *  as "awaiting review" in memory_status. */
+  invalidate(
+    ids: string[],
+    at: number,
+  ): { invalidated: string[]; unknown: string[] } {
+    const invalidated: string[] = [];
+    const unknown: string[] = [];
+    for (const id of ids) {
+      const attrs = this.map.get(id);
+      if (!attrs) {
+        unknown.push(id);
+        continue;
+      }
+      attrs.validTo = at;
+      attrs.needsInvalidationCheck = false;
+      invalidated.push(id);
+    }
+    return { invalidated, unknown };
+  }
+
+  /** A recall surfaced this entry: count it, refresh it, sharpen it.
+   *  0.4.0 item 6: the detail track sharpens alongside clarity (the
+   *  two are kept in sync); the emotion track is untouched — recalling
+   *  the words does not refresh the feeling. */
   bumpOnRecall(id: string, now: number): void {
     const attrs = this.map.get(id);
     if (!attrs) return;
     attrs.recallCount += 1;
     attrs.lastRecalledAt = now;
+    const prevDetail = attrs.detailClarity ?? attrs.clarity;
     attrs.clarity = Math.min(1, attrs.clarity + 0.15);
+    attrs.detailClarity = Math.min(1, prevDetail + 0.15);
   }
 
   /** Fade clarity since this entry was last reviewed (or since it
-   *  was recorded). Returns true when anything changed. */
+   *  was recorded). 0.4.0 item 6: fades BOTH tracks — detail at
+   *  detailLambda, emotion at the slower emotionLambda — and
+   *  returns true when either moved. Both floor at 0.05 (details
+   *  fade, feelings fade, neither erases). Note for old rows whose
+   *  emotionRetain materialised as 1.0 on load: when
+   *  lastReviewedAt is absent the decay runs over the full age
+   *  since entry.ts, so the first review lands on the age-correct
+   *  value in one step instead of starting a fresh 1.0 clock. */
   decayClarity(entry: MemoryEntry, now: number): boolean {
     const attrs = this.map.get(entry.id);
     if (!attrs) return false;
@@ -349,12 +488,23 @@ export class AttributeStore {
       attrs.lastReviewedAt = now;
       return false;
     }
-    const next = Math.max(
+    const detail = attrs.detailClarity ?? attrs.clarity;
+    const nextDetail = Math.max(
       0.05,
-      attrs.clarity * Math.exp(-clarityLambda(attrs.significance) * days),
+      detail * Math.exp(-detailLambda(attrs.significance) * days),
     );
-    const changed = next !== attrs.clarity;
-    attrs.clarity = next;
+    const emotion = attrs.emotionRetain ?? 1.0;
+    const nextEmotion = Math.max(
+      0.05,
+      emotion * Math.exp(-emotionLambda(attrs.significance) * days),
+    );
+    const changed =
+      nextDetail !== detail ||
+      nextDetail !== attrs.clarity ||
+      nextEmotion !== emotion;
+    attrs.clarity = nextDetail;
+    attrs.detailClarity = nextDetail;
+    attrs.emotionRetain = nextEmotion;
     attrs.lastReviewedAt = now;
     return changed;
   }

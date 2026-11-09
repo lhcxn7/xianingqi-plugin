@@ -187,6 +187,12 @@ export interface FragmentTone {
 
 export interface Fragment {
   id: string;
+  /** 0.4.0 item 3: only "reflection" is special — a reflection
+   *  conclusion stored as a fragment. Absent = an ordinary
+   *  fragment (0.3.0). The type only changes how the fragment is
+   *  verified (quote-only, see verifyStored): the starmap and
+   *  recall treat every fragment the same. */
+  type?: "reflection";
   sourceIds: string[];
   text: string;
   tone: FragmentTone;
@@ -369,7 +375,12 @@ export function fragmentKeyTerms(text: string): string[] {
  *    tag denies).
  *  A fragment with no key terms at all has nothing to ground it and
  *  fails. A source set with no attitude markers passes the tone
- *  check as inconclusive (toneChecked false) — the documented limit. */
+ *  check as inconclusive (toneChecked false) — the documented limit.
+ *  quoteOnly (0.4.0 item 3, reflections): skip the key-term and
+ *  tone checks entirely and check ONLY the quotes. A reflection's
+ *  insight is new by design ("他最近压力大" from three "累"), so
+ *  its new words must never be checked against the sources — only
+ *  its citations must be verbatim. */
 export function verifyFragment(
   draft: {
     text: string;
@@ -377,21 +388,25 @@ export function verifyFragment(
     quotes: string[];
   },
   sources: MemoryEntry[],
+  opts?: { quoteOnly?: boolean },
 ): FragmentVerifyResult {
   const reasons: string[] = [];
   if (sources.length === 0) {
     return { ok: false, reasons: ["没有找到来源条目（sourceIds 不存在）。"], toneChecked: false };
   }
   const joined = sources.map((s) => s.text).join("\n");
-  const terms = fragmentKeyTerms(draft.text);
-  if (terms.length === 0) {
-    reasons.push("片段正文里没有任何可核对的关键实词（只有语气词/停用词），无法核对来源。");
-  } else {
-    const missing = terms.filter((t) => !joined.includes(t));
-    if (missing.length > 0) {
-      reasons.push(
-        `关键实词不在来源里：${missing.slice(0, 5).join("、")}——来源从没提过这些词，可能是编造。`,
-      );
+  const quoteOnly = opts?.quoteOnly === true;
+  if (!quoteOnly) {
+    const terms = fragmentKeyTerms(draft.text);
+    if (terms.length === 0) {
+      reasons.push("片段正文里没有任何可核对的关键实词（只有语气词/停用词），无法核对来源。");
+    } else {
+      const missing = terms.filter((t) => !joined.includes(t));
+      if (missing.length > 0) {
+        reasons.push(
+          `关键实词不在来源里：${missing.slice(0, 5).join("、")}——来源从没提过这些词，可能是编造。`,
+        );
+      }
     }
   }
   if (draft.quotes.length === 0) {
@@ -407,11 +422,13 @@ export function verifyFragment(
   // Tone: sources first, then the fragment's own text. Only when
   // BOTH sides are known levels — a free-form tone ("unknown") or
   // sources with no markers never fail on tone alone (toneChecked
-  // stays false); keyword + quote checks still apply.
+  // stays false); keyword + quote checks still apply. Skipped
+  // entirely in quoteOnly mode (reflections carry tone "unknown"
+  // and have no attitude to check).
   const sourceLevel = sourceToneLevel(sources.map((s) => s.text));
   let toneChecked = false;
   const fragValue = toneLevelValue(draft.tone.level);
-  if (sourceLevel !== undefined && fragValue !== undefined) {
+  if (!quoteOnly && sourceLevel !== undefined && fragValue !== undefined) {
     toneChecked = true;
     const diff = Math.abs(fragValue - TONE_LEVEL_VALUE[sourceLevel]);
     if (diff > 1) {
@@ -421,7 +438,7 @@ export function verifyFragment(
     }
   }
   const textLevels = detectToneLevels(draft.text);
-  if (textLevels.length > 0 && fragValue !== undefined) {
+  if (!quoteOnly && textLevels.length > 0 && fragValue !== undefined) {
     const textLevel = textLevels.reduce((a, b) =>
       Math.abs(TONE_LEVEL_VALUE[b]) > Math.abs(TONE_LEVEL_VALUE[a]) ? b : a,
     );
@@ -579,6 +596,11 @@ export class FragmentStore {
         }
         clean.push({
           id: f.id,
+          // 0.4.0 item 3: only "reflection" survives the load —
+          // any other type value (hand-edited or from a future
+          // version) is dropped, never trusted. Old rows without
+          // the field load as ordinary fragments.
+          type: f.type === "reflection" ? "reflection" : undefined,
           sourceIds: [...f.sourceIds],
           text: f.text,
           tone: {
@@ -634,7 +656,12 @@ export class FragmentStore {
   /** Re-verify a stored fragment against its current sources (the
    *  log never changes, so this normally passes — it fails when the
    *  fragment was created against sources that are no longer there,
-   *  or when its stored text/quotes were hand-edited afterwards). */
+   *  or when its stored text/quotes were hand-edited afterwards).
+   *  0.4.0 item 3: a reflection fragment is re-checked quote-only
+   *  — its insight words are new by design, so the key-term check
+   *  that guards ordinary fragments would wrongly fail it on
+   *  first recall and mark it suspect. Only its citations are
+   *  re-checked, verbatim. */
   verifyStored(
     fragment: Fragment,
     entriesById: Map<string, MemoryEntry>,
@@ -652,7 +679,18 @@ export class FragmentStore {
     return verifyFragment(
       { text: fragment.text, tone: fragment.tone, quotes: fragment.quotes },
       sources,
+      fragment.type === "reflection" ? { quoteOnly: true } : undefined,
     );
+  }
+
+  /** Store an already-built fragment (0.4.0 item 3: reflections
+   *  are built by reflection.ts, not by validateFragmentInput —
+   *  their insight words are new by design and would fail the
+   *  ordinary fragment checks). The caller owns verification; this
+   *  only appends and persists. */
+  add(fragment: Fragment): void {
+    this.list.push(fragment);
+    this.save();
   }
 
   /** Mark a fragment suspect after a failed retrieval-time check.

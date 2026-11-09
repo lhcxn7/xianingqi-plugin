@@ -13,12 +13,24 @@
 //   the query, 0.7 otherwise (no session context).
 // - emotion: 1.0 when the query's emotion matches the entry's,
 //   0.2 on a mismatch, 0.7 when either side has no emotion.
-// - time: retrievability, floored at 0.3 — time never zeroes a
-//   memory out; an important old memory can still surface.
+// - time: 0.4.0 item 6 — the 0.7/0.3 blend of the two clarity
+//   tracks (detail 0.7 + emotion 0.3), floored at 0.3 — time
+//   never zeroes a memory out; an important old memory can still
+//   surface. The old form was retrievability (a single decay
+//   curve); the blend reads the review-maintained stored tracks,
+//   lazily decayed from lastReviewedAt to now (see timeFactor),
+//   so a missed review never freezes decay — and a row born
+//   fresh for an old entry never props its activation up.
 // - attention: 1.0 when the entry shares a content token with the
 //   recent turns' user messages, 0.5 otherwise (no recent context).
 
-import { emotionPolarity, retrievability, tagEmotion } from "./attributes.ts";
+import {
+  detailLambda,
+  emotionLambda,
+  emotionPolarity,
+  emotionRetain,
+  tagEmotion,
+} from "./attributes.ts";
 import { tokenize } from "./tokenize.ts";
 import type {
   EmotionTag,
@@ -152,12 +164,43 @@ export function emotionFactor(
   return qPol === ePol ? 0.7 : 0.2;
 }
 
+/** 0.4.0 item 6: the time factor is the 0.7/0.3 blend of the two
+ *  clarity tracks — detail 0.7 (min(detailClarity, 1), falling back
+ *  to the legacy clarity when the row predates the split) + emotion
+ *  0.3 (stored emotionRetain, or the age-computed value when the
+ *  row has none yet). Floored at 0.3, capped at 1: time never
+ *  zeroes a memory out — that iron rule is unchanged.
+ *
+ *  The stored tracks are snapshots as of lastReviewedAt (or the
+ *  entry's ts when never reviewed), so both are lazily decayed
+ *  over the gap to `now` — exactly the math decayClarity applies
+ *  at review time, evaluated early. Without this, a row recorded
+ *  for an old entry would read as brand new (clarity 1.0) until
+ *  the first review ran, and a missed review would freeze decay
+ *  entirely; with it, the value review would write is the value
+ *  activation already sees, and review never double-counts (it
+ *  decays from lastReviewedAt and moves the stamp forward). */
 export function timeFactor(
   entry: MemoryEntry,
   attrs: MemoryAttributes,
   now: number,
 ): number {
-  return Math.min(1, Math.max(0.3, retrievability(attrs, entry, now)));
+  const since = attrs.lastReviewedAt ?? entry.ts;
+  const days = Math.max(0, (now - since) / 86_400_000);
+  const detail =
+    Math.min(1, attrs.detailClarity ?? attrs.clarity) *
+    Math.exp(-detailLambda(attrs.significance) * days);
+  // 0.4.0 item 6 (coordinator fix): the stored emotionRetain is a
+  // snapshot at lastReviewedAt, so it needs the extra decay to now —
+  // but the age-based fallback already decays to now, and multiplying
+  // it again would square the decay. Only the stored value gets the
+  // extra factor.
+  const emotion =
+    attrs.emotionRetain != null
+      ? attrs.emotionRetain *
+        Math.exp(-emotionLambda(attrs.significance) * days)
+      : emotionRetain(attrs, entry, now);
+  return Math.min(1, Math.max(0.3, 0.7 * detail + 0.3 * emotion));
 }
 
 /** Content tokens only (length >= 2, not in COMMON_TOKENS).

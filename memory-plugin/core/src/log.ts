@@ -3,7 +3,16 @@
 // three-layer view built on top of it. A torn last line (crash
 // mid-append) is skipped on read, never fatal.
 
-import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import type { MemoryEntry } from "./types.ts";
 
 export class AppendLog {
@@ -19,10 +28,42 @@ export class AppendLog {
   append(entry: MemoryEntry): void {
     const fd = openSync(this.file, "a");
     try {
+      // 0.4.6 (0.4.3 audit item 15): a torn last line (crash
+      // mid-append) used to swallow the NEXT append too — the new
+      // line glued onto the torn half, the whole JSON line failed
+      // to parse, and readAll skipped both. If the file does not
+      // end with a newline, terminate the torn line first; the
+      // torn half stays as its own (skipped) line and the new
+      // entry survives intact.
+      if (this.needsTerminator()) {
+        appendFileSync(fd, "\n", "utf8");
+      }
       appendFileSync(fd, JSON.stringify(entry) + "\n", "utf8");
       fsyncSync(fd);
     } finally {
       closeSync(fd);
+    }
+  }
+
+  /** True when the file is non-empty and its last byte is not a
+   *  newline — i.e. the previous append was torn mid-line. A
+   *  missing or empty file needs nothing. Never throws: a stat
+   *  failure degrades to "no terminator" (the append still lands,
+   *  one line down). */
+  private needsTerminator(): boolean {
+    try {
+      const size = statSync(this.file).size;
+      if (size === 0) return false;
+      const buf = Buffer.alloc(1);
+      const rfd = openSync(this.file, "r");
+      try {
+        readSync(rfd, buf, 0, 1, size - 1);
+      } finally {
+        closeSync(rfd);
+      }
+      return buf[0] !== 0x0a;
+    } catch {
+      return false;
     }
   }
 

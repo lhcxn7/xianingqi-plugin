@@ -5,10 +5,13 @@
 // Restore first snapshots the current state, so restore is reversible.
 //
 // Snapshots cover ONLY plugin-owned files (log.jsonl, index.json, the
-// per-month log segments, persona-sessions.json). MEMORY.md, the
+// per-month log segments, persona-sessions.json, profile.json —
+// 0.4.3 — plus graph/attributes/review/fragments). MEMORY.md, the
 // monthly archives and the diary are NEVER snapshotted or restored —
 // those belong to the skill / the user, and restoring them would
 // silently revert her memory or diary to snapshot time (audit, 0.1.3).
+// Still excluded: invalidation-audit.jsonl, beliefs.json, loop.json
+// (see isPluginOwned).
 //
 // Restore is NON-DESTRUCTIVE: it only overwrites/adds the files that
 // are present in the snapshot. Files that are not in the snapshot —
@@ -93,6 +96,11 @@ export function snapshotComplete(dataDir: string, name: string): boolean {
           "attributes.json",
           "review.json",
           "fragments.json",
+          // 0.4.3: profile.json is plugin-owned and snapshotted
+          // (memory_profile writes it) — a pre-marker snapshot
+          // counts as complete when it holds it, like any other
+          // managed file.
+          "profile.json",
         ].includes(f) ||
         /^log-\d{4}-\d{2}\.jsonl$/.test(f) ||
         /^summary-\d{4}-\d{2}\.jsonl$/.test(f),
@@ -115,13 +123,25 @@ export function pruneSnapshots(dataDir: string, keep = 30): void {
  *  restored from one. `appended-ids.json` (0.1.4 minor 1) is
  *  plugin-owned too: it records which recall hits a session's turn-1
  *  append already committed, so a restore must revert it together
- *  with the log or the dedupe state would disagree with the log. */
+ *  with the log or the dedupe state would disagree with the log.
+ *  0.4.3: `profile.json` joins the list — it is tool-writable
+ *  plugin state (memory_profile writes it), so a restore must
+ *  revert it together with the log or the profile would disagree
+ *  with the restored memory. Still EXCLUDED, deliberately:
+ *  `invalidation-audit.jsonl` (append-only audit trail, never
+ *  rewound), `beliefs.json` (belief layer, its own store) and
+ *  `loop.json` (behaviour-loop state) — restoring them would
+ *  silently rewind audit history / beliefs / pending actions to
+ *  snapshot time. */
 function isPluginOwned(name: string): boolean {
   return (
     name === "log.jsonl" ||
     name === "index.json" ||
     name === "persona-sessions.json" ||
     name === "appended-ids.json" ||
+    // 0.4.3: profile.json is plugin-owned (memory_profile writes
+    // it) and snapshotted together with the log.
+    name === "profile.json" ||
     // 0.2.0: graph, attributes, review state and compressed
     // summaries are plugin-owned and snapshotted together with the
     // log. starmap.html is deliberately EXCLUDED — derived

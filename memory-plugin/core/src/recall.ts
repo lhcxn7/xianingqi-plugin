@@ -26,10 +26,12 @@ import {
 } from "./activation.ts";
 import {
   defaultClarity,
+  emotionRetain,
   initialSignificance,
   tagEmotion,
   type AttributeStore,
 } from "./attributes.ts";
+import { formatBeliefLine, type BeliefStore } from "./beliefs.ts";
 import { ageDays } from "./dates.ts";
 import { TRAVERSABLE_TYPES, type MemoryGraph } from "./graph.ts";
 import { estimateTokens, tokenize } from "./tokenize.ts";
@@ -43,6 +45,34 @@ import type {
 } from "./types.ts";
 
 export const DEFAULT_TOKEN_CAP = 1500;
+
+/** 0.4.0 item 1: true when this validity window has closed — the
+ *  memory/edge stopped being true at or before `now` (null or
+ *  absent = still valid). */
+export function isExpired(validTo: number | null | undefined, now: number): boolean {
+  return validTo != null && validTo <= now;
+}
+
+/** 0.4.0 item 1: mark entries invalid from `at` — write ONLY
+ *  validTo, nothing else (the log text and every other field are
+ *  untouched), and persist attributes.json. Ids with no stored
+ *  attribute row are reported as unknown, never created.
+ *
+ *  NOTE on the signature: the spec's `invalidateEntries(ids, at)`
+ *  has nowhere to persist to — recall.ts holds no store instance
+ *  (it only receives one through RecallOptions), so the store is a
+ *  third parameter. MemoryCore.invalidateEntries() is the
+ *  lock-guarded wrapper the DSH tool calls (it also stamps the
+ *  incident graph edges). */
+export function invalidateEntries(
+  ids: string[],
+  at: number,
+  store: AttributeStore,
+): { invalidated: string[]; unknown: string[] } {
+  const result = store.invalidate(ids, at);
+  store.save();
+  return result;
+}
 
 export interface RecallOptions {
   /** Default "persona": only persona-window records. "all" includes task
@@ -84,6 +114,12 @@ export interface RecallOptions {
    *  fragment that fails the re-check falls back to the verbatim
    *  source text and is marked suspect in the store. */
   fragments?: FragmentStore;
+  /** 0.4.0 item 2: the belief store. When present, the recall
+   *  block gains one compact belief line at the end (see
+   *  formatRecallBlock) — it takes no token-cap budget, like the
+   *  profile block, and no line is added when there are no
+   *  beliefs. Absent = old caller: no belief line. */
+  beliefs?: BeliefStore;
 }
 
 /** Attributes for an entry: the stored row when available, else
@@ -94,11 +130,27 @@ function attrsFor(
   now: number,
 ): MemoryAttributes {
   if (store) return store.ensure(entry, undefined, now);
-  return {
+  // 0.4.0 item 6: no store — the defaults are age-correct, not
+  // fresh: detail starts at the aged defaultClarity, emotion at
+  // the age-computed retention (a 90-day-old entry recalled
+  // without a store must not pretend its feeling is brand new).
+  const significance = initialSignificance(entry);
+  const clarity = defaultClarity(entry, now);
+  const base: MemoryAttributes = {
     emotion: tagEmotion(entry.text),
-    clarity: defaultClarity(entry, now),
+    clarity,
     recallCount: 0,
-    significance: initialSignificance(entry),
+    significance,
+  };
+  return {
+    ...base,
+    detailClarity: clarity,
+    emotionRetain: emotionRetain(base, entry, now),
+    // This default is a snapshot as of `now` (both tracks were
+    // just aged to it above), so stamp it — otherwise timeFactor
+    // would see no lastReviewedAt, assume the snapshot is as of
+    // entry.ts, and decay the already-aged values a second time.
+    lastReviewedAt: now,
   };
 }
 
@@ -205,13 +257,21 @@ export function recallFromEntries(
   const scoped = entries.filter(
     (e) => window === "all" || e.window === window,
   );
-  const byId = new Map(scoped.map((e) => [e.id, e]));
+  // 0.4.0 item 1: expired memories never enter the candidate set —
+  // they are skipped before scoring, not deleted: the log text
+  // stays on disk and stays searchable by hand. Only a stored row
+  // can expire an entry (no row = old data = never invalidated).
+  // Archive hits have no attribute row and are never expired here.
+  const live = scoped.filter(
+    (e) => !isExpired(opts.attributes?.get(e.id)?.validTo, now),
+  );
+  const byId = new Map(live.map((e) => [e.id, e]));
 
   // Keyword hits. A candidateIds set (from the keyword index) bounds
   // the log scan; archive rows are exempt (they are not in the index).
   const matched = new Map<string, string[]>(); // entry id -> matched tokens
   if (tokens.length > 0) {
-    for (const e of scoped) {
+    for (const e of live) {
       if (typeof e.text !== "string") continue; // defensive (audit B2)
       if (
         opts.candidateIds &&
@@ -230,7 +290,7 @@ export function recallFromEntries(
   // topic (rarest matched token). Only computed when there are hits.
   let docFreq = new Map<string, number>();
   if (matched.size > 0) {
-    for (const e of scoped) {
+    for (const e of live) {
       for (const t of new Set(tokenize(e.text))) {
         docFreq.set(t, (docFreq.get(t) ?? 0) + 1);
       }
@@ -261,6 +321,9 @@ export function recallFromEntries(
           matchedTokens,
           activation,
           topic: topicOf(matchedTokens, docFreq),
+          // 0.4.0 item 5: a direct hit walked no edge, so its
+          // spotlight sort factor is 1.
+          edgeWeight: 1,
         };
       })
       .sort((a, b) => b.score - a.score || b.entry.ts - a.entry.ts);
@@ -343,6 +406,9 @@ export function recallFromEntries(
       let considered = 0;
       for (const edge of edges) {
         if (!TRAVERSABLE_TYPES.has(edge.type)) continue;
+        // 0.4.0 item 1: an expired edge is never walked — the link
+        // stays in graph.json, only skipped.
+        if (isExpired(edge.validTo, now)) continue;
         if (considered >= 10) break;
         considered += 1;
         const otherId = opts.graph?.otherEnd(edge, seed.entry.id) ?? "";
@@ -372,6 +438,12 @@ export function recallFromEntries(
           activation,
           viaGraph: true,
           topic: seed.topic,
+          // 0.4.0 item 5: the edge this hit arrived through — the
+          // spotlight sort key (activation × edge weight) needs it,
+          // and activation alone already folded this weight into
+          // its content factor once. Read before the traverse bump
+          // at the end of recall (the bump runs after selection).
+          edgeWeight: edge.weight,
         });
       }
       return out;
@@ -503,6 +575,18 @@ export function recallFromEntries(
     }
   }
 
+  // 0.4.0 item 5 (心光选择): pick the spotlight candidates from
+  // the FINAL hits — the ones actually injected, after the token
+  // cap and the valve. The score only ranks candidates (activation
+  // × edge weight, one per topic, top 3); the single ★ is the
+  // in-session model's call, made from the ☆ prompt line in
+  // formatRecallBlock below — no extra model call, no new tool.
+  // Runs on the final list whether the valve is on or off (an
+  // explicit search still gets at most 3 candidates).
+  if (finalHits.length > 0) {
+    selectSpotlightCandidates(finalHits);
+  }
+
   // Graph weight bump — only for neighbours that actually surfaced.
   // A candidate that was dropped by the threshold, the token cap or
   // the valve never entered context, so its edge must not gain
@@ -518,9 +602,85 @@ export function recallFromEntries(
   return {
     hits: finalHits,
     layer1,
+    // 0.4.0 item 4: the standing profile block rides along with
+    // every recall, computed from layer 1 only — it never touches
+    // the keyword match, the valve or the token cap, so it cannot
+    // crowd out a hit (see the item-4 tests in test/demo.ts).
+    profileText: formatProfileBlock(layer1),
     estimatedTokens: used,
-    text: formatRecallBlock(finalHits),
+    // 0.4.0 item 2: the belief line rides at the end of the block
+    // — one compact line, no token-cap budget (it is ~20 tokens
+    // and never the bulk of the 1500 cap), and no line at all when
+    // there are no beliefs (an empty belief layer never pollutes
+    // recall). Computed from the store when one was passed.
+    text: formatRecallBlock(
+      finalHits,
+      opts.beliefs ? formatBeliefLine(opts.beliefs.all()) : undefined,
+    ),
   };
+}
+
+/** 0.4.0 item 5 (心光选择 + 传播激活, 小凌识海心光 + HippoRAG
+ *  PPR, 2026-11-09 改版): pick the spotlight candidates from a
+ *  recall's final hits. The score ONLY ranks candidates — it never
+ *  picks the single ★: sort by activation × edge weight (a direct
+ *  hit's edge weight is 1; a graph hit's is the edge it arrived
+ *  through), keep at most one per topic (topicOf, same topic the
+ *  valve uses), take the top 3, and mark them
+ *  `spotlightCandidate = true` in place (the same objects the
+ *  caller injects, so formatRecallBlock sees the flags). Ties
+ *  break by score, then recency. Returns the candidates (at most
+ *  3, in rank order); non-candidates are left unmarked. Pure
+ *  arithmetic, no model call — the choice itself happens in the
+ *  session that is already replying, via the ☆ prompt line. */
+export function selectSpotlightCandidates(hits: RecallHit[]): RecallHit[] {
+  const ranked = [...hits].sort(
+    (a, b) =>
+      b.activation * (b.edgeWeight ?? 1) -
+        a.activation * (a.edgeWeight ?? 1) ||
+      b.score - a.score ||
+      b.entry.ts - a.entry.ts,
+  );
+  const seenTopics = new Set<string>();
+  const out: RecallHit[] = [];
+  for (const h of ranked) {
+    if (out.length >= 3) break;
+    if (seenTopics.has(h.topic)) continue;
+    seenTopics.add(h.topic);
+    h.spotlightCandidate = true;
+    out.push(h);
+  }
+  return out;
+}
+
+/** 0.4.0 item 4 (画像常驻块, Memobase): the standing profile block
+ *  — who she is, what stage the relationship is at, one standing
+ *  like and one standing agreement. At most 5 lines, one field per
+ *  line; a field with no data is skipped, never left as a blank
+ *  line. Pure assembly, no judgement: `profile.*` wins over the
+ *  layer-1 keys of the same meaning (name/stage), likes/agreements
+ *  come from the layer-1 lists (the profile has no fields for
+ *  them). Null / empty layer 1 (no profile, no name, no stage, no
+ *  likes, no agreements) returns "" — never null, never throws.
+ *  The block is computed fresh from the layer-1 object handed in,
+ *  so changing the profile needs no index rebuild: the next recall
+ *  simply reads the new layer 1. */
+export function formatProfileBlock(layer1: Layer1State | null): string {
+  if (!layer1) return "";
+  const profile = layer1.profile ?? {};
+  const lines: string[] = [];
+  const name = profile.name ?? layer1.name;
+  if (name) lines.push(`她：${name}`);
+  const stage = profile.stage ?? layer1.stage;
+  if (stage) lines.push(`阶段：${stage}`);
+  if (profile.relationshipStage) {
+    lines.push(`关系：${profile.relationshipStage}`);
+  }
+  if (layer1.likes.length > 0) lines.push(`喜欢：${layer1.likes[0]}`);
+  if (layer1.agreements.length > 0) {
+    lines.push(`约定：${layer1.agreements[0]}`);
+  }
+  return lines.slice(0, 5).join("\n");
 }
 
 /** Layer-1 display for memory_search. Uses the skill's own wording
@@ -553,8 +713,18 @@ export function formatLayer1(layer1: Layer1State): string {
  *  hit injects the fragment text, marked [·片段·<tone>] so the
  *  model sees the tone tag; a fragment-fallback hit injects the
  *  verbatim source, marked [·原文] so the model knows the fragment
- *  was distrusted this turn. */
-export function formatRecallBlock(hits: RecallHit[]): string {
+ *  was distrusted this turn. 0.4.0 item 5: a spotlight candidate
+ *  line is marked ☆, and when at least one candidate exists a
+ *  single prompt line follows the list, asking the model already
+ *  replying in this session to pick the one most worth noting and
+ *  mention it in its own words — no tool call, no separate
+ *  explanation, no extra model round. No candidates means no ☆
+ *  marks and no prompt line (and no hits still means ""). 0.4.0
+ *  item 2: an optional belief line (one compact line, e.g.
+ *  `关系：信任 0.7（证据 6 条）· 亲近 0.4`) is appended at the very
+ *  end, after the spotlight prompt line. Empty / absent means no
+ *  line — an empty belief layer never pollutes the block. */
+export function formatRecallBlock(hits: RecallHit[], beliefLine?: string): string {
   if (hits.length === 0) return "";
   const parts: string[] = ["相关记忆:"];
   for (const hit of hits) {
@@ -568,8 +738,16 @@ export function formatRecallBlock(hits: RecallHit[]): string {
           ? "·压缩"
           : "";
     parts.push(
-      `- [${hit.entry.date} ${hit.entry.time} ${label}${mark}] ${hit.displayText ?? hit.entry.text}`,
+      `- ${hit.spotlightCandidate ? "☆ " : ""}[${hit.entry.date} ${hit.entry.time} ${label}${mark}] ${hit.displayText ?? hit.entry.text}`,
     );
+  }
+  if (hits.some((h) => h.spotlightCandidate)) {
+    parts.push(
+      "心光：上面标 ☆ 的是这次最值得注意的候选（最多 3 条），请挑其中最值得注意的一条，在回复里用自己的话自然点出来，不用调工具、不用单独解释。",
+    );
+  }
+  if (beliefLine) {
+    parts.push(beliefLine);
   }
   return parts.join("\n");
 }

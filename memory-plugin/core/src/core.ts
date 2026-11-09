@@ -49,7 +49,13 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteText, ensureDir } from "./atomic.ts";
-import { AttributeStore } from "./attributes.ts";
+import { AttributeStore, initialSignificance } from "./attributes.ts";
+import { BeliefStore } from "./beliefs.ts";
+import type {
+  BeliefAdjustResult,
+  BeliefCreateInput,
+  BeliefCreateResult,
+} from "./beliefs.ts";
 import { formatDate, formatTime, monthKey } from "./dates.ts";
 import { FragmentStore } from "./fragments.ts";
 import type {
@@ -57,6 +63,18 @@ import type {
   FragmentInput,
 } from "./fragments.ts";
 import { MemoryGraph } from "./graph.ts";
+import {
+  LoopStore,
+  buildProactPrompt,
+  checkGuardrails,
+  recordOutcome,
+} from "./loop.ts";
+import type {
+  LoopState,
+  PendingAction,
+  ProactChannel,
+  ProactDecision,
+} from "./loop.ts";
 import {
   acquireWriteLock,
   DEFAULT_LOCK_TIMEOUT_MS,
@@ -68,13 +86,29 @@ import {
   fingerprintsEqual,
 } from "./keyword-index.ts";
 import { MemoryFile } from "./memory-file.ts";
-import { DEFAULT_TOKEN_CAP, recallFromEntries } from "./recall.ts";
+import { loadProfile, mergeProfile, saveProfile, type PersonaProfile } from "./profile.ts";
+import { DEFAULT_TOKEN_CAP, formatProfileBlock, recallFromEntries } from "./recall.ts";
 import {
   REVIEW_INTERVAL_MS,
   loadReviewState,
   loadSummaries,
   runReview,
 } from "./review.ts";
+import {
+  RECENT_MAX_CHARS,
+  RECENT_MAX_ENTRIES,
+  selectCappedEntries,
+} from "./model-review.ts";
+import type { CappedSelection } from "./model-review.ts";
+import {
+  buildReflectionPrompt,
+  reflectionGate,
+  saveReflection,
+} from "./reflection.ts";
+import type {
+  ReflectionCheck,
+  ReflectionSaveResult,
+} from "./reflection.ts";
 import {
   listSnapshots,
   restoreSnapshot,
@@ -87,6 +121,9 @@ import {
 } from "./starmap.ts";
 import { tokenize } from "./tokenize.ts";
 import type {
+  Belief,
+  BeliefDimension,
+  BeliefDimensionSummary,
   CoreOptions,
   CoreStats,
   EmotionTag,
@@ -105,6 +142,19 @@ import type {
 
 const LOG_FILE = "log.jsonl";
 const INDEX_FILE = "index.json";
+
+/** What prepareProactPrompt hands back: the prompt and the token
+ *  that binds the model's decision to it, plus the source ids the
+ *  prompt showed. `prompted: false` with a `reason` means the
+ *  day's quota is spent; without one means there is nothing at
+ *  all to weigh. */
+export interface PrepareProactPromptResult {
+  prompted: boolean;
+  prompt?: string;
+  promptToken?: string;
+  sourceIds?: string[];
+  reason?: string;
+}
 
 export interface RecordInput {
   role: Role;
@@ -131,6 +181,11 @@ export class MemoryCore {
   private readonly attrs: AttributeStore;
   /** 0.3.0: fragments (summary layer on top of the log). */
   private readonly fragments: FragmentStore;
+  /** 0.4.0 item 2: beliefs (evidence-backed belief layer +
+   *  three relationship dimensions). */
+  private readonly beliefs: BeliefStore;
+  /** 0.4.0 item 7: behaviour loop (proactive actions, loop.json). */
+  private readonly loop: LoopStore;
   /** 0.2.0: entryId -> compressed one-line summary (review). */
   private summaries: Map<string, string>;
   /** 0.2.0: last entry per session, for session-edge linking. */
@@ -200,6 +255,8 @@ export class MemoryCore {
     this.graph = new MemoryGraph(this.dataDir);
     this.attrs = new AttributeStore(this.dataDir);
     this.fragments = new FragmentStore(this.dataDir);
+    this.beliefs = new BeliefStore(this.dataDir);
+    this.loop = new LoopStore(this.dataDir);
     this.summaries = loadSummaries(this.dataDir);
     if (!this.graph.loadedExisting && this.entries.length > 0) {
       try {
@@ -312,10 +369,13 @@ export class MemoryCore {
     // 0.2.0: another writer may have moved the graph, the
     // attributes or the summaries too — reload them together, or
     // this instance's next save would overwrite their changes.
-    // 0.3.0: same for fragments.json.
+    // 0.3.0: same for fragments.json. 0.4.0 item 2: same for
+    // beliefs.json.
     this.graph.reload();
     this.attrs.reload();
     this.fragments.reload();
+    this.beliefs.reload();
+    this.loop.reload();
     this.summaries = loadSummaries(this.dataDir);
     this.lastBySession.clear();
     for (const e of this.entries) {
@@ -427,11 +487,14 @@ export class MemoryCore {
     } = {},
   ): RecallResult {
     // A non-string query (a bad tool call) returns empty, never
-    // throws (audit m11).
+    // throws (audit m11). The profile block is query-independent,
+    // so it still comes along from the current layer 1.
     if (typeof query !== "string") {
+      const layer1 = this.readLayer1();
       return {
         hits: [],
-        layer1: this.readLayer1(),
+        layer1,
+        profileText: formatProfileBlock(layer1),
         estimatedTokens: 0,
         text: "",
       };
@@ -443,7 +506,7 @@ export class MemoryCore {
     // reference (stage) and layer 2 for the 0.1.6 dedupe (a log hit
     // saying what the skill already read at open is dropped).
     const parsed = this.memoryFile.load();
-    const layer1 = parsed.layer1;
+    const layer1 = mergeProfile(parsed.layer1, loadProfile(this.dataDir));
     // Keyword-index lookup (audit m1): the persisted index is the
     // candidate source for the log scan, not a dead file — recall
     // unions the index's per-token id lists and lets
@@ -467,6 +530,9 @@ export class MemoryCore {
     // 0.3.0: plus the fragments — a hit covered by a verified
     // fragment injects the fragment text instead of the full
     // original (recallFromEntries re-checks it first).
+    // 0.4.0 item 2: plus the beliefs — the recall block gains one
+    // compact belief line at the end (no token-cap budget, no line
+    // when there are no beliefs).
     const result = recallFromEntries(
       [...this.entries, ...archiveHits],
       layer1,
@@ -479,6 +545,7 @@ export class MemoryCore {
         attributes: this.attrs,
         summaries: this.summaries,
         fragments: this.fragments,
+        beliefs: this.beliefs,
       },
     );
     // 0.2.0: the next record in this session links back to the
@@ -557,6 +624,31 @@ export class MemoryCore {
     );
   }
 
+  /** Significance of one entry (0.4.5: the daily-review prompt
+   *  cap ranks yesterday's entries by it). Read-only — a missing
+   *  row falls back to the entry's initial significance, never
+   *  creates a row. */
+  significanceOf(entry: MemoryEntry): number {
+    return (
+      this.attrs.get(entry.id)?.significance ?? initialSignificance(entry)
+    );
+  }
+
+  /** Entries by id (for the shell: resolve the review's
+   *  invalidation-check ids to their text for the daily-review
+   *  prompt — the model needs the words, not just ids). Unknown
+   *  ids are skipped, never created. Read-only. */
+  entriesByIds(ids: string[]): MemoryEntry[] {
+    this.refreshIfStale();
+    const byId = new Map(this.entries.map((e) => [e.id, e]));
+    const out: MemoryEntry[] = [];
+    for (const id of ids) {
+      const entry = byId.get(id);
+      if (entry) out.push(entry);
+    }
+    return out;
+  }
+
   /** Apply the model review's picks: every id that names a real log
    *  entry is raised to significance 0.9 and flagged modelMarked
    *  (the code review never compresses it). Only upgrades, never
@@ -588,6 +680,46 @@ export class MemoryCore {
     });
   }
 
+  // ---- invalidation (0.4.0 item 1, Graphiti 双时间戳失效) --------
+  //
+  // Mark entries invalid from `at` (default now): only validTo is
+  // written, in attributes.json (via AttributeStore.invalidate) and
+  // on every graph edge touching an invalidated entry (via
+  // MemoryGraph.invalidate — a dead memory's links must not diffuse
+  // it into recall). The log text is never touched: an invalidated
+  // memory stays readable in history, it just stops recalling.
+  // Unknown ids are reported, never created. Runs under the write
+  // lock and persists both files.
+  invalidateEntries(
+    ids: string[],
+    at: number = Date.now(),
+  ): { invalidated: string[]; unknown: string[] } {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const byId = new Map(this.entries.map((e) => [e.id, e]));
+      const invalidated: string[] = [];
+      const unknown: string[] = [];
+      for (const id of ids) {
+        const entry = byId.get(id);
+        if (!entry) {
+          unknown.push(id);
+          continue;
+        }
+        // Ensure a row exists first: invalidate() only stamps rows
+        // it finds, and a log entry with no row yet (never recalled,
+        // never reviewed) still deserves a validTo.
+        this.attrs.ensure(entry, undefined, at);
+        invalidated.push(id);
+      }
+      const res = this.attrs.invalidate(invalidated, at);
+      this.attrs.save();
+      if (this.graph.invalidate(res.invalidated, at) > 0) {
+        this.graph.save();
+      }
+      return { invalidated: res.invalidated, unknown };
+    });
+  }
+
   // ---- fragments (0.3.0) ---------------------------------------
   //
   // Create a fragment on top of the verbatim log. The model writes
@@ -609,16 +741,456 @@ export class MemoryCore {
     return this.fragments.all();
   }
 
+  // ---- beliefs (0.4.0 item 2, 带证据的信念层 + 三维信念) --------
+  //
+  // Create / support / contradict a belief. Every write verifies
+  // its quote word for word against the log (the memory_fragment
+  // pattern) and REJECTS the write when the quote is not verbatim
+  // — nothing is stored, and the reasons come back so the model can
+  // fix it. Deltas are the model's call (how strong this evidence
+  // is); the store only clamps a single move to ±0.2 and strength
+  // to 0..1. A contradict for an already-charged entry is ignored
+  // (duplicate), never deducted twice. All three run under the
+  // write lock and persist beliefs.json.
+
+  createBelief(input: BeliefCreateInput): BeliefCreateResult {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const entriesById = new Map(this.entries.map((e) => [e.id, e]));
+      // 0.4.1 (A) core-layer persona-source check: the evidence for a
+      // belief must come from a persona-window memory. The tool layer
+      // being persona-gated does not stop a task entry id being passed
+      // in, so the core checks the source entry itself — a missing or
+      // non-persona source throws source_entry_not_found (A's error
+      // name), before the store's verbatim-quote / ≥2-char rules run.
+      const source = entriesById.get(input.entryId ?? "");
+      if (!source || source.window !== "persona") {
+        throw new Error("source_entry_not_found");
+      }
+      return this.beliefs.create(input, entriesById);
+    });
+  }
+
+  supportBelief(
+    beliefId: string,
+    entryId: string,
+    quote: string,
+    delta: number,
+  ): BeliefAdjustResult {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const entriesById = new Map(this.entries.map((e) => [e.id, e]));
+      // 0.4.1 (A): same persona-source check as createBelief — a
+      // task-window entry must not move a belief, even verbatim.
+      const source = this.entries.find(
+        (entry) => entry.id === entryId && entry.window === "persona",
+      );
+      if (!source) throw new Error("source_entry_not_found");
+      return this.beliefs.support(beliefId, entryId, quote, delta, entriesById);
+    });
+  }
+
+  contradictBelief(
+    beliefId: string,
+    entryId: string,
+    quote: string,
+    delta: number,
+  ): BeliefAdjustResult {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const entriesById = new Map(this.entries.map((e) => [e.id, e]));
+      // 0.4.1 (A): same persona-source check as createBelief — a
+      // task-window entry must not deduct from a belief, even verbatim.
+      const source = this.entries.find(
+        (entry) => entry.id === entryId && entry.window === "persona",
+      );
+      if (!source) throw new Error("source_entry_not_found");
+      return this.beliefs.contradict(beliefId, entryId, quote, delta, entriesById);
+    });
+  }
+
+  /** All stored beliefs (for memory_belief get / review / tests). */
+  listBeliefs(): Belief[] {
+    return this.beliefs.all();
+  }
+
+  // ---- reflection (0.4.0 item 3, Generative Agents 反思触发器) ----
+  //
+  // The gate check for memory_reflect: the last 24 h of new
+  // persona memories (minus entries already folded into a
+  // reflection), summed by significance. Below the tiny
+  // anti-disturbance floor (REFLECTION_MIN_FLOOR) there is no
+  // prompt — the tool returns triggered: false and no model is
+  // called. Above it the prompt is handed to the model, which
+  // decides for itself whether to reflect and what to conclude;
+  // the code never blocks it. Read-only: ensure() is in-memory
+  // only until flush, so this writes nothing to disk.
+  //
+  // 0.4.3: the gate SNAPSHOT. reflectionCheck() remembers the
+  // sourceIds of the last gate prompt it issued
+  // (lastReflectionGateSourceIds, in memory only — never on
+  // disk, never in loop.json). The save path validates a
+  // conclusion against THAT snapshot, not a freshly recomputed
+  // gate: the model may take minutes over the prompt, and a
+  // source that crosses the 24 h boundary in between must not
+  // be refused for arriving late. Lifecycle: a new gate
+  // overwrites the snapshot; a gate below the floor clears it
+  // (no prompt was issued, so nothing may be cited); a
+  // successful save clears it too (one gate, one reflection —
+  // the saved entries are folded into reflectedIds anyway, so
+  // the next gate would not contain them). A failed save keeps
+  // it, so the model can fix the quotes and retry against the
+  // same prompt.
+  private lastReflectionGateSourceIds: string[] | null = null;
+
+  /** Source ids of the last reflection gate prompt issued (a
+   *  copy), or null when no gate is outstanding — the last gate
+   *  was below the floor, or its reflection was already saved.
+   *  The memory_reflect save path validates against this
+   *  snapshot instead of recomputing the gate (see above). */
+  reflectionGateSnapshot(): string[] | null {
+    return this.lastReflectionGateSourceIds
+      ? [...this.lastReflectionGateSourceIds]
+      : null;
+  }
+
+  reflectionCheck(now: number = Date.now()): ReflectionCheck {
+    const reflectedIds = new Set<string>();
+    for (const f of this.fragments.all()) {
+      if (f.type === "reflection") {
+        for (const id of f.sourceIds) reflectedIds.add(id);
+      }
+    }
+    const gate = reflectionGate(
+      this.entries,
+      (e) => this.attrs.ensure(e, undefined, now).significance,
+      now,
+      reflectedIds,
+    );
+    // 0.4.6: the prompt is capped (top 20 / 3000 characters) — the
+    // snapshot and the returned sourceIds are the SHOWN entries
+    // only, so the model can only cite memories it was shown in
+    // full (the prompt's overflow lines are summaries, not
+    // citable). entryCount stays the gate total (how much new
+    // significance triggered at all).
+    const significanceOf = (e: MemoryEntry) =>
+      this.attrs.ensure(e, undefined, now).significance;
+    const shownEntries = gate.reached
+      ? selectCappedEntries(gate.entries, {
+          maxEntries: RECENT_MAX_ENTRIES,
+          maxChars: RECENT_MAX_CHARS,
+          significanceOf,
+        }).shown.map((r) => r.entry)
+      : [];
+    // 0.4.3 snapshot: remember this gate's sources when a prompt
+    // is issued; clear when below the floor (no prompt, no
+    // citable sources).
+    this.lastReflectionGateSourceIds = gate.reached
+      ? shownEntries.map((e) => e.id)
+      : null;
+    return {
+      reached: gate.reached,
+      significanceSum: gate.significanceSum,
+      entryCount: gate.entries.length,
+      sourceIds: shownEntries.map((e) => e.id),
+      prompt: gate.reached
+        ? buildReflectionPrompt(gate.entries, { significanceOf })
+        : undefined,
+    };
+  }
+
+  /** Save a reflection conclusion as a type: "reflection"
+   *  fragment (fragments.json). Every 「」-quoted phrase in the
+   *  conclusion is verified verbatim against its sources first —
+   *  a fabricated quote voids the whole reflection and nothing
+   *  is stored. The insight's own new words are never checked
+   *  (they are the conclusion, not a citation). Runs under the
+   *  write lock and persists fragments.json. */
+  saveReflection(
+    text: string,
+    sourceIds: string[],
+  ): ReflectionSaveResult {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const entriesById = new Map(this.entries.map((e) => [e.id, e]));
+      const res = saveReflection(text, sourceIds, entriesById, this.fragments);
+      // 0.4.3: a successful save consumes the gate snapshot (one
+      // gate, one reflection); a failed save keeps it, so the
+      // model can fix the quotes and retry against the same prompt.
+      if (res.ok) this.lastReflectionGateSourceIds = null;
+      return res;
+    });
+  }
+
+  /** The three dimensions' current values (memory_belief get /
+   *  memory_status). No full quotes — only per-dimension strength /
+   *  uncertainty / proofCount. */
+  beliefSummary(): Record<BeliefDimension, BeliefDimensionSummary> {
+    return this.beliefs.summarize();
+  }
+
+  /** The compact belief line appended to recall blocks ("" when
+   *  there are no beliefs). */
+  beliefLine(): string {
+    return this.beliefs.line();
+  }
+
+  // ---- proactivity (0.4.0 item 7, 行为回流 · 会话内主动版) -------
+  //
+  // Judgement belongs to the model, guardrails to the code. The
+  // tool flow (memory_proact, two calls): (1) {} checks the
+  // guardrails and hands the model the prompt — a refusal there
+  // costs no model call — and issues a 15-minute prompt token
+  // (prepareProactPrompt); issuing a prompt writes no
+  // lastJudgedAt and consumes no daily quota. (2) the model
+  // hands its decision back together with that token, the
+  // guardrails run again (token + TTL + trigger-in-prompt, then
+  // the daily and 7-day checks), and the action is stored in
+  // loop.json. A model `act: false` stores nothing, consumes no
+  // quota, and voids the token it answered. The user's reply
+  // closes the loop via recordProactOutcome (appended to
+  // log.jsonl like any ordinary message, action marked done).
+
+  /** Current loop state (a copy — loop.json on disk). */
+  loopState(): LoopState {
+    return this.loop.get();
+  }
+
+  /** All loop actions (pending, done, dropped). */
+  listProactActions(): PendingAction[] {
+    return this.loop.all();
+  }
+
+  /** Hard-guardrail check for a trigger (empty trigger = gate
+   *  call: only the daily limit is checked). Read-only. When a
+   *  prompt token is carried, it must match the outstanding
+   *  prompt and be inside its TTL, and the trigger must be one
+   *  of that prompt's sourceIds. */
+  proactCheck(
+    trigger: string,
+    now: number = Date.now(),
+    promptToken?: string,
+  ): {
+    ok: boolean;
+    reason?: string;
+  } {
+    return checkGuardrails(this.loop.get(), trigger, now, promptToken);
+  }
+
+  /** The 24 h persona memories behind the proactivity prompt,
+   *  UNCAPPED — buildProactPrompt caps once (top 20 / 3000
+   *  characters by significance) and reports the overflow ("另有
+   *  N 条未列出"). (0.4.7, 0.4.6 audit new issue 2: the cap used
+   *  to happen here first, so buildProactPrompt never saw any
+   *  overflow and the model was never told 180 more memories
+   *  existed.) */
+  private proactMemories(now: number): MemoryEntry[] {
+    return this.entries.filter(
+      (e) =>
+        e.window === "persona" &&
+        now - e.ts >= 0 &&
+        now - e.ts <= 24 * 60 * 60 * 1000,
+    );
+  }
+
+  /** The capped selection the proactivity prompt is built from:
+   *  same input, same cap as buildProactPrompt applies, so the
+   *  source ids are exactly the entries shown in full — a
+   *  decision can only carry a trigger the model was shown.
+   *  Overflow entries are summaries, never triggers (0.4.6). */
+  private proactSelection(now: number): CappedSelection {
+    return selectCappedEntries(this.proactMemories(now), {
+      maxEntries: RECENT_MAX_ENTRIES,
+      maxChars: RECENT_MAX_CHARS,
+      significanceOf: (e) => this.significanceOf(e),
+    });
+  }
+
+  /** The proactivity prompt for the model: the last 24 h of new
+   *  persona memories, all beliefs, all saved reflections.
+   *  Undefined when there is nothing at all to weigh (no prompt
+   *  is built on an empty day). Read-only. */
+  proactPrompt(now: number = Date.now()): string | undefined {
+    const memories = this.proactMemories(now);
+    const beliefs = this.beliefs.all();
+    const reflections = this.fragments
+      .all()
+      .filter((f) => f.type === "reflection");
+    if (
+      memories.length === 0 &&
+      beliefs.length === 0 &&
+      reflections.length === 0
+    ) {
+      return undefined;
+    }
+    return buildProactPrompt(
+      { memories, beliefs, reflections, now },
+      { significanceOf: (e) => this.significanceOf(e) },
+    );
+  }
+
+  /** The ids the proactivity prompt is built from, in prompt
+   *  order: today's persona memories, all beliefs, all saved
+   *  reflections. These are the only triggers a decision may
+   *  carry for the prompt issued alongside them. The memory ids
+   *  are the shown (capped) ones only, matching the prompt (0.4.6). */
+  proactPromptSourceIds(now: number = Date.now()): string[] {
+    const memories = this.proactSelection(now).shown.map(
+      (r) => r.entry,
+    );
+    const beliefs = this.beliefs.all();
+    const reflections = this.fragments
+      .all()
+      .filter((f) => f.type === "reflection");
+    return [
+      ...memories.map((e) => e.id),
+      ...beliefs.map((b) => b.id),
+      ...reflections.map((f) => f.id),
+    ];
+  }
+
+  /** Gate call: check the guardrails, then hand the model the
+   *  prompt together with its token. `prompted: false` with a
+   *  reason means the day is spent (no model call); `prompted:
+   *  false` without one means there is nothing to weigh. The
+   *  token is issued (and loop.json written) only when a prompt
+   *  is actually built; issuing writes no `lastJudgedAt` and
+   *  consumes no daily quota. */
+  prepareProactPrompt(
+    now: number = Date.now(),
+  ): PrepareProactPromptResult {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const guard = checkGuardrails(this.loop.get(), "", now);
+      if (!guard.ok) return { prompted: false, reason: guard.reason };
+      const prompt = this.proactPrompt(now);
+      if (!prompt) return { prompted: false };
+      const sourceIds = this.proactPromptSourceIds(now);
+      const issued = this.loop.issuePrompt(sourceIds, now);
+      return {
+        prompted: true,
+        prompt,
+        promptToken: issued.token,
+        sourceIds,
+      };
+    });
+  }
+
+  /** Void the outstanding prompt token (an `act: false` decision
+   *  answers the prompt and retires it, so it can never be
+   *  answered twice). A token that does not match the
+   *  outstanding prompt clears nothing. Returns false when
+   *  there was no outstanding prompt to void. */
+  discardProactPrompt(promptToken?: string): boolean {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      return this.loop.clearPrompt(promptToken);
+    });
+  }
+
+  /** Store a model decision as a pending action. The guardrails
+   *  run again here, under the write lock — a decision that went
+   *  stale between the gate and the save is still refused.
+   *  `channel` is "session" only for now: "qq" returns
+   *  {ok:false, reason:"qq_not_connected"} and stores nothing.
+   *  When a prompt token is carried, the decision must answer
+   *  that exact prompt (token + TTL) and its trigger must be one
+   *  of the prompt's sourceIds. A full pending list (3) drops
+   *  the oldest pending action first (status "dropped", record
+   *  kept). An `act: false` decision stores nothing, consumes
+   *  no quota, and voids the token it carried. */
+  proactSave(
+    decision: ProactDecision,
+    channel: ProactChannel = "session",
+    now: number = Date.now(),
+    promptToken?: string,
+  ): { ok: boolean; action?: PendingAction; reason?: string } {
+    if (channel === "qq") {
+      return { ok: false, reason: "qq_not_connected" };
+    }
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      if (!decision || decision.act !== true) {
+        if (typeof promptToken === "string" && promptToken.length > 0) {
+          this.loop.clearPrompt(promptToken);
+        }
+        return {
+          ok: false,
+          reason: "没有要执行的行动（模型决定不主动）。",
+        };
+      }
+      return this.loop.addAction(decision, channel, now, promptToken);
+    });
+  }
+
+  /** Close the loop: append the user's reply to log.jsonl like
+   *  any ordinary message (role "user", persona window) and mark
+   *  the action done. Unknown / already-done action id, or an
+   *  empty reply: nothing is appended, nothing is marked. */
+  recordProactOutcome(
+    actionId: string,
+    userReply: string,
+    sessionId: string = "",
+  ): { ok: boolean; entry?: MemoryEntry; reason?: string } {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      let entry: MemoryEntry | undefined;
+      const closed = recordOutcome(
+        this.loop,
+        actionId,
+        userReply,
+        (text) => {
+          entry = this.record({
+            role: "user",
+            text,
+            window: "persona",
+            sessionId,
+          });
+        },
+      );
+      if (!closed) {
+        return {
+          ok: false,
+          reason: "没有这条待执行的行动，或它已经完成了。",
+        };
+      }
+      return { ok: true, entry };
+    });
+  }
+
+  /** Mark one pending action done WITHOUT appending anything —
+   *  for callers whose user reply is already in the log (the DSH
+   *  session/event handler records every user message itself).
+   *  Returns false when the id is unknown or already done. */
+  markProactDone(actionId: string): boolean {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      return this.loop.markDone(actionId);
+    });
+  }
+
   // ---- MEMORY.md (read-only) --------------------------------------
 
   /** Layer 1 current state, as the skill wrote it. Stage comes from here. */
   readLayer1(): Layer1State {
-    return this.memoryFile.load().layer1;
+    return mergeProfile(this.memoryFile.load().layer1, loadProfile(this.dataDir));
   }
 
   /** Whole skill memory file, read-only (for memory_search display). */
   readMemoryFile(): ParsedMemoryFile {
-    return this.memoryFile.load();
+    const parsed = this.memoryFile.load();
+    return { ...parsed, layer1: mergeProfile(parsed.layer1, loadProfile(this.dataDir)) };
+  }
+
+  /** Update the persona profile (profile.json). Tool layer restricts to persona windows. */
+  updateProfile(profile: Partial<PersonaProfile>, at = Date.now()): PersonaProfile {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const previous = loadProfile(this.dataDir) ?? {};
+      const next: PersonaProfile = { ...previous, ...profile, updatedAt: at };
+      saveProfile(this.dataDir, next);
+      return next;
+    });
   }
 
   // ---- rollover ---------------------------------------------------
@@ -690,7 +1262,8 @@ export class MemoryCore {
    *  0.2.0: also persists the graph and the attributes (in-memory
    *  recall bumps live here until flushed). 0.3.0: also persists
    *  fragments (in-memory suspect marks from recall live here
-   *  until flushed). */
+   *  until flushed). 0.4.0 item 2: also persists beliefs.
+   *  0.4.0 item 7: also persists the loop state. */
   flush(): void {
     this.withWriteLock(() => {
       this.refreshIfStale();
@@ -698,6 +1271,8 @@ export class MemoryCore {
       this.graph.save();
       this.attrs.save();
       this.fragments.save();
+      this.beliefs.save();
+      this.loop.save();
     });
   }
 
@@ -786,6 +1361,11 @@ export class MemoryCore {
           return null;
         }
       }
+      // 0.4.6 (0.4.5 audit new issue 2): the profile name's tokens
+      // can never be invalidation topics either — a rename via
+      // memory_profile is honoured on top of the skill-name
+      // default in review.ts.
+      const profileName = loadProfile(this.dataDir)?.name;
       const r = runReview({
         dataDir: this.dataDir,
         entries: this.entries,
@@ -793,7 +1373,11 @@ export class MemoryCore {
         attrs: this.attrs,
         index: this.index,
         fragments: this.fragments.all(),
+        beliefs: this.beliefs,
         now,
+        excludedTopicTokens: profileName
+          ? new Set(tokenize(profileName))
+          : undefined,
       });
       // review.json was written by runReview; the in-memory
       // summaries cache picks up any new compressed lines.
@@ -841,6 +1425,22 @@ export class MemoryCore {
       // 0.3.0
       fragments: this.fragments.size,
       suspectFragments: this.fragments.suspectCount,
+      // 0.4.0 item 2
+      beliefs: this.beliefs.size,
+      beliefDimensions: this.beliefs.summarize(),
+      // 0.4.4 item 2: memories flagged needsInvalidationCheck and
+      // not yet invalidated — "awaiting model review". The flag
+      // clears when the model invalidates the entry, when the
+      // opposing statement ages past the 30-day window, or when
+      // the entry drops out of the check's population, so this
+      // number never counts a resolved or stale check.
+      pendingInvalidationChecks: this.entries.filter((e) => {
+        const attrs = this.attrs.get(e.id);
+        return (
+          attrs?.needsInvalidationCheck === true &&
+          !(attrs.validTo != null && attrs.validTo <= Date.now())
+        );
+      }).length,
     };
   }
 }

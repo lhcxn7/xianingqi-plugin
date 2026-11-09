@@ -290,11 +290,18 @@ function deleteDirIfOwnerMatches(
   } else if (!current || current.token !== expected.token) {
     return false; // changed hands — do not delete
   }
+  // TEST HOOK (env LOCK_TEST_RECLAIM_FAIL): pretend the delete
+  // failed (e.g. the lock dir held open by another process on
+  // Windows), so a test can prove acquireWriteLock still yields
+  // and times out instead of tight-looping. Off by default;
+  // never set in production. (Follows the LOCK_TEST_BREAK_DELAY_MS
+  // precedent in breakArbiter below.)
+  if (process.env.LOCK_TEST_RECLAIM_FAIL === "1") return false;
   try {
     rmSync(dir, { recursive: true, force: true });
     return true;
   } catch {
-    return false; // already gone
+    return false; // already gone, or held open (Windows)
   }
 }
 
@@ -496,6 +503,10 @@ export function acquireWriteLock(
   let lastArbiterError: string | null = null;
   let firstArbiterError: string | null = null;
   let arbiterAttempts = 0;
+  // 0.4.6 (0.4.3 audit item 16): stale-lock reclaim attempts
+  // that failed (delete refused or rm threw) — counted so the
+  // timeout error can say what happened.
+  let reclaimFailures = 0;
   for (;;) {
     // One critical section: try to take the lock, or break a stale
     // one, while holding the arbiter. If the arbiter itself cannot
@@ -611,17 +622,29 @@ export function acquireWriteLock(
             // The stale lock is gone; take the now-free dir.
             continue;
           }
-          // It changed hands (or is already gone); retry the mkdir.
-          continue;
+          // 0.4.6 (0.4.3 audit item 16): the reclaim failed — the
+          // dir changed hands, or the rm threw (on Windows a lock
+          // dir held open by another process cannot be removed).
+          // Do NOT `continue` here: the old code continued on
+          // both branches, skipping the deadline check and the
+          // sleep below, so a permanently failing reclaim spun
+          // forever without yielding or ever timing out. Fall
+          // through to the deadline/sleep like a live lock, and
+          // count the failure for the timeout error.
+          reclaimFailures += 1;
         }
-        // Live lock: wait for it (arbiter freed below, before we sleep).
+        // Live lock, or a stale lock whose reclaim failed: wait
+        // for it (arbiter freed below, before we sleep).
       }
     } finally {
       releaseArbiter();
     }
     if (Date.now() >= deadline) {
       throw new Error(
-        `could not acquire write lock ${dir} within ${timeoutMs}ms (another process holds it)`,
+        `could not acquire write lock ${dir} within ${timeoutMs}ms (another process holds it)` +
+          (reclaimFailures > 0
+            ? `; ${reclaimFailures} stale-lock reclaim attempt(s) failed`
+            : ""),
       );
     }
     sleepSync(Math.min(retryMs, Math.max(0, deadline - Date.now())));
