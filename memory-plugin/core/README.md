@@ -187,6 +187,46 @@ the source), `topic`/`keywords`, `createdAt`, `verified`.
   colour, then the neutral default — an unknown word still renders
   a star.
 
+## 0.4.8: dsh-tools schema adapter + install/lock version fixes
+
+Fixes the Codex real-environment finding (2026-11-10, real Node
+24.22.2 + installed `@deepseek-ai/dsh-tools`): with dependencies
+installed, the tool compiler rejected the tool schemas — parameters
+carry `required: false`, and object schemas have no
+`additionalProperties` — the plugin caught the error and skipped
+registration, so none of the 13 tools registered. The sandbox mock
+tests never saw it: the mock compiler is lenient and the real package
+was never installed there. The fix is a single choke point in
+`dsh-plugin/src/define-tool.ts`, not 22 edits in `index.ts`:
+
+- **`normalizeSchemaForDshTools`** walks a schema recursively,
+  drops every `required: false`, and adds `additionalProperties:
+  false` to every object schema lacking it (nested objects
+  included).
+- **`normalizeToolSpec`** applies it to a tool's `parameters` and
+  its `output.schema`.
+- **`compileWithDshTools`** normalizes before the real defineTool
+  compiles the schemas, and keeps the plugin's own `execute`
+  handler (defineTool still compiles both schemas).
+- The local fallback path normalizes too:
+  `compileToolLocally(normalizeToolSpec(tool))`.
+
+The 22 `required: false` sites in `dsh-plugin/src/index.ts` are
+deliberately left as-is — the concise declarations stay readable
+and the adapter owns the dialect. A second layer (from the
+re-check): if the real compiler still rejects a normalized schema,
+`compileWithDshTools` catches it, warns once (`dsh-tools defineTool
+编译失败，改用本地 schema 编译`), and falls back to the local
+compiler — the tools register anyway instead of the whole plugin
+going silent. Install command and guide text
+now say v0.4.8; both lock files now record 0.4.8 (were 0.1.0 /
+0.1.7). Tests: core 193 PASS, mock 163 PASS (was 161, +1 adapter
+test covering nested objects and the output schema, +1 fallback
+test covering a rejecting compiler and the once-only warning), `tsc` 0
+errors on core. Caveat: the adapter is verified by the mock test
+only in the sandbox; real registration still needs re-verification
+on a machine with the dependency installed.
+
 ## 0.4.7: 0.4.6 re-review pre-ship fixes (new issues 1–2)
 
 Fixes from the 0.4.6 independent re-review (real data + real DSH

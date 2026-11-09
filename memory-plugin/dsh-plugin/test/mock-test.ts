@@ -29,6 +29,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MemoryCore } from "../../core/src/index.ts";
 import { apply, hasTaskBlocklistWord, inject, INVALIDATION_AUDIT_FILE, isPersonaTrigger, MODEL_REVIEW_AUTO_RELEASE_TURNS, name, parseEmotion, shouldMarkPersona } from "../src/index.ts";
+import { compileWithDshTools, normalizeToolSpec } from "../src/define-tool.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -40,6 +41,84 @@ function check(label: string, fn: () => void): void {
   fn();
   console.log(`PASS ${label}`);
 }
+
+check("dsh-tools schema adapter removes false required flags and closes nested objects", () => {
+  const normalized = normalizeToolSpec({
+    parameters: {
+      optional: { type: "string", required: false },
+      nested: {
+        type: "object",
+        properties: {
+          child: { type: "object", properties: { enabled: { type: "boolean" } } },
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: "object",
+        properties: {
+          result: { type: "object", properties: { ok: { type: "boolean" } } },
+        },
+      },
+    },
+  }) as {
+    parameters: Record<string, unknown>;
+    output: { schema: Record<string, unknown> };
+  };
+  assert.deepEqual(normalized.parameters.optional, { type: "string" });
+  const nested = normalized.parameters.nested as {
+    additionalProperties: boolean;
+    properties: Record<string, { additionalProperties: boolean }>;
+  };
+  assert.equal(nested.additionalProperties, false);
+  assert.equal(nested.properties.child.additionalProperties, false);
+  const output = normalized.output.schema.properties as Record<
+    string,
+    { additionalProperties: boolean }
+  >;
+  assert.equal(output.result.additionalProperties, false);
+});
+
+check("dsh-tools compiler failure falls back locally and warns once", () => {
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(" "));
+  };
+  try {
+    const execute = (args: unknown) => args;
+    const spec = {
+      name: "fallback_test",
+      description: "Fallback regression fixture",
+      parameters: {
+        query: { type: "string", required: true },
+        limit: { type: "number", required: false },
+      },
+      output: {
+        schema: { type: "object", properties: { ok: { type: "boolean" } } },
+        render: () => [],
+      },
+      execute,
+    };
+    const rejectSchema = () => {
+      throw new Error("strict schema rule changed");
+    };
+    const first = compileWithDshTools(rejectSchema, spec) as {
+      parameters: { type: string; required?: string[]; properties: Record<string, unknown> };
+      execute: typeof execute;
+    };
+    const second = compileWithDshTools(rejectSchema, spec);
+    assert.equal(first.parameters.type, "object");
+    assert.deepEqual(first.parameters.required, ["query"]);
+    assert.deepEqual(first.parameters.properties.limit, { type: "number" });
+    assert.equal(first.execute, execute);
+    assert.ok(second);
+    assert.equal(warnings.length, 1);
+    assert.ok(warnings[0].includes("strict schema rule changed"));
+  } finally {
+    console.warn = originalWarn;
+  }
+});
 
 interface Handler {
   handler: (...args: unknown[]) => unknown;
@@ -289,7 +368,7 @@ check("apply never reads ctx.config (real-DSH regression)", () => {
   apply(strictProxy as never, { dataDir: strictDir } as never);
 });
 
-check("registers directives section and all thirteen fallback tools (compiled JSON Schema)", () => {
+check("registers directives section and all thirteen tools (compiled JSON Schema)", () => {
   assert.ok(
     ctx.sections.some((s) => s.name === "memory-plugin:directives"),
   );

@@ -37,7 +37,7 @@ install the `dsh-plugin/` folder alone.
 ### Option A — one line (DSH plugin command)
 
 ```sh
-dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v0.3.0&path:/memory-plugin/dsh-plugin"
+dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v0.4.8&path:/memory-plugin/dsh-plugin"
 ```
 
 Replace `<name>` with your DSH profile name (often `web` or
@@ -60,7 +60,7 @@ Paste this into your own DSH agent and let it do the work. It installs
 the plugin; you restart DSH by hand afterwards.
 
 > 帮我装一个 DSH 记忆插件：从 GitHub 把 lhcxn7/xianingqi-plugin
-> 这个仓库的 v0.3.0 版装进来（我的 profile 是 <你的 profile 名>）。
+> 这个仓库的 v0.4.8 版装进来（我的 profile 是 <你的 profile 名>）。
 > 插件在仓库的 memory-plugin/dsh-plugin 子目录，core 在 memory-plugin/core 目录，两个目录
 > 必须在一起，装的时候别只拷 dsh-plugin 一个目录。装完告诉我
 > 结果，报错原文发我；装好后我自己重启 DSH。我的记忆数据文件夹
@@ -116,6 +116,34 @@ memory-plugin/
 
 ## Status
 
+- [x] 0.4.8 (2026-11-10) — fixes the Codex real-environment
+      finding: with dependencies installed, the tool compiler
+      rejected the tool schemas (`required: false` in parameters,
+      object schemas without `additionalProperties`), the plugin
+      caught the error and skipped registration, so none of the 13
+      tools registered. The sandbox mock tests never saw it — the
+      mock compiler is lenient and the real package was never
+      installed there. Fix: `normalizeToolSpec` /
+      `normalizeSchemaForDshTools` in `dsh-plugin/src/define-tool.ts`
+      strips `required: false` recursively and adds
+      `additionalProperties: false` to every object schema lacking
+      it, applied on both paths (real defineTool via
+      `compileWithDshTools`, keeping the plugin's own execute
+      handler; local fallback via
+      `compileToolLocally(normalizeToolSpec(tool))`). The 22
+      `required: false` sites in `index.ts` are deliberately left
+      as-is — normalization happens at the compiler boundary, one
+      choke point. A second layer (from the re-check): if the real
+      compiler still rejects a normalized schema,
+      `compileWithDshTools` warns once and falls back to the local
+      compiler, so the tools register anyway instead of the whole
+      plugin going silent. Install command and guide text now say v0.4.8;
+      both lock files now record 0.4.8 (were 0.1.0 / 0.1.7).
+      Tests: core 193 PASS, mock 163 PASS (was 161, +1 adapter
+      test, +1 fallback test), `tsc` 0 errors on core. Caveat: the adapter is
+      verified by the mock test only in the sandbox; real
+      registration still needs re-verification on a machine with
+      the dependency installed.
 - [x] 0.4.7 (2026-11-09) — fixes from the 0.4.6 independent
       re-review (its two pre-ship items, new issues 1–2). The
       blocklist item is NOT touched (user decision — "先不管"

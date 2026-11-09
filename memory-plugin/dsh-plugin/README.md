@@ -7,7 +7,7 @@ Harness. Local only — no network, no login, no cloud.
 ## Install (in DSH)
 
 ```sh
-dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v0.3.0&path:/memory-plugin/dsh-plugin"
+dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v0.4.8&path:/memory-plugin/dsh-plugin"
 ```
 
 or, for local development, load the patch overlay without installing:
@@ -132,6 +132,42 @@ still never writes MEMORY.md.
   arbitrary words: the activation emotion factor falls back from
   an exact type match to a coarse polarity match, and the starmap
   colours unknown types by polarity or the neutral default.
+
+## 0.4.8: dsh-tools schema adapter — tools register with dependencies installed
+
+Same 13 tools, same parameters and return shapes. What changed
+under them:
+
+- **Schemas are normalized before either compiler sees them
+  (define-tool.ts).** Codex on a real machine (Node 24.22.2,
+  `@deepseek-ai/dsh-tools` installed) found the tool compiler
+  rejects the schemas — `required: false` in parameters, object
+  schemas without `additionalProperties` — and the plugin then
+  skips registration, so none of the 13 tools registered. The
+  sandbox mock tests never saw it (lenient mock compiler, real
+  package never installed). `normalizeSchemaForDshTools` drops
+  every `required: false` and adds `additionalProperties: false`
+  to every object schema lacking it, nested included;
+  `normalizeToolSpec` applies it to `parameters` and
+  `output.schema`; the real-defineTool path goes through
+  `compileWithDshTools` (plugin's own `execute` handler kept),
+  the fallback through `compileToolLocally(normalizeToolSpec(tool))`.
+  The 22 `required: false` sites in `index.ts` stay as-is — one
+  choke point owns the dialect. Tests: mock 163 PASS (was 161,
+  +1 adapter test on nested objects and the output schema, +1
+  fallback test: a rejecting compiler falls back locally, warns
+  once, keeps the plugin's execute handler).
+- **A rejecting compiler no longer silences the plugin.** If the
+  real defineTool throws even after normalization,
+  `compileWithDshTools` warns once and compiles locally, so the
+  tools still register. This is the second layer from the re-check,
+  not a fix for a second observed rejection.
+- **Install command and lock versions now say 0.4.8.** The README
+  install line used to pin `#v0.3.0` (installing by the book would
+  have pulled the old release); both lock files recorded 0.1.0 /
+  0.1.7. Caveat: the adapter is verified by the mock test only in
+  the sandbox; real registration still needs re-verification on a
+  machine with the dependency installed.
 
 ## 0.4.7: 0.4.6 re-review pre-ship fixes (new issues 1–2) — reflection marking, proact overflow count
 
