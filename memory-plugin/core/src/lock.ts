@@ -86,8 +86,8 @@
 //   is alive, is never broken. A lock dir with NO owner record
 //   (crashed between mkdir and writing owner.json) is stale only
 //   once very old (60 s) — a fresh one is mid-creation, not stale.
-// - The arbiter is stale when it is old (mtime over 5 s — a
-//   critical section is a few synchronous calls, so 5 s is far
+// - The arbiter is stale when it is old (mtime over 1 s — a
+//   critical section is a few synchronous calls, so 1 s is far
 //   beyond any legitimate hold) AND its owner pid is dead (or it
 //   never wrote an owner record). A stale arbiter is reclaimed by
 //   the in-place delete above (never a rename).
@@ -121,6 +121,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 
 export const LOCK_DIR_NAME = ".locks";
@@ -134,12 +135,14 @@ export const DEFAULT_LOCK_RETRY_MS = 25;
 /** Arbiter directory name (serialises all canonical-lock operations). */
 export const ARBITER_NAME = "arbiter.lock";
 /** An arbiter older than this AND whose owner pid is dead may be broken.
- *  A critical section is a few synchronous calls, so 5 s is far beyond
- *  any legitimate hold. Kept well below the caller's acquire timeout
- *  (default 5 s for the canonical lock, 10 s in the tests) so a waiter
- *  can outlast a stuck-arbiter break instead of timing out at the same
- *  instant the break becomes possible. */
-export const ARBITER_STALE_MS = 5_000;
+ *  A critical section is a few synchronous calls, so 1 s is far beyond
+ *  any legitimate hold. 1 s (not 5 s, as before) is what keeps the
+ *  arbiter break from racing the caller's acquire timeout: the old
+ *  5 s matched the default canonical acquire timeout exactly, so a
+ *  waiter could time out at the same instant the break became
+ *  possible. 1 s is well below both the 5 s canonical timeout and
+ *  the 500 ms arbiter attempt window's retry loop. */
+export const ARBITER_STALE_MS = 1_000;
 /** Per-attempt timeout for acquiring the arbiter (the canonical
  *  acquire loop retries until its own deadline). */
 export const ARBITER_TIMEOUT_MS = 500;
@@ -163,6 +166,46 @@ export interface LockOwner {
   pid: number;
   token: string;
   time: number;
+  // 0.5.1 (0.4.3 §四): liveness used to be pid-only, which is only
+  // meaningful on the machine that wrote the lock — a pid from
+  // another host (shared/network data dir) can never be verified
+  // here, so a cross-host lock is never broken (see isOwnerForeign).
+  // `host` is the writer's hostname; `startedAt` is when the
+  // writer's process started (epoch ms, for diagnosis — a lock
+  // whose owner started long before the lock file is suspicious).
+  // Both are optional: owner.json rows written before 0.5.1 have
+  // neither, and keep the old pid-only behaviour.
+  host?: string;
+  startedAt?: number;
+}
+
+/** This machine's hostname, captured once (see LockOwner). */
+const HOSTNAME = hostname();
+/** This process's start time (epoch ms), captured once — Date.now()
+ *  minus process uptime, approximate to ~1 s. */
+const PROCESS_STARTED_AT =
+  Date.now() - Math.floor(process.uptime() * 1000);
+
+function ownerRecord(token: string): LockOwner {
+  return {
+    pid: process.pid,
+    token,
+    time: Date.now(),
+    host: HOSTNAME,
+    startedAt: PROCESS_STARTED_AT,
+  };
+}
+
+/** True when the owner record names a different host — a pid from
+ *  there cannot be verified from here, so the lock is never stale
+ *  on that evidence alone. An owner with no host field predates
+ *  0.5.1 and keeps the old pid-only behaviour. */
+function isOwnerForeign(owner: LockOwner): boolean {
+  return (
+    typeof owner.host === "string" &&
+    owner.host.length > 0 &&
+    owner.host !== HOSTNAME
+  );
 }
 
 export function lockDirPath(dataDir: string): string {
@@ -220,6 +263,10 @@ function readOwner(dir: string): LockOwner | null {
         pid: parsed.pid,
         token: parsed.token,
         time: typeof parsed.time === "number" ? parsed.time : 0,
+        ...(typeof parsed.host === "string" ? { host: parsed.host } : {}),
+        ...(typeof parsed.startedAt === "number"
+          ? { startedAt: parsed.startedAt }
+          : {}),
       };
     }
   } catch {
@@ -245,7 +292,7 @@ function traceArbiter(dataDir: string, action: string, token: string): void {
     appendFileSync(
       join(dataDir, "arbiter-trace.log"),
       `${JSON.stringify({ t: Date.now(), pid: process.pid, action, token: token.slice(0, 24) })}\n`,
-      "utf8",
+      { encoding: "utf8", mode: 0o600 },
     );
   } catch {
     // Tracing must never break the lock.
@@ -265,6 +312,9 @@ function staleOwnerIfStale(
   if (lockAgeMs(dir) <= staleMs) return null;
   const owner = readOwner(dir);
   if (!owner) return lockAgeMs(dir) > NULL_OWNER_STALE_MS ? "no-owner" : null;
+  // 0.5.1 (§四): a foreign host's pid cannot be verified here —
+  // the lock is never stale on pid evidence alone.
+  if (isOwnerForeign(owner)) return null;
   return isPidAlive(owner.pid) ? null : owner;
 }
 
@@ -339,6 +389,8 @@ function isArbiterStale(dir: string): boolean {
   if (lockAgeMs(dir) <= ARBITER_STALE_MS) return false;
   const owner = readOwner(dir);
   if (!owner) return true;
+  // 0.5.1 (§四): a foreign host's pid cannot be verified here.
+  if (isOwnerForeign(owner)) return false;
   return !isPidAlive(owner.pid);
 }
 
@@ -352,7 +404,7 @@ function isArbiterStale(dir: string): boolean {
  *  A new holder that took the path after the judgement carries a
  *  different token and is never deleted. A no-owner arbiter is
  *  stale once older than the arbiter threshold (a critical section
- *  is a few sync calls, so a no-owner arbiter older than 5 s is
+ *  is a few sync calls, so a no-owner arbiter older than 1 s is
  *  not mid-creation) — matching isArbiterStale. */
 function breakArbiter(dir: string): void {
   const dataDir = dirname(dirname(dir));
@@ -363,6 +415,8 @@ function breakArbiter(dir: string): void {
     if (age <= ARBITER_STALE_MS) return; // fresh, possibly mid-creation
     expected = "no-owner";
   } else {
+    // 0.5.1 (§四): a foreign host's pid cannot be verified here.
+    if (isOwnerForeign(owner)) return;
     if (isPidAlive(owner.pid)) return; // live — do not touch
     if (age <= ARBITER_STALE_MS) return; // fresh — do not touch
     expected = owner;
@@ -398,7 +452,7 @@ function acquireArbiter(dataDir: string, timeoutMs: number): () => void {
       mkdirSync(dir);
       writeFileSync(
         join(dir, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, token, time: Date.now() })}\n`,
+        `${JSON.stringify(ownerRecord(token))}\n`,
         "utf8",
       );
       // Holder re-validation: a breaker can only delete a STALE
@@ -547,7 +601,7 @@ export function acquireWriteLock(
         mkdirSync(dir);
         writeFileSync(
           join(dir, "owner.json"),
-          `${JSON.stringify({ pid: process.pid, token, time: Date.now() })}\n`,
+          `${JSON.stringify(ownerRecord(token))}\n`,
           "utf8",
         );
         // We own it: hand back the releaser (which re-acquires the

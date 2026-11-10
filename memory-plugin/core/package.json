@@ -14,9 +14,12 @@
   },
   "type": "module",
   "types": "./src/index.ts",
-  "version": "0.4.8",
+  "version": "0.5.5",
   "devDependencies": {
     "@types/node": "^24.19.2",
     "typescript": "^5.9.3"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "3.8.1"
   }
 }

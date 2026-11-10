@@ -187,6 +187,232 @@ the source), `topic`/`keywords`, `createdAt`, `verified`.
   colour, then the neutral default — an unknown word still renders
   a star.
 
+## 0.5.5: local-only follow-ups
+
+- **`composeInjection`** in `recall.ts`: one total token budget for
+  profile + hits + belief + experiences; trimming order experience →
+  belief → hits → profile, hard truncation only as a last resort.
+- **`factChains`** now validates explicit `supersedes` links: missing
+  targets, branches, cycles and multiple currents mark the chain
+  invalid (`valid:false`, `issues[]`); invalid chains do not affect
+  ranking. No-links chains keep the time-order fallback.
+- **ExperienceStore** gains `revoke`, optional `expiresAt`, and
+  stricter trigger matching (no 1-char triggers or 1-char shared
+  tokens); `confirm` records who/when; expired/revoked rules are
+  never injected.
+- **Tests** cover total-budget trimming, branch/cycle/multiple-current
+  chains, revoke/expiry, and short-trigger rejection.
+
+## 0.5.4: second external review fixes
+
+- **Model auto-location.** `findBundledModelDir()` resolves
+  `dsh-plugin/models/bge-small-zh-v1.5` / `models/bge-small-zh-v1.5`
+  from the package; the default `modelDir` prefers `<dataDir>/models`
+  then the bundled copy. No manual copy for the full package.
+- **Delete journal covers forgetting state.** Snapshot allowlist
+  includes `forgotten.json` / `forget-requests.json`; a failed recovery
+  keeps the journal.
+- **Snapshot covers experiences/goals.** `restore()` reloads them and
+  `revalidateReferences()` drops source ids that are not live; an
+  Experience with no sources becomes unconfirmed.
+- **Writes through Core.** Goal/Experience mutations are Core methods
+  under the write lock; tools/CLI/API do not call Store.save directly.
+- **Admin token and Experience confirmation** are CLI/API-only; see the
+  shell README.
+
+## 0.5.3: remaining audit closures
+
+- **Delete journal + recovery.** `executeForget` writes
+  `forget-journal.json` before the first mutation and marks it
+  `committed` after the last; `Core` construction rolls an
+  interrupted delete back to its pre-delete snapshot.
+- **Embedding runtime path.** `TransformersEmbeddingProvider` accepts
+  `runtimeDir` (default `<dataDir>`) and resolves the optional
+  runtime from `<runtimeDir>/node_modules` before the normal import.
+- **Experience provenance.** `Experience` carries `sourceIds` and
+  `verified`; `record` requires source ids, `confirm` promotes a
+  candidate, `match` injects only confirmed rules.
+- **Forget boundary.** `ForgetPreview.skillCopies` lists
+  `MEMORY.md` / `MEMORY-YYYY-MM.md`; `executeForget` has an opt-in
+  `purgeSkillFiles` that backs up and removes exact matching lines.
+- **Admin token, JSONL diagnostics, review persona-only.** See the
+  dsh-plugin README.
+
+## 0.5.2: audit fixes (privacy + data integrity)
+
+- **Unified hidden filter.** `proactMemories`, `proactPrompt`,
+  `review`, `reflectionCheck`, `generateStarmap`, `createFragment`,
+  `createBelief`, `supportBelief`, `contradictBelief`, `saveReflection`
+  and archive recall all exclude `forget.isForgotten(id)` sources.
+- **Fail-closed tombstones.** `ForgetStore.load()` reads
+  `forgotten.json` independently of `forget-requests.json`; a corrupt
+  tombstone table hides every id (`isForgotten` returns true) until
+  repaired, instead of silently showing hidden memories again.
+- **Permissions + restore.** `ensureDir` uses `0700`, `AppendLog`
+  creates `log.jsonl` with `0600`; `restoreSnapshot` deletes
+  plugin-owned files absent from the snapshot and `Core.restore`
+  drops the semantic index/pending reflection gate and regenerates
+  the starmap.
+- **Experiences/Goals/embedding.** No developer seeds; goal update
+  validation; `editEntry` refreshes the vector; semantic rebuild
+  clears, top-N filters allowed ids, provider load is retryable,
+  cosine validates dimensions/finiteness, and the timeout timer is
+  cleared.
+- **Tests.** P0 regression checks added; Windows-safe mode
+  assertions; optional-runtime type shim for a clean `tsc`.
+
+## 0.5.1: review fixes (0.4.3 + 0.4.5)
+
+- **Corrupt stores** (`beliefs.ts`, `fragments.ts`, `attributes.ts`,
+  `graph.ts`): a failed load backs the file up to
+  `.corrupt-<ms>-<rand>`, warns, and never overwrites it. Beliefs /
+  fragments / attributes refuse to save afterwards (`loadFailed`
+  blocks the write); the graph is derived data, so it keeps the old
+  edges, marks `needsBackfill`, and may still save (a rebuild from
+  the log restores it). `beliefs.json` joins the snapshot whitelist
+  (`snapshot.ts`).
+- **Cross-process writes** (`core.ts`): the stale check now
+  fingerprints every store file (mtime + size), not just the log —
+  a second process that edits beliefs / attributes / loop can no
+  longer be silently clobbered by a flush from the first.
+- **Recall** (`recall.ts`): a weak single token (in `COMMON_TOKENS`
+  or `df > max(2, 15%)`) is dropped only when no strong token
+  anchors the hit — a lone weak token is noise, but next to a
+  strong token it is context (q15's walk depends on it).
+  Multi-token scores are rarity-weighted (`rarityWeight`:
+  `log((N+2)/(df+1)) / log((N+2)/2)`); single-token queries keep
+  the flat score. One injected hit caps at ~400 chars with a
+  "truncated" mark, and newlines are flattened out of injected
+  text so a message can no longer forge a review line.
+- **Fragments** (`fragments.ts`): the source join is lowercased
+  before compare (DSH / iPhone / GitHub no longer mis-refused);
+  quotes need ≥ 4 chars and at least one must share a 2-char word
+  with the fragment text; `不` / `没` are back in the real-word
+  table as `NEGATION_CHARS`, and `termPolarity` refuses a polarity
+  flip (`我没有生气` → `我生气了`). `createFragment` rejects a
+  task-window source. Suspect / verified marks survive a reload
+  (`dirty` map replayed after load, cleared on a successful save).
+- **Beliefs** (`beliefs.ts`): `support` dedupes by entry id
+  (`duplicate: true`, strength and counts untouched) and
+  `uncertainty = 0.8 / (1 + proofCount)`, derived on create /
+  support / load — never trusted from input. New ids are the max
+  numeric suffix + 1.
+- **Review** (`review.ts`, `model-review.ts`): topic tokens for
+  fragment / belief candidates reuse `COMMON_TOKENS` /
+  `CJK_SINGLE_STOP` plus a small aspect list (a no-segmentation
+  bigram can still slip across a word boundary — honest limit).
+  The summary counts upgraded edges (`(另有 N 条边升级。)`).
+  `selectCappedEntries` truncates even the first entry to the
+  remaining 8000-char budget (`"…"`) instead of blowing past it,
+  and one-lines every display string. `loadSummaries` catches a
+  missing directory.
+- **Reflections** (`reflection.ts`): 1000 chars / 200 rows caps,
+  length checked before count, count before validation.
+- **Lock / atomic** (`lock.ts`, `atomic.ts`): the owner record
+  carries `host` + `startedAt`; a foreign host's lock is never
+  broken. `ARBITER_STALE_MS` is 1000 ms (was 5000, the same as the
+  acquire timeout). `atomicWriteText` is 0o600 and removes its
+  temp on failure; `cleanTempLeftovers` clears `.tmp-*` older than
+  60 s at core construction.
+- **Starmap** (`starmap.ts`): entries without a date get one from
+  the timestamp (`formatDate` / `formatTime`); `safeJsonForHtml`
+  escapes U+2028 / U+2029; badge words are computed once per star.
+- **Dates / clarity** (`dates.ts`, `attributes.ts`):
+  `yesterdayEntries` is a calendar day, not 24 h back;
+  `defaultClarity` now decays with the same `detailLambda` rate
+  the half-life table implies (heavy 41 days, light 26 days).
+  `validFrom` is write-only by design — `ensure` always sets it
+  equal to `entry.ts`, so checking it would change nothing.
+- **Benchmark (0.5.1).** Keyword-only: coverage 0.923, Recall@5
+  0.8, MRR 0.733, no-evidence false positives 0.167 (was 0.5).
+  `--rewrite`: 1.0 / 1.0. Conflict class MRR 1.0 (q13/q14/q15
+  all rank 1 — the fact chain below fixed q15).
+- **Fact version chain + forgetting** (`facts.ts`, `forget.ts`):
+  `factKey` names one fact, `supersedes` links the new version to
+  the old. A present question answers the current version (1.5x)
+  and demotes the superseded one (0.12x); a history question
+  (以前/之前/曾经/…) mirrors it (superseded 1.5x, current 0.5x).
+  The factor only fires when the query touches the fact, and a
+  matched superseded version pulls its current version into the
+  match set with the same tokens — "她现在喝不喝咖啡" matches
+  不喝咖啡 but answers with the current 美式 (q15 rank 4 → 1).
+  A superseded hit is marked `·旧版` in the injected block.
+  Forgetting is never a chat line: `request` only files a pending
+  request (7-day TTL), `approve` accepts only the `cli` / `admin`
+  channels (there is no `model` channel), `execute` hides
+  (tombstone — recall / search / yesterday / entriesByIds all
+  skip it, admin still sees it) or deletes (snapshot first, then
+  the log, index, graph, attributes, fragments and beliefs are
+  rewritten, audit row in `forget-audit.jsonl`). Dry-run previews
+  entries / fragments / beliefs / graph edges / index vectors /
+  unknown ids and changes nothing.
+- **Local embedding** (`semantic.ts`, see `LOCAL-EMBEDDING.md`
+  and `MODELS.md`): bge-small-zh-v1.5, ONNX int8, pinned revision
+  `75c43b069aac4d136ba6bc1122f995fedcfd2781`, 512 dims, `cls`
+  pooling, query prefix
+  `为这个句子生成表示以用于检索相关文章：`. Default off
+  (`semanticRecall.enabled=false`); the index
+  (`semantic-index.json`) is derived and rebuildable, discarded
+  when the model identity changes. Semantic-only hits score by
+  similarity × 4 (not recency), with a 0.5 similarity floor
+  measured on the benchmark (see the doc for the trade: synonym
+  Recall@5 0.625 → 0.875, MRR 0.500 → 0.667, false positives
+  back to the 1/6 keyword baseline). Timeout (default 2000 ms)
+  falls back to keyword-only; the timeout lives at the async
+  call site because recall is synchronous (plan §3.2 deviation,
+  documented in `LOCAL-EMBEDDING.md`). Pre-step injection stays
+  keyword-gated — semantic-only hits do not auto-inject.
+- **Admin centre** (`admin.ts`, `admin-cli.ts`,
+  `admin-server.ts`): CLI (`node core/src/admin-cli.ts
+  --dataDir <dir> …`) and a localhost-only HTTP API
+  (127.0.0.1:18081, non-loopback refused, 1 MB body cap) for
+  list / show / edit / correct / delete entries, forget
+  request / dry-run / approve / execute / unhide, goals and
+  experiences, semantic status / rebuild. `correctEntry` appends
+  a new version (supersedes, same factKey) instead of rewriting
+  history; `editEntry` rewrites in place, rebuilds the index,
+  relinks the graph, and writes `admin-audit.jsonl`. No web UI
+  yet — that comes later.
+- **Experience learning** (`experiences.ts`): rules learned from
+  mistakes (`rule` + `trigger[]` + `source`), matched against the
+  query (at most 2, token cap excluded like belief lines) and
+  injected as `经验：<rule>` rows. `useCount` is bumped in memory
+  on injection and persisted at flush. A fresh dir seeds 3 real
+  lessons (q15 conflict, weak-token anchoring, review kinds
+  object). Match ties break newer-first (same-ms `createdAt`
+  no longer lets a seed cut off a just-recorded rule).
+- **Goals / todos** (`goals.ts`): `title`, `status` (open /
+  done / dropped), `dueAt`, `notes`, `sourceIds`. Any status
+  transition is allowed (done → open reopens); model-readable
+  and writable through `memory_goal` and the admin centre.
+
+## 0.5.0: provenance, feedback, rewritten recall
+
+- **`provenance.ts`**: `sourceIds` / `sourceType` / `confidence` /
+  `verifyCount` / `lastVerifiedAt` on every fragment and belief. The
+  model proposes the type (`user_quote` / `model_quote` /
+  `model_summary` / `model_inference`); the number is computed by
+  `confidenceFor` (base by type + 0.02 per verification, capped at
+  0.95) and recomputed on read, so a hand-edited confidence is never
+  trusted. Missing source rows load as `legacy` with `confidence:
+  null`; a recall re-check does not invent a count for them.
+- **`MemoryCore.applyFeedback`**: `correct` (verification count),
+  `wrong` (same invalidation path as `memory_invalidate`; the log
+  text stays), `irrelevant` (significance halves for the first two
+  calls, ranking factor caps at 0.25×). Runs under the write lock.
+- **`recallFromEntries`**: `matchTokensFor` drops lone single-char
+  tokens when the query has multi-char tokens (a single-char query
+  keeps them); low-confidence fragment hits are demoted by
+  `confidenceFactor`; injected fragments bump `verifyCount`.
+- **`retrieval.ts`**: `KeywordRetriever` forwards to the existing
+  keyword path; `SemanticRetriever` is interface-only (no embedding
+  ships). Query rewrite is a host-injected `queryRewriter`, not a
+  provider — the core receives both strings and unions their tokens.
+- **Fixes**: action word + memory object (`更新一下记忆`) is a task,
+  not a persona opening; `irrelevant` stops halving after two calls;
+  legacy fragments keep `verifyCount 0` on recall; the rewrite timeout
+  is cleared; lock files say 0.5.0.
+
 ## 0.4.8: dsh-tools schema adapter + install/lock version fixes
 
 Fixes the Codex real-environment finding (2026-11-10, real Node

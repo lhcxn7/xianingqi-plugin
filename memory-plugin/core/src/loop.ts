@@ -265,7 +265,7 @@ export function buildProactPrompt(
   } else {
     for (const b of input.beliefs) {
       lines.push(
-        `- [${b.id}] ${b.dimension}：${b.statement}（强度 ${b.strength.toFixed(2)}，证据 ${b.proofCount} 条）`,
+        `- [${b.id}] ${b.dimension}：${b.statement.replace(/[\r\n]+/g, " ")}（强度 ${b.strength.toFixed(2)}，证据 ${b.proofCount} 条）`,
       );
     }
   }
@@ -274,7 +274,7 @@ export function buildProactPrompt(
     lines.push("（最近没有反思）");
   } else {
     for (const f of input.reflections) {
-      lines.push(`- [${f.id}] ${f.text}`);
+      lines.push(`- [${f.id}] ${f.text.replace(/[\r\n]+/g, " ")}`);
     }
   }
   lines.push(

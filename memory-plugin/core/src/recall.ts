@@ -12,6 +12,7 @@
 
 import {
   ACTIVATION_THRESHOLD,
+  COMMON_TOKENS,
   GRAPH_HOP_DECAY,
   activationFor,
   applyValveTop,
@@ -33,7 +34,19 @@ import {
 } from "./attributes.ts";
 import { formatBeliefLine, type BeliefStore } from "./beliefs.ts";
 import { ageDays } from "./dates.ts";
+import type { ExperienceStore } from "./experiences.ts";
+import {
+  factChains,
+  factVersionFactor,
+  isHistoryQuery,
+  isSuperseded,
+} from "./facts.ts";
 import { TRAVERSABLE_TYPES, type MemoryGraph } from "./graph.ts";
+import {
+  confidenceFactor,
+  entryProvenance,
+} from "./provenance.ts";
+import type { SemanticRetriever } from "./retrieval.ts";
 import { estimateTokens, tokenize } from "./tokenize.ts";
 import type { FragmentStore } from "./fragments.ts";
 import type {
@@ -46,9 +59,22 @@ import type {
 
 export const DEFAULT_TOKEN_CAP = 1500;
 
+/** 0.5.1 (0.4.3 §四): one injected hit is capped at ~400 chars —
+ *  a single over-long reply must not eat the whole injection
+ *  budget. Applied in formatRecallBlock only (the injected block);
+ *  memory_search hits are search results, not injection, and are
+ *  returned in full. */
+export const MAX_INJECT_CHARS_PER_HIT = 400;
+
 /** 0.4.0 item 1: true when this validity window has closed — the
  *  memory/edge stopped being true at or before `now` (null or
- *  absent = still valid). */
+ *  absent = still valid).
+ *
+ *  NOTE on validFrom (0.5.1 §四): recall deliberately checks only
+ *  validTo. ensure() stamps validFrom to the entry's own ts and
+ *  nothing ever writes a later validFrom, so every stored entry
+ *  is trivially in force from its own time — checking validFrom
+ *  here would change nothing. Only validTo can close the window. */
 export function isExpired(validTo: number | null | undefined, now: number): boolean {
   return validTo != null && validTo <= now;
 }
@@ -81,8 +107,7 @@ export interface RecallOptions {
   /** Max estimated tokens for the returned block. Default 1500. */
   tokenCap?: number;
   /** Max hits. Default 10. */
-  limit?: number;
-  /** Restrict the log scan to these entry ids (e.g. a keyword-index
+  limit?: number;  /** Restrict the log scan to these entry ids (e.g. a keyword-index
    *  lookup). Archive entries are exempt — they are not in the index
    *  (audit m1). */
   candidateIds?: Set<string>;
@@ -90,6 +115,15 @@ export interface RecallOptions {
    *  these at open, so a log hit saying the same thing is dropped in
    *  favour of the curated copy (0.1.6 recall dedupe). */
   layer2?: MemoryEntry[];
+  /** 0.5.0 step 5: the query-rewritten form (model rewrite /
+   *  expansion, dsh-plugin side). Its tokens UNION with the
+   *  original query's — the original recall is never lost to a
+   *  bad rewrite — and the single-char noise filter runs on the
+   *  union. Absent = keyword-only, exactly as before. */
+  rewrittenQuery?: string;
+  /** 0.5.0 step 5: optional semantic provider slot (real
+   *  embedding is a separate item; when absent, pure keyword). */
+  semantic?: SemanticRetriever;
   /** 0.2.0: current session id (relationship factor: same session
    *  scores 1.0). */
   sessionId?: string;
@@ -120,6 +154,12 @@ export interface RecallOptions {
    *  profile block, and no line is added when there are no
    *  beliefs. Absent = old caller: no belief line. */
   beliefs?: BeliefStore;
+  /** 0.5.1 item 4: the experience store. When present, up to two
+   *  experiences whose triggers match the query are injected as
+   *  short "经验：" lines after the belief line (outside the
+   *  token cap, like the belief line — at most two short rules).
+   *  No match = no lines, no cost. */
+  experiences?: ExperienceStore;
 }
 
 /** Attributes for an entry: the stored row when available, else
@@ -160,6 +200,41 @@ export function scoreEntry(
   now: number,
 ): number {
   const keyword = matchedCount * 2;
+  const importance = entry.importance === "heavy" ? 3 : 0;
+  const recency = 1 / (1 + ageDays(entry.ts, now));
+  return keyword + importance + recency;
+}
+
+/** 0.5.1 (0.4.3 item 6): rarity weight of one matched token —
+ *  log((N+2)/(df+1)) / log((N+2)/2), reusing topicOf's docFreq.
+ *  A token only one entry has weighs 1 (×2 = the old flat 2 per
+ *  token); a token in every entry weighs ~0. So "喜欢" (df 5 of
+ *  18) contributes little, "生日" (df 1) contributes the full 2. */
+export function rarityWeight(
+  token: string,
+  docFreq: Map<string, number>,
+  totalEntries: number,
+): number {
+  const df = docFreq.get(token) ?? 0;
+  const n = Math.max(totalEntries, 1);
+  return Math.log((n + 2) / (df + 1)) / Math.log((n + 2) / 2);
+}
+
+/** scoreEntry with rarity-weighted keywords: same importance +
+ *  recency terms, but each matched token contributes 2 × its
+ *  rarity weight instead of a flat 2. Graph hits (no matched
+ *  tokens) still use scoreEntry. */
+export function scoreEntryWeighted(
+  entry: MemoryEntry,
+  matchedTokens: string[],
+  docFreq: Map<string, number>,
+  totalEntries: number,
+  now: number,
+): number {
+  const keyword = matchedTokens.reduce(
+    (s, t) => s + 2 * rarityWeight(t, docFreq, totalEntries),
+    0,
+  );
   const importance = entry.importance === "heavy" ? 3 : 0;
   const recency = 1 / (1 + ageDays(entry.ts, now));
   return keyword + importance + recency;
@@ -239,6 +314,33 @@ function duplicatesMemoryText(
   return false;
 }
 
+/** 0.5.0 step 2 (single-char token noise): the tokens a query
+ *  actually matches with. tokenize() still emits lone single
+ *  characters — a one-character query such as "汤" needs them to
+ *  match "酸梅汤" (audit m4) — but when the query ALSO carries
+ *  multi-character tokens, its lone singles are noise: "天" in
+ *  "今天天气怎么样" matches every line containing 天, so an
+ *  unrelated question recalls five unrelated memories. Those
+ *  singles are therefore dropped from the MATCH set (never from
+ *  the index: tokenize() itself is unchanged, and a query with
+ *  no multi-character token at all keeps its singles). The
+ *  rewritten query (0.5.0 step 5) joins the same union before
+ *  this filter runs, so an expansion never re-introduces single-
+ *  char noise. */
+export function matchTokensFor(
+  query: string,
+  rewrittenQuery?: string,
+): string[] {
+  const all = new Set<string>(tokenize(query));
+  if (typeof rewrittenQuery === "string" && rewrittenQuery.length > 0) {
+    for (const t of tokenize(rewrittenQuery)) all.add(t);
+  }
+  const tokens = [...all];
+  const hasMultiChar = tokens.some((t) => t.length > 1);
+  if (!hasMultiChar) return tokens;
+  return tokens.filter((t) => t.length > 1);
+}
+
 export function recallFromEntries(
   entries: MemoryEntry[],
   layer1: Layer1State | null,
@@ -249,7 +351,7 @@ export function recallFromEntries(
   const window = opts.window ?? "persona";
   const tokenCap = opts.tokenCap ?? DEFAULT_TOKEN_CAP;
   const limit = opts.limit ?? 10;
-  const tokens = tokenize(query);
+  const tokens = matchTokensFor(query, opts.rewrittenQuery);
   const queryEmotion = detectQueryEmotion(query);
   const recentTexts = opts.recentTexts ?? [];
   const valveOn = opts.valve ?? opts.limit === undefined;
@@ -266,6 +368,24 @@ export function recallFromEntries(
     (e) => !isExpired(opts.attributes?.get(e.id)?.validTo, now),
   );
   const byId = new Map(live.map((e) => [e.id, e]));
+
+  // 0.5.1 item 1 (fact version chain): group the live entries by
+  // factKey once — a present-tense question ranks the current
+  // version first, a history question the old ones. The factor
+  // only fires inside a multi-version chain; unversioned entries
+  // score exactly as before.
+  const chains = factChains(live);
+  const historyMode = isHistoryQuery(query);
+
+  // 0.5.1 item 4: experiences whose triggers match the query —
+  // at most two, injected as short lines (see the return below).
+  // markUsed is in-memory only; the caller persists at flush().
+  const matchedExperiences = opts.experiences
+    ? opts.experiences.match(query, 2)
+    : [];
+  for (const m of matchedExperiences) {
+    opts.experiences?.markUsed(m.experience.id, now);
+  }
 
   // Keyword hits. A candidateIds set (from the keyword index) bounds
   // the log scan; archive rows are exempt (they are not in the index).
@@ -286,6 +406,99 @@ export function recallFromEntries(
     }
   }
 
+  // 0.5.0 step 5: semantic slot — extra candidates from the
+  // optional provider (interface only; no embedding ships). They
+  // enter as matches with NO keyword tokens. Their score is their
+  // similarity (see the ranking below), NOT importance + recency
+  // — a 0.45-similarity hit from yesterday must not outrank a
+  // 0.65-similarity hit from a year ago. Their content factor is
+  // 0, so the valve (which gates on activation) drops them from
+  // injection, but an explicit search (valve off) surfaces them
+  // ranked by similarity. Only live, in-window entries count; an
+  // id the provider returns that is not in the live set is
+  // ignored, and a throwing provider degrades to keyword-only —
+  // recall never breaks on the semantic path.
+  if (opts.semantic) {
+    try {
+      for (const id of opts.semantic.retrieveIds(query, live)) {
+        if (typeof id !== "string" || matched.has(id)) continue;
+        if (!byId.has(id)) continue;
+        matched.set(id, []);
+      }
+    } catch {
+      // Semantic failure is a silent fallback to keyword-only.
+    }
+  }
+
+  // 0.5.1 item 1 (fact version chain, fact-level match): when a
+  // matched entry is a version of a fact, the version the
+  // question actually asks for joins the match set with the same
+  // tokens — a present question about a fact is answered by its
+  // current version even when the current wording shares no
+  // keyword with the query ("她现在喝不喝咖啡" matches 不喝咖啡;
+  // the answer is the current 喝美式, not a graph accident).
+  // History mode mirrors it: a matched current version pulls in
+  // its superseded versions. Runs before the weak-token filter,
+  // so an added hit counts as anchoring evidence like any other
+  // multi-token hit.
+  for (const [id, toks] of [...matched.entries()]) {
+    // A semantic-only hit carries no keyword tokens, so it has
+    // nothing to lend: it must not trigger a fact-level addition
+    // (and must not count as "the fact was matched" below —
+    // q12: a 0.35-similarity semantic hit on the old 不喝咖啡
+    // otherwise "contests" the fact and boosts the current 美式
+    // 1.5x above the real answer).
+    if (toks.length === 0) continue;
+    const entry = byId.get(id);
+    if (!entry || typeof entry.factKey !== "string" || entry.factKey.length === 0) {
+      continue;
+    }
+    const chain = chains.get(entry.factKey);
+    if (!chain || chain.versions.length < 2) continue;
+    if (!historyMode) {
+      const current = chain.current;
+      if (current.id !== id) {
+        // Upgrade, don't just skip: a semantic-only hit may
+        // already hold this id with EMPTY tokens (the semantic
+        // block runs first) — a current version with no tokens
+        // scores recency-only and falls out of the top 5, which
+        // is exactly the q17 regression the mock run caught. A
+        // version that already has real keyword tokens keeps
+        // them.
+        const existing = matched.get(current.id);
+        if (existing === undefined || existing.length === 0) {
+          matched.set(current.id, [...toks]);
+        }
+      }
+    } else {
+      for (const v of chain.versions) {
+        if (v.id !== chain.current.id) {
+          const existing = matched.get(v.id);
+          if (existing === undefined || existing.length === 0) {
+            matched.set(v.id, [...toks]);
+          }
+        }
+      }
+    }
+  }
+
+  // Which facts this query touches (a version matched directly),
+  // and where a matched version is superseded — the fact factor
+  // only fires on these sets (see facts.ts). Semantic-only hits
+  // (empty tokens) do not count: similarity is not keyword
+  // evidence about the fact (q12).
+  const touchedFacts = new Set<string>();
+  const supersededMatchedFacts = new Set<string>();
+  for (const [id, toks] of matched.entries()) {
+    if (toks.length === 0) continue;
+    const entry = byId.get(id);
+    if (!entry || typeof entry.factKey !== "string" || entry.factKey.length === 0) {
+      continue;
+    }
+    touchedFacts.add(entry.factKey);
+    if (isSuperseded(entry, chains)) supersededMatchedFacts.add(entry.factKey);
+  }
+
   // Document frequency over the scoped entries, for the valve's
   // topic (rarest matched token). Only computed when there are hits.
   let docFreq = new Map<string, number>();
@@ -293,6 +506,56 @@ export function recallFromEntries(
     for (const e of live) {
       for (const t of new Set(tokenize(e.text))) {
         docFreq.set(t, (docFreq.get(t) ?? 0) + 1);
+      }
+    }
+  }
+
+  // 0.5.1 (0.4.3 item 6): a hit on ONE weak token alone is noise
+  // — "喜欢" matches every line that ever liked anything, "上周"
+  // matches every line anchored last week — so it is dropped
+  // unless the query ALSO produced an anchored hit somewhere: a
+  // hit matching 2+ strong tokens proves the query has real
+  // evidence in this corpus, and then its single-weak-token
+  // companions are context, not noise. q15 is the proof: m17
+  // (不喝/喝咖/咖啡, 3 strong) anchors the query, and the
+  // 现在-only hits m14/m16 are graph seeds — dropping them cut
+  // the walk that surfaces m18, so q15 fell from rank 4 to
+  // nothing. With no anchored hit (q16/q17: only "喜欢"/"上周")
+  // the weak singles are the whole result, and they go. Weak =
+  // in COMMON_TOKENS, or in more than 15% of the scoped entries
+  // (df > max(2, 15%) — the floor of 2 keeps a genuine topic
+  // token alive in a tiny corpus, where two entries sharing a
+  // word is a topic, not noise). Semantic hits (no keyword
+  // tokens) are untouched. And the filter only runs when the
+  // query itself carried 2+ match tokens: a one-token query
+  // ("好的") asked for exactly that word, so its hits are the
+  // answer, not noise. This is the multi-char counterpart of the
+  // single-char noise filter in matchTokensFor: that one drops
+  // lone singles from the QUERY, this one drops lone weak tokens
+  // from the RESULTS. q08 (明天 + 早上, two tokens) survives;
+  // q19's hits match 3 tokens (最喜/喜欢/欢的), so this filter
+  // does not touch them — they are a weighting problem, not a
+  // single-token one, and the 0.5 rate there is accepted: the
+  // false-positive rate is measured over the no-evidence set,
+  // and q16+q17 dropping to 0 already takes it to 1/6.
+  if (matched.size > 0 && tokens.length >= 2) {
+    const strongThreshold = Math.max(2, Math.floor(live.length * 0.15));
+    const isWeak = (t: string): boolean => {
+      const df = docFreq.get(t) ?? 0;
+      return COMMON_TOKENS.has(t) || df > strongThreshold;
+    };
+    let anchored = false;
+    for (const toks of matched.values()) {
+      if (toks.filter((t) => !isWeak(t)).length >= 2) {
+        anchored = true;
+        break;
+      }
+    }
+    if (!anchored) {
+      for (const [id, toks] of [...matched.entries()]) {
+        if (toks.length === 0) continue; // semantic hit: no keywords
+        if (toks.length >= 2) continue;
+        if (isWeak(toks[0])) matched.delete(id);
       }
     }
   }
@@ -315,12 +578,57 @@ export function recallFromEntries(
           recentTexts,
           now,
         });
+        // 0.5.0 step 3: low-confidence fragment-backed hits are
+        // demoted in ranking (never deleted, never hidden from
+        // explicit search). A live fragment's provenance scales
+        // the score; a verbatim log hit (no fragment) is untouched.
+        // Suspect fragments do not demote — the hit falls back to
+        // the verbatim source anyway.
+        // 0.5.0 step 4: "irrelevant" feedback demotes too — the
+        // score halves per feedback, up to two halvings (0.25×).
+        const liveFrag = opts.fragments
+          ?.forEntry(entry.id)
+          .find((f) => !f.suspect);
+        const irrelevant = attrs.feedbackIrrelevant ?? 0;
+        const feedbackFactor =
+          irrelevant > 0 ? Math.pow(0.5, Math.min(irrelevant, 2)) : 1;
         return {
           entry,
-          score: scoreEntry(entry, matchedTokens.length, now),
+          // 0.5.1 (0.4.3 item 6): rarity-weighted keyword score
+          // (see scoreEntryWeighted) — a hit that only matches a
+          // common word ranks below one that matches a rare word.
+          // Only for multi-token queries: with a single query token
+          // there is nothing to discriminate between, and weighting
+          // it would demote a direct hit below its own graph
+          // neighbours (a reflection's direct source losing to a
+          // graph walk of the same word). Single-token queries
+          // keep the flat scoreEntry, exactly as before.
+          // 0.5.1 item 1 (fact version chain): a superseded version
+          // is demoted and the current version boosted, so "她现在
+          // 喝不喝咖啡" ranks the 美式 first and the dead "不喝咖啡"
+          // cannot win on keyword count alone. The factor only
+          // fires when the query touches the fact (see facts.ts).
+          // 0.5.1 item 2: a semantic-only hit (no keyword tokens)
+          // scores by its similarity, not by importance + recency
+          // — similarity is the only evidence it has. Scale 4
+          // puts a 0.65-similarity hit at ~2.6, around a 1–2
+          // token keyword hit, and a 0.35 one at ~1.4, below most
+          // keyword hits. No similarity on the provider means 0:
+          // the hit only survives if the valve is off and nothing
+          // better exists.
+          score:
+            (matchedTokens.length === 0
+              ? (opts.semantic?.similarityOf?.(id) ?? 0) * 4
+              : tokens.length >= 2
+                ? scoreEntryWeighted(entry, matchedTokens, docFreq, live.length, now)
+                : scoreEntry(entry, matchedTokens.length, now)) *
+            confidenceFactor(liveFrag?.provenance) *
+            feedbackFactor *
+            factVersionFactor(entry, chains, historyMode, touchedFacts, supersededMatchedFacts),
           matchedTokens,
           activation,
           topic: topicOf(matchedTokens, docFreq),
+          superseded: isSuperseded(entry, chains) || undefined,
           // 0.4.0 item 5: a direct hit walked no edge, so its
           // spotlight sort factor is 1.
           edgeWeight: 1,
@@ -433,11 +741,14 @@ export function recallFromEntries(
         });
         out.push({
           entry: other,
-          score: scoreEntry(other, 0, now),
+          score:
+            scoreEntry(other, 0, now) *
+            factVersionFactor(other, chains, historyMode, touchedFacts, supersededMatchedFacts),
           matchedTokens: seed.matchedTokens,
           activation,
           viaGraph: true,
           topic: seed.topic,
+          superseded: isSuperseded(other, chains) || undefined,
           // 0.4.0 item 5: the edge this hit arrived through — the
           // spotlight sort key (activation × edge weight) needs it,
           // and activation alone already folded this weight into
@@ -544,6 +855,14 @@ export function recallFromEntries(
     }
     const cost = estimateTokens(displayText) + 8; // + date/time line
     if (used + cost > tokenCap) continue;
+    // 0.5.0 step 3: a fragment that passed its retrieval-time
+    // re-check counts as one more verification (in-memory; the
+    // caller persists at flush()). Only counted when the hit
+    // actually injects — a candidate dropped by the cap was never
+    // shown, so its fragment was never really re-verified in use.
+    if (fragmentId !== undefined) {
+      opts.fragments?.markVerified(fragmentId, now);
+    }
     hits.push({
       ...hit,
       // m-1 (review-12): a fragment fallback injects the VERBATIM
@@ -559,6 +878,13 @@ export function recallFromEntries(
       fragmentId,
       fragmentTone,
       fragmentFallback: fragmentFallback || undefined,
+      // 0.5.0 step 3: provenance rides the hit — the fragment's
+      // when fragment-backed (post-verification counts), otherwise
+      // the verbatim log line itself (user_quote / model_quote).
+      provenance:
+        fragmentId !== undefined && live?.provenance
+          ? live.provenance
+          : entryProvenance(hit.entry),
     });
     used += cost;
   }
@@ -613,10 +939,17 @@ export function recallFromEntries(
     // and never the bulk of the 1500 cap), and no line at all when
     // there are no beliefs (an empty belief layer never pollutes
     // recall). Computed from the store when one was passed.
+    // 0.5.1 item 4: matched experience rules ride after it, same
+    // terms (at most two short lines, no budget).
     text: formatRecallBlock(
       finalHits,
       opts.beliefs ? formatBeliefLine(opts.beliefs.all()) : undefined,
+      matchedExperiences.map((m) => m.experience.rule),
     ),
+    experiences: matchedExperiences.map((m) => ({
+      rule: m.experience.rule,
+      source: m.experience.source,
+    })),
   };
 }
 
@@ -724,7 +1057,11 @@ export function formatLayer1(layer1: Layer1State): string {
  *  `关系：信任 0.7（证据 6 条）· 亲近 0.4`) is appended at the very
  *  end, after the spotlight prompt line. Empty / absent means no
  *  line — an empty belief layer never pollutes the block. */
-export function formatRecallBlock(hits: RecallHit[], beliefLine?: string): string {
+export function formatRecallBlock(
+  hits: RecallHit[],
+  beliefLine?: string,
+  experienceRules?: string[],
+): string {
   if (hits.length === 0) return "";
   const parts: string[] = ["相关记忆:"];
   for (const hit of hits) {
@@ -737,8 +1074,25 @@ export function formatRecallBlock(hits: RecallHit[], beliefLine?: string): strin
         : hit.compressed
           ? "·压缩"
           : "";
+    // 0.5.1 item 1: a superseded version is marked so the model
+    // can see it is the OLD version of its fact, not the current
+    // one — in a history question it is the wanted answer, in a
+    // present question it is context, never the answer.
+    const versionMark = hit.superseded ? "·旧版" : "";
+    // 0.5.1 (0.4.3 §四): one over-long reply used to eat the whole
+    // injection budget — a single hit is capped at ~400 chars and
+    // marked, so one long message cannot crowd out the rest. And
+    // a newline inside a hit is flattened to a space first: the
+    // block is one line per hit, and a forged "- [id] ..." line
+    // inside a message must never survive as its own line.
+    const raw = hit.displayText ?? hit.entry.text;
+    const oneLine = raw.replace(/[\r\n]+/g, " ");
+    const shown =
+      oneLine.length > MAX_INJECT_CHARS_PER_HIT
+        ? `${oneLine.slice(0, MAX_INJECT_CHARS_PER_HIT)}…（单条过长，已截断）`
+        : oneLine;
     parts.push(
-      `- ${hit.spotlightCandidate ? "☆ " : ""}[${hit.entry.date} ${hit.entry.time} ${label}${mark}] ${hit.displayText ?? hit.entry.text}`,
+      `- ${hit.spotlightCandidate ? "☆ " : ""}[${hit.entry.date} ${hit.entry.time} ${label}${mark}${versionMark}] ${shown}`,
     );
   }
   if (hits.some((h) => h.spotlightCandidate)) {
@@ -749,5 +1103,71 @@ export function formatRecallBlock(hits: RecallHit[], beliefLine?: string): strin
   if (beliefLine) {
     parts.push(beliefLine);
   }
+  // 0.5.1 item 4: matched experience rules, one short line each
+  // (at most two) — a rule the model is about to need, in front
+  // of it. They ride only with hits: no keyword match means no
+  // injection at all, experiences included (the 2026-11-05
+  // no-match rule stands).
+  for (const rule of experienceRules ?? []) {
+    parts.push(`经验：${rule}`);
+  }
   return parts.join("\n");
+}
+
+/** 0.5.5: compose the FINAL injected block under one token budget.
+ *  The profile block, hit lines, belief line and experience rules
+ *  used to be counted separately (or not at all); this function
+ *  measures the whole block and trims in priority order:
+ *    1. experience rules (nice-to-have);
+ *    2. belief line;
+ *    3. oldest/lowest-ranked hit lines;
+ *    4. profile block (last resort);
+ *    5. hard character truncation, only if even the profile alone
+ *       exceeds the cap.
+ *  `formatRecallBlock` itself stays budget-free for callers that
+ *  want the full search result (memory_search / tests). */
+export function composeInjection(
+  profileText: string | undefined,
+  hits: RecallHit[],
+  beliefLine: string | undefined,
+  experienceRules: string[] | undefined,
+  tokenCap: number,
+): string {
+  const cap = Math.max(1, Math.floor(tokenCap));
+  let profile = profileText ?? "";
+  let belief = beliefLine;
+  let rules = [...(experienceRules ?? [])];
+  let hs = [...hits];
+  const make = (): string => {
+    const block = hs.length > 0 ? formatRecallBlock(hs, belief, rules) : "";
+    return [profile, block].filter((s) => s.length > 0).join("\n");
+  };
+  let text = make();
+  while (estimateTokens(text) > cap && rules.length > 0) {
+    rules = rules.slice(0, -1);
+    text = make();
+  }
+  while (estimateTokens(text) > cap && belief !== undefined) {
+    belief = undefined;
+    text = make();
+  }
+  while (estimateTokens(text) > cap && hs.length > 0) {
+    hs = hs.slice(0, -1);
+    text = make();
+  }
+  if (estimateTokens(text) > cap && profile.length > 0) {
+    profile = "";
+    text = make();
+  }
+  if (estimateTokens(text) <= cap || text.length === 0) return text;
+  // Binary-search the longest prefix that fits. The last resort
+  // only runs when a single profile line alone is over budget.
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (estimateTokens(text.slice(0, mid)) <= cap) lo = mid;
+    else hi = mid - 1;
+  }
+  return text.slice(0, lo);
 }

@@ -7,7 +7,7 @@ Harness. Local only — no network, no login, no cloud.
 ## Install (in DSH)
 
 ```sh
-dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v0.4.8&path:/memory-plugin/dsh-plugin"
+dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v0.5.5&path:/memory-plugin/dsh-plugin"
 ```
 
 or, for local development, load the patch overlay without installing:
@@ -16,7 +16,7 @@ or, for local development, load the patch overlay without installing:
 pnpm dsh web --patch ./dsh-plugin/cordis.patch.yml
 ```
 
-Requires DSH `0.2.1-rc.5 || >=0.2.0 <0.3.0` and Node `^22.19.0 || >=24.0.0`.
+Requires DSH `0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.0 <0.3.0` and Node `^22.19.0 || >=24.0.0`.
 
 ## Config
 
@@ -414,6 +414,261 @@ remaining check is a full live conversation on the user's own DSH:
 check `log.jsonl` grows for persona turns and stays still for task
 turns, and that a second window's persona turn does not crash.
 
+## 0.5.5: local-only follow-ups
+
+- **One total injection budget.** `composeInjection` measures the
+  final block (profile + hit lines + belief + experience) and trims
+  in order: experience rules, belief line, lowest-ranked hits,
+  profile; only a single over-budget profile is hard-truncated.
+  `formatRecallBlock` itself stays budget-free for search results.
+- **Fact chains are a validated version DAG.** When `supersedes` is
+  present, a chain must have existing targets in the same factKey,
+  at most one successor per version, exactly one current, and no
+  cycle. Invalid chains keep a display current but contribute no
+  ranking factor; entries with no links keep the old time-order
+  fallback.
+- **Experience governance.** `confirm` is CLI/API-only, `revoke` and
+  optional `expiresAt` are available; a one-character trigger or a
+  one-character shared token no longer fires. Expired/revoked rules
+  are not injected; the model tool still cannot confirm itself.
+- **No real-machine requirement** for this batch: budget, DAG and
+  governance are covered by local unit/integration tests; real DSH
+  and real BGE remain a separate acceptance step.
+
+## 0.5.4: second external review fixes
+
+- **Admin CLI token.** `serve` prints `token: ...` and a ready
+  `curl -H "Authorization: Bearer ..."` line; `--token` lets the
+  operator choose one. The API still requires the header.
+- **Experience confirm is not a model action.** The `memory_experience`
+  tool refuses `confirm`; confirmation is CLI / local admin API only,
+  and records `confirmedBy` + `confirmedAt`. Unconfirmed rules never
+  inject.
+- **Goal/Experience writes use the Core lock.** Tools, CLI and API go
+  through `MemoryCore.createGoal/updateGoal/setStatus/removeGoal` and
+  `recordExperience/confirmExperience/removeExperience`, which take
+  the write lock, refresh stale state and validate live persona
+  sources. No direct Store save from the shell.
+- **Delete transaction covers forgetting state.** `forgotten.json` and
+  `forget-requests.json` are in the snapshot; an interrupted delete
+  restores log + derived data + tombstones + request state. If the
+  snapshot is missing/unreadable, the journal is kept as evidence.
+- **Snapshot covers experiences/goals.** Restore reloads them with the
+  log and revalidates `sourceIds`; an Experience with no live source
+  drops back to unconfirmed, a Goal drops invalid source ids.
+- **Model is bundled and automatic.** The model ships at
+  `dsh-plugin/models/bge-small-zh-v1.5/`; the plugin finds it without a
+  manual copy. `<dataDir>/models/bge-small-zh-v1.5/` still wins if
+  present. `@huggingface/transformers` is an optionalDependency, so a
+  normal plugin install brings the runtime; a portable zip needs one
+  `npm install --prefix dsh-plugin`.
+
+## 0.5.3: remaining audit closures
+
+- **Delete journal.** `forget-journal.json` is written before the
+  first delete mutation and marked `committed` after the last one.
+  A restart that finds a non-committed journal restores the safety
+  snapshot taken just before the delete, then reloads every store.
+- **Embedding runtime from the data dir.** The provider resolves
+  `@huggingface/transformers` from `<dataDir>/node_modules` first
+  (`npm install --prefix <dataDir> @huggingface/transformers@3.8.1`)
+  and falls back to the normal import. The install path no longer
+  depends on DSH's plugin-folder layout.
+- **Experience provenance.** `memory_experience add` requires
+  `sourceIds` pointing at live persona entries; a new rule is
+  unverified and is NOT injected until `confirm`. Old rows without
+  the confirmation bit are candidates, not trusted prompt rules.
+- **Forget boundary disclosed.** `dry-run` lists `MEMORY.md` /
+  `MEMORY-YYYY-MM.md` copies. `executeForget({purgeSkillFiles:true})`
+  is an explicit opt-in that backs up each skill file and removes
+  only lines containing the exact deleted text.
+- **Admin API auth.** Loopback alone is no longer accepted: every
+  request needs `Authorization: Bearer <token>`; the token is
+  returned by `startAdminServer()`.
+- **Log diagnostics.** A corrupt JSONL line in the middle (not just
+  the torn last line) warns once per file instead of silently
+  shrinking the log.
+- **Review scope.** Daily review processes persona, non-tombstoned
+  entries only; task rows no longer get attributes/compression/edges.
+
+## 0.5.2: audit fixes (privacy + data integrity)
+
+- **Hidden means hidden everywhere.** `proactPrompt`, the review
+  input, the reflection gate, the starmap, and every fragment /
+  belief / reflection source check now exclude tombstoned entries.
+  A hidden memory can no longer reappear through a belief line or a
+  proactivity prompt.
+- **Forget loading never fails open.** `forgotten.json` is loaded
+  independently of `forget-requests.json`; a corrupt tombstone table
+  sets `forgottenLoadFailed` and `isForgotten()` returns true for
+  every id until the operator restores it. The request list is
+  separate: a corrupt request file only loses pending requests.
+- **Owner-only files on POSIX.** New data dirs are `0700`, the raw
+  log is `0600`, atomic writes already were. (Windows uses ACL
+  inheritance; the mode argument is ignored there.)
+- **Restore is a rollback, not a merge.** Plugin-owned files that
+  exist now but are absent from the snapshot are removed; the
+  semantic index and pending reflection gate are dropped and the
+  starmap is regenerated.
+- **No developer seeds.** `ExperienceStore` starts empty; the three
+  project debug rules are test fixtures, not user prompt content.
+- **Task windows cannot read persona memory.** An explicit
+  `memory_search` with a task-window caller is refused (automatic
+  pre-step injection was already gated).
+- **Goal/edit/vector hygiene.** `Goal.update` rejects non-finite
+  `dueAt`, oversized `notes`, and malformed `sourceIds`;
+  `MemoryAdmin.editEntry` refreshes the vector; semantic rebuild
+  clears first, top-N is filtered by the allowed id set, a failed
+  provider load is retryable, and cosine rejects dimension/NaN
+  mismatches.
+- **Test/type portability.** Windows skips POSIX mode assertions;
+  the process-start assertion uses a generous window; a type-only
+  shim lets a clean package `tsc` without the optional
+  `@huggingface/transformers` runtime.
+
+## 0.5.1: review fixes (0.4.3 + 0.4.5)
+
+- **Persona windows only.** `memory_search` defaults to `window:
+  "persona"` — a task-window log entry never surfaces in a persona
+  search (the log is append-only, so a direct write is the only way
+  a task entry gets in, and the window filter is the fence).
+  `memory_restore` refuses in a task window (and writes nothing —
+  no safety snapshot either); `memory_snapshot` is deliberately
+  ungated, since it only copies files and changes no memory.
+  `memory_daily_review` checks the ids it is given against the ids
+  the review prompt actually showed (whitelist, capped at 60,
+  single-use); a call with no live whitelist falls back to
+  yesterday's ids, so an id recorded after the review registered
+  can never be marked. Fragments can only be built from persona
+  sources — `createFragment` rejects a task-window source with the
+  same wording the belief/reflection checks use.
+- **Early exit, fixed twice.** The 0.4.5 fix for "yesterday empty
+  kills the proposals" first read the review kinds object as a
+  proposal even when both kinds were false; the condition now reads
+  the kinds' values. Yesterday empty AND no proposals still
+  registers nothing.
+- **Deferral.** `memory_belief`, `memory_reflect` and
+  `memory_proact` now carry `deferLoading: true`, like
+  `memory_feedback`; the flag is passed through by both compilers.
+  Runtime behaviour on real DSH is still unverified (0.4.8 was
+  never installed on a real machine either).
+- **Review copy.** `memory_status` now describes
+  `pendingInvalidationChecks` as "awaiting the next review"
+  (expired-but-unreviewed marks still count until the next review
+  clears them). The merged recent section tells her to take a fresh
+  `memory_proact({})` gate call before acting on a proact proposal
+  — the prompt text itself carries no token, and a model that calls
+  `memory_proact` straight from the review gets the gate's token
+  and a fresh prompt, not the review's copy.
+- **Benchmark (0.5.1).** Keyword-only: coverage 0.923, Recall@5
+  0.8, MRR 0.733, no-evidence false positives 0.167 (was 0.5).
+  `--rewrite`: 1.0 / 1.0. q15 conflict order is fixed in this
+  version (fact chain below) — it no longer waits for 0.6.0.
+- **Fact version chain.** `memory_remember` takes optional
+  `factKey` / `supersedes`: same fact, new version. "现在" ranks
+  the current version first (q15 美式 rank 1, was 4); "以前"
+  ranks the old version first; a superseded hit shows `·旧版`.
+- **Forgetting, governed.** `memory_forget` (persona-gated,
+  `deferLoading`) only files a request, dry-runs, or lists —
+  it has no approve / execute action at all. Approval lives in
+  the admin CLI / local API only, on a non-model channel; a chat
+  "我同意" can never authorise a deletion or a hide. See the
+  core README for the hide / delete mechanics and the 7-day TTL.
+- **Local embedding.** `semanticRecall` config (`enabled`,
+  `modelDir`, `modelRevision`, `timeoutMs`, `maxCandidates`,
+  `minSimilarity`); default off. When enabled, the plugin builds
+  the index in the background (never blocks activation) and the
+  pre-step / `memory_search` paths await semantic candidates
+  with the configured timeout, falling back to keyword-only.
+  The model files ship inside the plugin under
+  `dsh-plugin/models/bge-small-zh-v1.5/`; the plugin finds them
+  automatically (a copy in `<dataDir>/models/bge-small-zh-v1.5/`
+  takes precedence). A nomodel package needs the model copied in
+  manually — see `MODELS.md` for hashes. Measured: synonym Recall@5
+  0.625 → 0.875, MRR 0.500 → 0.667, false positives 1/6 (see
+  `LOCAL-EMBEDDING.md`).
+- **Admin centre (CLI + local API first).** No web UI yet. The
+  plugin itself does not serve the API — run
+  `node core/src/admin-cli.ts --dataDir <dir> serve` (or
+  `… serve --port N --token T`). The command prints the bearer
+  token; every request needs
+  `Authorization: Bearer <token>`.
+- **Experience learning + goals.** Two new persona-gated,
+  `deferLoading` tools: `memory_experience` (add / list / match
+  — rules learned from mistakes, injected as `经验：` rows when
+  they match) and `memory_goal` (create / list / get / update /
+  complete / reopen / drop / remove). `memory_status` now
+  reports `openGoals`, `doneGoals`, `pendingForgets` and
+  `semantic: {enabled, modelPresent, indexSize}`. Seventeen
+  tools total.
+
+## 0.5.0 (fixed): provenance, feedback, rewritten recall
+
+0.5.0 is the five-step release: (1) an honest benchmark set, (2) the
+record-side split, (3) provenance / trust, (4) the fourteenth tool
+(`memory_feedback`), (5) query-rewrite hybrid recall. Embedding stays
+out of scope — no model file ships.
+
+- **Provenance** (`core/src/provenance.ts`): every fragment and belief
+  carries `sourceIds`, `sourceType` (`user_quote` / `model_quote` /
+  `model_summary` / `model_inference` / `legacy`), a code-computed
+  `confidence`, `verifyCount` and `lastVerifiedAt`. The model proposes
+  the type only; the number is recomputed on read. Pre-0.5.0 rows load
+  as `legacy` with `confidence: null` — never forged. `memory_search`
+  hits carry all seven fields; low-confidence fragment hits are demoted,
+  not deleted.
+- **`memory_feedback`** (14th tool, persona windows only): `correct`
+  counts a verification, `wrong` invalidates through the same path as
+  `memory_invalidate` (audit line included), `irrelevant` halves
+  significance for the first two calls and caps the ranking factor at
+  0.25×. The description is one short line and `deferLoading: true`;
+  the flag is passed through by both compilers.
+- **Query rewrite** (`queryRewriter` on `MemoryPluginConfig`): the host
+  injects the model call; the plugin awaits it with a 3 s timeout and
+  falls back to keyword-only on timeout / throw / empty / unchanged.
+  The rewritten tokens union with the original ones, so a bad rewrite
+  can never lose the original recall. No rewriter = exactly the old
+  keyword path. `SemanticRetriever` is interface-only.
+- **Benchmark** (`core/test/benchmark-050.*`): 18 memories, 21 queries
+  (6 synonym / 6 time / 3 conflict / 6 no-evidence), 6 sessions.
+  Keyword-only: coverage 0.923, Recall@5 0.8, MRR 0.683, no-evidence
+  false positives 0.5, 62.6 injected tokens. The `--rewrite` run uses a
+  deterministic six-pair synonym stub, not a model: its 1.0 / 0.922
+  proves the pipeline only; with the stub table emptied it falls back
+  to 0.8 / 0.5. q02/q05 are the recall regression (single-char
+  bridges); q06 was already `rank null` in 0.4.8. q15 conflict order is
+  still open (0.6.0 fact-version chain).
+- **Fixes in this archive**: the record-side memory-object rule
+  (`更新一下记忆` / `删除这条记忆` no longer mark a persona session);
+  `irrelevant` stops halving significance after two calls; legacy
+  fragments no longer gain a `verifyCount` from a recall; the rewrite
+  timeout is cleared; the lock files say 0.5.0; `engines.dsh` now also
+  lists `0.2.2-rc.1`.
+
+## Known limitations (0.5.0 fixed — verified 2026-11-10)
+
+- **DSH baseline.** `engines.dsh` is
+  `0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.0 <0.3.0`; semver 7.8.6 says
+  this covers the user's own **0.2.2-rc.1** as well as the verified
+  `0.2.1-rc.5`. It has NOT been run on 0.2.2-rc.1 yet — a real-DSH
+  smoke test is still needed. Node engines
+  (`^22.19.0 || >=24.0.0`) were verified here on Node v24.22.1.
+- **`deferLoading` on `memory_feedback`.** Verified locally against
+  `@deepseek-ai/dsh-tools@0.2.1-rc.5`: `defineTool` keeps the flag and
+  `schemaOf` projects it onto the model-facing schema; the current
+  host's `ToolSchema` also declares `deferLoading?: true`. The actual
+  deferred-loading behaviour still needs a real-DSH check; the
+  one-line description is the mitigation if the host ignores it.
+- **Query rewrite needs a host-injected `queryRewriter`.** The
+  plugin context exposes no model-call API, so the model call
+  lives with the host (`MemoryPluginConfig.queryRewriter`). Without
+  one, recall is keyword-only exactly as before. The rewriter in
+  the tests and the benchmark is a deterministic synonym stub,
+  not a model.
+- **`SemanticRetriever` is interface-only.** No embedding model
+  ships, nothing is downloaded or bundled; a real provider plugs
+  into the `opts.semantic` slot later.
+
 ## What it deliberately does NOT do (v1)
 
 - **No deletion veto.** There is no `tools/pre-execute` listener in
@@ -430,9 +685,11 @@ turns, and that a second window's persona turn does not crash.
   `MEMORY.md` layer 1. Recall text excludes layer 1 (the skill already
   reads it at open).
 - No compaction-hook rotation (no such seam exists), no background
-  daemon (in-process only), no vector/semantic recall (keyword only
-  — 0.2.0 ranks keyword hits by five-factor activation, it does not
-  add semantic search).
+  daemon (in-process only), no vector/semantic recall ships
+  (keyword + query-rewrite hybrid — 0.5.0 ranks keyword hits by
+  five-factor activation, the rewrite only adds query words, and
+  SemanticRetriever is an interface-only slot with no embedding
+  bundled).
 
 ## Test (no real DSH needed)
 
@@ -442,7 +699,7 @@ node test/mock-test.ts
 
 Drives every hook with a fake Cordis context: session tracking,
 persona/task separation, turn-1 append vs turn-2 context refresh,
-injected-message filtering, flush points, all seven fallback tools,
+injected-message filtering, flush points, all fourteen tools,
 the 0.2.0 review gate / recall edge / emotion / starmap checks, the
 0.3.0 fragment tool / fragment-aware search + status / free-form
 emotion checks, and "MEMORY.md bytes unchanged". Exits non-zero on
@@ -470,6 +727,6 @@ summaries.
   self-checks every registered tool's parameters after register. In
   DSH the real `defineTool` is used when it resolves. Its version
   range in `package.json` mirrors the DSH engine range
-  (`0.2.1-rc.5 || >=0.2.0 <0.3.0`) and must be aligned with the installed DSH
+  (`0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.0 <0.3.0`) and must be aligned with the installed DSH
   release at publish time; for a published package, vendor or build
   `dsh-tools` into the artifact so the real compiler is present.

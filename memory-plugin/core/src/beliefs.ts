@@ -21,7 +21,13 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteText } from "./atomic.ts";
+import { atomicWriteText, backupCorruptFile } from "./atomic.ts";
+import type { CorruptBackup } from "./atomic.ts";
+import {
+  confidenceFor,
+  newProvenance,
+  normalizeProvenance,
+} from "./provenance.ts";
 import type {
   Belief,
   BeliefDimension,
@@ -38,6 +44,14 @@ export const BELIEF_DECAY_PER_DAY = 0.99;
 /** A fresh belief starts here: half-convinced, highly uncertain. */
 export const BELIEF_INITIAL_STRENGTH = 0.5;
 export const BELIEF_INITIAL_UNCERTAINTY = 0.8;
+/** 0.5.1 (0.4.3 item 7): uncertainty is DERIVED, never stored or
+ *  model-supplied — 0.8 with no proof, halving as proof piles up.
+ *  One proof: 0.4. Two: ~0.267. It is recomputed at create,
+ *  support and load, so a hand-edited uncertainty in the file is
+ *  ignored the same way a hand-edited strength would not be. */
+export function uncertaintyFor(proofCount: number): number {
+  return BELIEF_INITIAL_UNCERTAINTY / (1 + Math.max(0, proofCount));
+}
 /** A verbatim quote must be at least this long to count as evidence
  *  — a 1–2 char match ("他", "了") proves nothing. */
 export const BELIEF_MIN_QUOTE_CHARS = 2;
@@ -195,6 +209,24 @@ interface PersistedBeliefs {
 export class BeliefStore {
   private list: Belief[] = [];
   private readonly file: string;
+  // 0.5.1 (0.4.3 item 10): a failed load marks the store corrupt —
+  // save() refuses to overwrite until the file parses again (or is
+  // deleted), and the corrupt bytes are backed up once per distinct
+  // content (see backupCorruptFile). The in-memory list is kept on
+  // a failed reload so a cross-process hiccup does not blank it.
+  private loadFailed = false;
+  private corruptBackup: CorruptBackup | null = null;
+
+  /** True when the file on disk failed to parse and has not been
+   *  repaired since; while true, save() throws instead of writing. */
+  get hasLoadFailed(): boolean {
+    return this.loadFailed;
+  }
+
+  /** Path of the .corrupt-* backup, if one was taken. */
+  get corruptBackupPath(): string | null {
+    return this.corruptBackup?.path ?? null;
+  }
 
   constructor(dataDir: string) {
     this.file = join(dataDir, BELIEFS_FILE);
@@ -213,11 +245,87 @@ export class BeliefStore {
     return this.list.find((b) => b.id === id);
   }
 
+  /** Ids of beliefs whose evidence is ALL inside `ids` — they
+   *  would be left with no evidence at all (dry-run preview). */
+  idsLosingAllEvidence(ids: string[]): string[] {
+    const set = new Set(ids);
+    return this.list
+      .filter(
+        (b) =>
+          b.evidence.length > 0 &&
+          b.evidence.every((e) => set.has(e.entryId)),
+      )
+      .map((b) => b.id);
+  }
+
+  /** Strip evidence refs to `ids` (0.5.1 item 1: forget-delete).
+   *  A belief left with no evidence is dropped — a belief with
+   *  nothing behind it is not a belief, it is a rumour. Strength
+   *  and uncertainty are re-derived from the surviving evidence
+   *  (uncertaintyFor), provenance sourceIds follow the evidence.
+   *  Returns the dropped belief ids and how many evidence refs
+   *  were stripped. The caller saves. */
+  removeEntries(ids: string[]): { removedBeliefs: string[]; strippedRefs: number } {
+    const set = new Set(ids);
+    const removedBeliefs: string[] = [];
+    let strippedRefs = 0;
+    const kept: Belief[] = [];
+    for (const b of this.list) {
+      const before = b.evidence.length;
+      b.evidence = b.evidence.filter((e) => !set.has(e.entryId));
+      strippedRefs += before - b.evidence.length;
+      if (b.evidence.length === 0) {
+        removedBeliefs.push(b.id);
+        continue;
+      }
+      b.proofCount = b.evidence.length;
+      b.uncertainty = uncertaintyFor(b.evidence.length);
+      if (b.provenance) {
+        b.provenance = {
+          ...b.provenance,
+          sourceIds: b.evidence.map((e) => e.entryId),
+        };
+      }
+      kept.push(b);
+    }
+    this.list = kept;
+    return { removedBeliefs, strippedRefs };
+  }
+
+  /** A load failure never clears the in-memory list and never
+   *  overwrites the file: the corrupt bytes are backed up once and
+   *  the failure is marked, so the next save() refuses loudly
+   *  instead of silently writing an empty store over them. A
+   *  missing file is not a failure — it is a fresh store. */
+  private markCorrupt(why: string): void {
+    const backup = backupCorruptFile(this.file, this.corruptBackup);
+    if (backup) this.corruptBackup = backup;
+    this.loadFailed = true;
+    console.warn(
+      `[memory-plugin] beliefs.json 损坏（${why}），` +
+        `已备份到 ${this.corruptBackup?.path ?? "（备份失败）"}，` +
+        "拒绝覆盖原文件——请检查后删除损坏文件或从快照恢复。",
+    );
+  }
+
   private load(): void {
+    if (!existsSync(this.file)) {
+      this.list = [];
+      this.loadFailed = false;
+      return;
+    }
+    let data: PersistedBeliefs;
     try {
-      if (!existsSync(this.file)) return;
-      const data = JSON.parse(readFileSync(this.file, "utf8")) as PersistedBeliefs;
-      if (data.version !== 1 || !Array.isArray(data.beliefs)) return;
+      data = JSON.parse(readFileSync(this.file, "utf8")) as PersistedBeliefs;
+    } catch {
+      this.markCorrupt("无法解析 JSON");
+      return;
+    }
+    if (data.version !== 1 || !Array.isArray(data.beliefs)) {
+      this.markCorrupt("版本号或结构不对");
+      return;
+    }
+    try {
       const clean: Belief[] = [];
       for (const b of data.beliefs) {
         if (
@@ -228,7 +336,6 @@ export class BeliefStore {
           typeof b.statement !== "string" ||
           b.statement.trim().length === 0 ||
           !Number.isFinite(b.strength) ||
-          !Number.isFinite(b.uncertainty) ||
           !Array.isArray(b.evidence) ||
           !b.evidence.every(
             (e) =>
@@ -246,25 +353,56 @@ export class BeliefStore {
           strength: clamp01(b.strength),
           evidence: b.evidence.map((e) => ({ entryId: e.entryId, quote: e.quote })),
           proofCount: b.evidence.length,
-          uncertainty: clamp01(b.uncertainty),
+          // 0.5.1 (0.4.3 item 7): uncertainty is derived from the
+          // proof count — the stored number, if any, is ignored.
+          uncertainty: uncertaintyFor(b.evidence.length),
           updatedAt: Number.isFinite(b.updatedAt) ? b.updatedAt : 0,
           contradicting: Array.isArray(b.contradicting)
             ? b.contradicting.filter((x): x is string => typeof x === "string")
             : [],
+          // 0.5.0 step 3: rows written before this step have no
+          // provenance — derive it from the evidence (a belief IS
+          // a model inference; its sourceIds are the evidence
+          // entry ids, its verification count is the proof count).
+          // A stored provenance is normalised (confidence
+          // recomputed by code, never trusted as stored).
+          provenance: (b as { provenance?: unknown }).provenance
+            ? normalizeProvenance(
+                (b as { provenance?: unknown }).provenance,
+                b.evidence.map((e) => e.entryId),
+              )
+            : {
+                sourceIds: b.evidence.map((e) => e.entryId),
+                sourceType: "model_inference" as const,
+                confidence: confidenceFor(
+                  "model_inference",
+                  b.evidence.length,
+                ),
+                verifyCount: b.evidence.length,
+                lastVerifiedAt: Number.isFinite(b.updatedAt)
+                  ? b.updatedAt
+                  : null,
+              },
         });
       }
       this.list = clean;
+      this.loadFailed = false;
     } catch {
-      this.list = [];
+      this.markCorrupt("行级解析失败");
     }
   }
 
   reload(): void {
-    this.list = [];
     this.load();
   }
 
   save(): void {
+    if (this.loadFailed) {
+      throw new Error(
+        `beliefs.json 上次加载失败（已损坏，备份在 ${this.corruptBackup?.path ?? "未知"}），` +
+          "拒绝覆盖——请删除损坏文件或从快照恢复后再写。",
+      );
+    }
     atomicWriteText(
       this.file,
       JSON.stringify({ version: 1, beliefs: this.list } satisfies PersistedBeliefs),
@@ -303,9 +441,19 @@ export class BeliefStore {
       );
       if (!check.ok) return { ok: false, reasons: [check.reason as string] };
     }
-    const seq = this.list.filter((b) => b.dimension === input.dimension).length + 1;
+    // 0.5.1 (0.4.3 §四): the id is the max numeric suffix already
+    // stored in this dimension + 1, not the row count + 1 — rows
+    // dropped by sanitise used to make the next id collide with a
+    // surviving row (BEL_TRUST_001 + BEL_TRUST_003 on disk, a
+    // dropped 002, then a new BEL_TRUST_003).
+    let seq = 0;
+    for (const b of this.list) {
+      if (b.dimension !== input.dimension) continue;
+      const m = /^BEL_(?:SAFETY|TRUST|CLOSENESS)_(\d+)$/.exec(b.id);
+      if (m) seq = Math.max(seq, Number(m[1]));
+    }
     const belief: Belief = {
-      id: `BEL_${input.dimension.toUpperCase()}_${String(seq).padStart(3, "0")}`,
+      id: `BEL_${input.dimension.toUpperCase()}_${String(seq + 1).padStart(3, "0")}`,
       dimension: input.dimension,
       statement: input.statement.trim(),
       strength: clamp01(
@@ -315,13 +463,29 @@ export class BeliefStore {
         ? [{ entryId: input.entryId as string, quote: input.quote as string }]
         : [],
       proofCount: hasEvidence ? 1 : 0,
-      uncertainty: clamp01(
-        Number.isFinite(input.uncertainty)
-          ? (input.uncertainty as number)
-          : BELIEF_INITIAL_UNCERTAINTY,
-      ),
+      // 0.5.1 (0.4.3 item 7): uncertainty is derived from the
+      // proof count — an input.uncertainty, if the model passes
+      // one, is ignored.
+      uncertainty: uncertaintyFor(hasEvidence ? 1 : 0),
       updatedAt: now,
       contradicting: [],
+      // 0.5.0 step 3: a belief is a model inference from its
+      // evidence; the first quote was verified verbatim above, so
+      // creation counts as the first verification. No evidence
+      // means no sources yet (verifyCount 0, never forged).
+      provenance: hasEvidence
+        ? newProvenance(
+            [input.entryId as string],
+            "model_inference",
+            now,
+          )
+        : {
+            sourceIds: [],
+            sourceType: "model_inference" as const,
+            confidence: confidenceFor("model_inference", 0),
+            verifyCount: 0,
+            lastVerifiedAt: null,
+          },
     };
     this.list.push(belief);
     this.save();
@@ -350,13 +514,36 @@ export class BeliefStore {
     if (!Number.isFinite(delta)) {
       return { ok: false, reasons: ["support 需要一个数字 delta（这次证据有多强）。"] };
     }
+    // 0.5.1 (0.4.3 item 7): the same entryId supporting twice is
+    // a duplicate, not a second proof — same shape as contradict's
+    // no-double-charge rule, checked before the quote is even
+    // verified (the quote is identical by definition of a repeat).
+    if (belief.evidence.some((e) => e.entryId === entryId)) {
+      return { ok: true, belief, duplicate: true, reasons: [] };
+    }
     const check = verifyBeliefEvidence(entryId, quote, entriesById);
     if (!check.ok) return { ok: false, reasons: [check.reason as string] };
     const step = Math.min(BELIEF_MAX_DELTA, Math.abs(delta));
     belief.strength = clamp01(belief.strength + step);
     belief.evidence.push({ entryId, quote });
     belief.proofCount = belief.evidence.length;
+    belief.uncertainty = uncertaintyFor(belief.proofCount);
     belief.updatedAt = now;
+    // 0.5.0 step 3: the new evidence was verified verbatim above —
+    // it joins the sources and counts as a verification.
+    if (belief.provenance) {
+      const verifyCount = belief.proofCount;
+      belief.provenance = {
+        ...belief.provenance,
+        sourceIds: belief.evidence.map((e) => e.entryId),
+        verifyCount,
+        lastVerifiedAt: now,
+        confidence: confidenceFor(
+          belief.provenance.sourceType,
+          verifyCount,
+        ),
+      };
+    }
     this.save();
     return { ok: true, belief, reasons: [] };
   }
@@ -395,6 +582,12 @@ export class BeliefStore {
     belief.strength = clamp01(belief.strength - step);
     belief.contradicting = [...contradicting, entryId];
     belief.updatedAt = now;
+    // 0.5.0 step 3: the conflicting quote was verified verbatim
+    // above — it stamps the last-verified time (it does not join
+    // the supporting sources and does not move proofCount).
+    if (belief.provenance) {
+      belief.provenance = { ...belief.provenance, lastVerifiedAt: now };
+    }
     this.save();
     return { ok: true, belief, reasons: [] };
   }

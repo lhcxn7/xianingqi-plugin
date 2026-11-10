@@ -10,8 +10,11 @@
 // monthly archives and the diary are NEVER snapshotted or restored —
 // those belong to the skill / the user, and restoring them would
 // silently revert her memory or diary to snapshot time (audit, 0.1.3).
-// Still excluded: invalidation-audit.jsonl, beliefs.json, loop.json
-// (see isPluginOwned).
+// Still excluded: invalidation-audit.jsonl, loop.json
+// (see isPluginOwned). beliefs.json IS covered since 0.5.1 —
+// same reason as fragments.json: beliefs cite log entries as
+// evidence, and a restore that reverts the log but not the
+// beliefs would leave them pointing at pre-restore evidence.
 //
 // Restore is NON-DESTRUCTIVE: it only overwrites/adds the files that
 // are present in the snapshot. Files that are not in the snapshot —
@@ -153,6 +156,24 @@ function isPluginOwned(name: string): boolean {
     name === "attributes.json" ||
     name === "review.json" ||
     name === "fragments.json" ||
+    // 0.5.1 (0.4.3 audit item 10): beliefs.json is plugin-owned
+    // too — beliefs cite log entries as evidence, so a restore
+    // must revert them together with the log, or they would point
+    // at pre-restore evidence (same reason fragments.json is in).
+    // loop.json stays OUT: it is live behaviour-loop state, not
+    // log-derived — restoring it could re-trigger an already-acted
+    // proact decision. invalidation-audit.jsonl stays OUT too: it
+    // is the record of who invalidated what, never reverted.
+    name === "beliefs.json" ||
+    // 0.5.4: delete/restore must move the forgetting state together
+    // with the log, or a rollback can resurrect a deleted memory while
+    // leaving the request marked executed. These are plugin-owned.
+    name === "forgotten.json" ||
+    name === "forget-requests.json" ||
+    // 0.5.4: rules and goals cite log entries; restore them with the
+    // log and revalidate their sources afterwards (Core.restore).
+    name === "experiences.json" ||
+    name === "goals.json" ||
     /^summary-\d{4}-\d{2}\.jsonl$/.test(name) ||
     /^log-\d{4}-\d{2}\.jsonl$/.test(name)
   );
@@ -231,6 +252,16 @@ export function restoreSnapshot(dataDir: string, name: string): string {
   try {
     copyDataFiles(src, staging);
     atomicWriteText(join(staging, ".complete"), `${name}\n`);
+    // 0.5.2: a restore is a state rollback, not a merge. Plugin-owned
+    // files that exist now but were not in the snapshot (a later
+    // monthly log, summary, fragment/attribute store) must go, or the
+    // "restored" tree is a mixture of both states.
+    for (const f of readdirSync(dataDir)) {
+      if (!isPluginOwned(f)) continue;
+      if (!existsSync(join(staging, f))) {
+        rmSync(join(dataDir, f), { recursive: true, force: true });
+      }
+    }
     for (const f of readdirSync(staging)) {
       if (f === ".complete") continue;
       const from = join(staging, f);

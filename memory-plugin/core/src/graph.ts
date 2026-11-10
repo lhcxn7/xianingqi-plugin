@@ -27,7 +27,8 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteText } from "./atomic.ts";
+import { atomicWriteText, backupCorruptFile } from "./atomic.ts";
+import type { CorruptBackup } from "./atomic.ts";
 import type { KeywordIndex } from "./keyword-index.ts";
 import { tokenize } from "./tokenize.ts";
 import type { GraphEdge, MemoryEntry } from "./types.ts";
@@ -100,6 +101,42 @@ export class MemoryGraph {
   /** True when graph.json existed on disk at load. A first 0.2.0
    *  run over an old data dir backfills from the existing log. */
   readonly loadedExisting: boolean;
+  // 0.5.1 (0.4.3 item 10): a corrupt graph.json is backed up once
+  // and marked — unlike the other stores, the graph is DERIVED
+  // (the log is the source of truth), so a corrupt file is rebuilt
+  // from the log instead of blocking writes; needsBackfill says a
+  // rebuild is still owed. The in-memory edges are kept on a
+  // failed reload.
+  private loadFailed = false;
+  private corruptBackup: CorruptBackup | null = null;
+  private pendingBackfill = false;
+  // 0.5.1 (0.4.5 item 7): how many edges the last backfill()
+  // UPGRADED (session -> keyword), as opposed to created. Reset
+  // at each backfill; the review summary reports it separately.
+  private backfillUpgrades = 0;
+
+  /** True when the file on disk failed to parse and has not been
+   *  repaired since. */
+  get hasLoadFailed(): boolean {
+    return this.loadFailed;
+  }
+
+  /** Path of the .corrupt-* backup, if one was taken. */
+  get corruptBackupPath(): string | null {
+    return this.corruptBackup?.path ?? null;
+  }
+
+  /** True when a corrupt load left the graph short and a backfill
+   *  has not rebuilt it yet. */
+  get needsBackfill(): boolean {
+    return this.pendingBackfill;
+  }
+
+  /** Edges the last backfill() upgraded in place (session ->
+   *  keyword), not counting new edges. */
+  get lastBackfillUpgraded(): number {
+    return this.backfillUpgrades;
+  }
 
   constructor(dataDir: string) {
     this.file = join(dataDir, GRAPH_FILE);
@@ -115,22 +152,49 @@ export class MemoryGraph {
     return [...this.edges];
   }
 
-  /** Load graph.json. Missing or corrupt starts empty (the graph
-   *  is derived — backfill rebuilds it from the log). Hand-edited
-   *  rows are sanitised: the type must be one of the three, a
-   *  finite weight in (0, 1] is clamped, never trusted — a weight
-   *  of 5 must never reach traversal; a missing or non-numeric
-   *  weight (0.4.0 item 5: old graph.json) defaults to the type's
-   *  initial weight instead of dropping the edge; a finite weight
-   *  <= 0 still drops the row. A missing or non-numeric
-   *  lastTraversedAt defaults to 0 (never traversed), endpoints
-   *  are canonicalised, and duplicate (from, to) pairs keep only
-   *  the first valid row. */
+  /** Load graph.json. Missing starts empty (the graph is derived
+   *  — backfill rebuilds it from the log). Corrupt keeps the old
+   *  edges in memory (0.5.1 item 10) and flags needsBackfill.
+   *  Hand-edited rows are sanitised: the type must be one of the
+   *  three, a finite weight in (0, 1] is clamped, never trusted — a
+   *  weight of 5 must never reach traversal; a missing or
+   *  non-numeric weight (0.4.0 item 5: old graph.json) defaults to
+   *  the type's initial weight instead of dropping the edge; a
+   *  finite weight <= 0 still drops the row. A missing or
+   *  non-numeric lastTraversedAt defaults to 0 (never traversed),
+   *  endpoints are canonicalised, and duplicate (from, to) pairs
+   *  keep only the first valid row. */
+  /** A load failure never clears the in-memory edges and never
+   *  overwrites the file: the corrupt bytes are backed up once,
+   *  the failure is marked, and the graph is flagged for backfill
+   *  (the log rebuilds it — see the constructor and review()).
+   *  A missing file is not a failure — it is a first run. */
+  private markCorrupt(why: string): void {
+    const backup = backupCorruptFile(this.file, this.corruptBackup);
+    if (backup) this.corruptBackup = backup;
+    this.loadFailed = true;
+    this.pendingBackfill = true;
+    console.warn(
+      `[memory-plugin] graph.json 损坏（${why}），` +
+        `已备份到 ${this.corruptBackup?.path ?? "（备份失败）"}，` +
+        "旧边保留，将从日志回填重建。",
+    );
+  }
+
   private load(): boolean {
+    if (!existsSync(this.file)) return false;
+    let data: PersistedGraph;
     try {
-      if (!existsSync(this.file)) return false;
-      const data = JSON.parse(readFileSync(this.file, "utf8")) as PersistedGraph;
-      if (data.version !== 1 || !Array.isArray(data.edges)) return false;
+      data = JSON.parse(readFileSync(this.file, "utf8")) as PersistedGraph;
+    } catch {
+      this.markCorrupt("无法解析 JSON");
+      return false;
+    }
+    if (data.version !== 1 || !Array.isArray(data.edges)) {
+      this.markCorrupt("版本号或结构不对");
+      return false;
+    }
+    try {
       const seen = new Set<string>();
       const clean: GraphEdge[] = [];
       for (const e of data.edges) {
@@ -180,9 +244,10 @@ export class MemoryGraph {
         });
       }
       this.edges = clean;
+      this.loadFailed = false;
       return true;
     } catch {
-      this.edges = [];
+      this.markCorrupt("行级解析失败");
       return false;
     }
   }
@@ -223,6 +288,28 @@ export class MemoryGraph {
   find(a: string, b: string): GraphEdge | undefined {
     const [from, to] = canonical(a, b);
     return this.edgeIndex.get(edgeKey(from, to));
+  }
+
+  /** How many edges touch any of `ids` (dry-run preview for a
+   *  forget-delete). */
+  edgeCountFor(ids: string[]): number {
+    const set = new Set(ids);
+    let n = 0;
+    for (const e of this.edges) {
+      if (set.has(e.from) || set.has(e.to)) n += 1;
+    }
+    return n;
+  }
+
+  /** Remove every edge touching any of `ids` (0.5.1 item 1:
+   *  forget-delete). Returns how many edges were removed. The
+   *  caller saves. */
+  removeEntries(ids: string[]): number {
+    const set = new Set(ids);
+    const before = this.edges.length;
+    this.edges = this.edges.filter((e) => !set.has(e.from) && !set.has(e.to));
+    if (this.edges.length !== before) this.rebuildIndexes();
+    return before - this.edges.length;
   }
 
   /** Create or strengthen a link. An existing edge keeps its weight
@@ -369,6 +456,12 @@ export class MemoryGraph {
           if (TYPE_RANK[type] > TYPE_RANK[existing.type]) {
             const wasKeyword = existing.type === "keyword";
             existing.type = type;
+            // 0.5.1 (0.4.5 item 7): count the in-place upgrade
+            // for the review summary — a session edge becoming a
+            // keyword edge is not a new edge, but it is news.
+            if (type === "keyword" && !wasKeyword) {
+              this.backfillUpgrades += 1;
+            }
             return {
               edge: existing,
               created: false,
@@ -443,12 +536,14 @@ export class MemoryGraph {
    *  (upgrades are not new edges). */
   backfill(entries: MemoryEntry[], index: KeywordIndex, now: number): number {
     const before = this.edges.length;
+    this.backfillUpgrades = 0;
     const sorted = [...entries].sort((a, b) => a.ts - b.ts);
     const lastBySession = new Map<string, MemoryEntry>();
     for (const e of sorted) {
       this.linkNewEntry(e, index, lastBySession.get(e.sessionId) ?? null, now, true);
       lastBySession.set(e.sessionId, e);
     }
+    this.pendingBackfill = false;
     return this.edges.length - before;
   }
 }

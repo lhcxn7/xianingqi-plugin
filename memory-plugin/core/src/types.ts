@@ -1,3 +1,5 @@
+import type { Provenance } from "./provenance.ts";
+
 // Shared types for @memory-plugin/core.
 // Erasable TypeScript only (no enums, no parameter properties) so Node
 // runs these files directly via type stripping.
@@ -35,6 +37,21 @@ export interface MemoryEntry {
    *  recall dedupe log-vs-archive copies without deleting genuine
    *  repeats inside the log (audit m2). */
   source?: "log" | "archive";
+  /** 0.5.1 item 1 (fact version chain): identity of the fact this
+   *  entry is a version of ("最喜欢的颜色", "喝咖啡"). Entries
+   *  sharing a factKey are versions of one fact; the newest (by
+   *  ts) is current, older ones are superseded. Absent = this
+   *  entry is not versioned and recall treats it exactly as
+   *  before. Set by the model (memory_remember) or by the admin
+   *  correct path — never auto-derived from text (guessing a
+   *  fact identity from keywords is how two different facts get
+   *  merged into one chain). */
+  factKey?: string;
+  /** 0.5.1 item 1: id of the previous version this entry
+   *  replaces (must share the factKey). The chain itself is
+   *  factKey + ts order; this is the explicit link, for the
+   *  admin UI and the audit trail. */
+  supersedes?: string;
 }
 
 /** Layer 1: current state, at the head of MEMORY.md, always read on open,
@@ -91,6 +108,23 @@ export interface CoreOptions {
   logMaxEntries?: number;
   /** Snapshots to keep. Default 30. */
   snapshotKeep?: number;
+  /** 0.5.1 item 2: local embedding. Default off — disabled
+   *  means the model is never loaded and recall is exactly
+   *  keyword-only. */
+  semanticRecall?: {
+    enabled?: boolean;
+    modelId?: string;
+    modelDir?: string;
+    modelRevision?: string;
+    /** 0.5.3: directory whose node_modules holds the optional
+     *  @huggingface/transformers runtime (default: dataDir). */
+    runtimeDir?: string;
+    timeoutMs?: number;
+    maxCandidates?: number;
+    /** Similarity floor for semantic candidates (default 0.5;
+     *  see SEMANTIC_DEFAULT_MIN_SIMILARITY in semantic.ts). */
+    minSimilarity?: number;
+  };
 }
 
 export interface RecallHit {
@@ -103,6 +137,10 @@ export interface RecallHit {
   /** 0.2.0: true when this hit arrived via a graph edge, not a
    *  keyword match. */
   viaGraph?: boolean;
+  /** 0.5.1 item 1: true when this hit is a superseded version of
+   *  its fact — a newer version with the same factKey exists.
+   *  Rendered as "·旧版" in the injected block. */
+  superseded?: boolean;
   /** 0.2.0: rarest matched token (valve topic). Graph hits inherit
    *  their seed's topic. */
   topic: string;
@@ -126,6 +164,10 @@ export interface RecallHit {
   displayText?: string;
   /** 0.2.0: this entry was compressed by review. */
   compressed?: boolean;
+  /** 0.5.0 step 3: provenance of this hit — the fragment's when
+   *  fragment-backed, otherwise the verbatim log line itself
+   *  (user_quote / model_quote). Set in the token-cap loop. */
+  provenance?: Provenance;
   /** 0.3.0: this hit injects a fragment instead of the full entry
    *  text (the fragment is ~10 tokens vs ~100 for its sources). */
   fragmentId?: string;
@@ -153,6 +195,10 @@ export interface RecallResult {
   /** Ready-to-inject text block (hits only, markdown — layer 1 is
    *  never injected). */
   text: string;
+  /** 0.5.1 item 4: experiences whose triggers matched the query
+   *  (rule + source), in the order injected. Empty when none
+   *  matched. */
+  experiences?: Array<{ rule: string; source: string }>;
 }
 
 /** Result of rolling the current log into per-month segments. The
@@ -253,6 +299,16 @@ export interface MemoryAttributes {
    *  Recall never touches it — remembering the words does not
    *  refresh the feeling. */
   emotionRetain?: number;
+  /** 0.5.0 step 4: user feedback counts (memory_feedback).
+   *  correct = the user confirmed it right (a verification),
+   *  wrong = the user said it is wrong (the entry is invalidated),
+   *  irrelevant = the user said it does not belong here (recall
+   *  ranking halves per count, significance halves once per
+   *  feedback). All optional: old rows have none. */
+  feedbackCorrect?: number;
+  feedbackWrong?: number;
+  feedbackIrrelevant?: number;
+  lastFeedbackAt?: number;
 }
 
 /** One undirected link between two log entries (0.2.0, graph.json).
@@ -295,6 +351,9 @@ export interface ReviewState {
     promoted: number;
     compressed: number;
     edgesAdded: number;
+    /** 0.5.1 (0.4.5 item 7): edges the last review's backfill
+     *  upgraded in place (session -> keyword), not new edges. */
+    edgesUpgraded: number;
     entries: number;
   };
 }
@@ -398,6 +457,11 @@ export interface Belief {
    *  already charged once — a repeat contradict for the same entry
    *  is ignored, never deducted twice. Absent = none yet. */
   contradicting?: string[];
+  /** 0.5.0 step 3: provenance — sourceIds are the evidence entry
+   *  ids, sourceType is always model_inference (a belief is a
+   *  model judgement), confidence is code-computed from the type
+   *  + verification count. The model never writes the number. */
+  provenance?: Provenance;
 }
 
 /** One review-proposed belief cluster (0.4.0 item 2): entries

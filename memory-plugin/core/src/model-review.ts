@@ -70,6 +70,16 @@ export interface CappedSelectOptions {
   summaryChars?: number;
 }
 
+/** 0.5.1 (0.4.3 §四): one line per entry, always — a newline
+ *  inside a message must never survive as its own line in the
+ *  prompt, or a forged "- [id] ..." line inside a message would
+ *  look like a real prompt line. Applied to every displayText,
+ *  every overflow summary, and every pasted quote below (and to
+ *  the recall block's injected lines in recall.ts, same class). */
+function oneLine(s: string): string {
+  return s.replace(/[\r\n]+/g, " ");
+}
+
 /** Pick entries for a prompt section under an entry count and a
  *  character budget, highest significance first, shown
  *  chronologically. The budget is a hard cap, not a hint: an entry
@@ -98,10 +108,10 @@ export function selectCappedEntries(
   let overflowHidden = 0;
   let chars = 0;
   let cut = false;
-  const summarize = (text: string): string =>
-    text.length > summaryChars
-      ? text.slice(0, summaryChars) + "…"
-      : text;
+  const summarize = (text: string): string => {
+    const t = oneLine(text);
+    return t.length > summaryChars ? t.slice(0, summaryChars) + "…" : t;
+  };
   const pushOverflow = (e: MemoryEntry): void => {
     if (overflow.length < overflowMax) {
       overflow.push({ id: e.id, summary: summarize(e.text) });
@@ -119,7 +129,7 @@ export function selectCappedEntries(
       if (shown.length === 0) {
         shown.push({
           entry: e,
-          displayText: e.text.slice(0, Math.max(0, opts.maxChars)) + "…",
+          displayText: oneLine(e.text).slice(0, Math.max(0, opts.maxChars)) + "…",
         });
         chars = opts.maxChars;
         cut = true;
@@ -129,7 +139,7 @@ export function selectCappedEntries(
       }
       continue;
     }
-    shown.push({ entry: e, displayText: e.text });
+    shown.push({ entry: e, displayText: oneLine(e.text) });
     chars += e.text.length;
   }
   shown.sort((a, b) => a.entry.ts - b.entry.ts);
@@ -278,7 +288,7 @@ export function buildModelReviewPrompt(
     );
     for (const c of beliefCandidates) {
       lines.push(
-        `- 话题“${c.topic}”：${c.sourceIds.map((id) => `[${id}]`).join("、")}；原文摘录：${c.quotes.map((q) => `“${q}”`).join("、")}`,
+        `- 话题“${c.topic}”：${c.sourceIds.map((id) => `[${id}]`).join("、")}；原文摘录：${c.quotes.map((q) => `“${oneLine(q)}”`).join("、")}`,
       );
     }
     lines.push(

@@ -13,7 +13,7 @@ import { atomicWriteText } from "./atomic.ts";
 import { tokenize } from "./tokenize.ts";
 import type { MemoryEntry } from "./types.ts";
 
-interface FileFingerprint {
+export interface FileFingerprint {
   size: number;
   mtimeMs: number;
 }

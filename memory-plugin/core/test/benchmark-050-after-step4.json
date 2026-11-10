@@ -1,0 +1,281 @@
+{
+  "dataset": "0.5.0-benchmark-1",
+  "dataDir": "/tmp/memory-plugin-bench050-02PowT",
+  "queries": 21,
+  "retrievable": 15,
+  "coverage": 0.923,
+  "coverageDetail": [
+    {
+      "id": "s1",
+      "turns": 3,
+      "recorded": 2,
+      "expected": 2
+    },
+    {
+      "id": "s2",
+      "turns": 2,
+      "recorded": 2,
+      "expected": 2
+    },
+    {
+      "id": "s3",
+      "turns": 2,
+      "recorded": 2,
+      "expected": 2
+    },
+    {
+      "id": "s4",
+      "turns": 2,
+      "recorded": 2,
+      "expected": 2
+    },
+    {
+      "id": "s5",
+      "turns": 2,
+      "recorded": 2,
+      "expected": 2
+    },
+    {
+      "id": "s6",
+      "turns": 2,
+      "recorded": 2,
+      "expected": 2
+    }
+  ],
+  "recallAt5": 0.8,
+  "mrr": 0.683,
+  "byCategory": {
+    "synonym": {
+      "n": 6,
+      "recallAt5": 0.5,
+      "mrr": 0.417
+    },
+    "time": {
+      "n": 6,
+      "recallAt5": 1,
+      "mrr": 0.917
+    },
+    "conflict": {
+      "n": 3,
+      "recallAt5": 1,
+      "mrr": 0.75
+    }
+  },
+  "noEvidenceQueries": 6,
+  "noEvidenceFalsePositiveRate": 0.5,
+  "avgInjectedTokens": 62.6,
+  "avgLatencyMs": 0.64,
+  "p95LatencyMs": 1.52,
+  "perQuery": [
+    {
+      "id": "q01",
+      "category": "synonym",
+      "query": "她喜欢喝什么酸酸甜甜的饮品",
+      "expect": "m01",
+      "rank": 1,
+      "hits": 5,
+      "tokens": 117,
+      "ms": 4.19
+    },
+    {
+      "id": "q02",
+      "category": "synonym",
+      "query": "她什么时候会检查我",
+      "expect": "m02",
+      "rank": null,
+      "hits": 0,
+      "tokens": 0,
+      "ms": 0.24
+    },
+    {
+      "id": "q03",
+      "category": "synonym",
+      "query": "她不吃哪种绿色的配菜",
+      "expect": "m03",
+      "rank": 2,
+      "hits": 5,
+      "tokens": 110,
+      "ms": 0.66
+    },
+    {
+      "id": "q04",
+      "category": "synonym",
+      "query": "她哪天过生日",
+      "expect": "m04",
+      "rank": 1,
+      "hits": 2,
+      "tokens": 50,
+      "ms": 0.7
+    },
+    {
+      "id": "q05",
+      "category": "synonym",
+      "query": "她家那只胖猫叫什么",
+      "expect": "m05",
+      "rank": null,
+      "hits": 0,
+      "tokens": 0,
+      "ms": 0.24
+    },
+    {
+      "id": "q06",
+      "category": "synonym",
+      "query": "她害怕什么天气现象",
+      "expect": "m06",
+      "rank": null,
+      "hits": 0,
+      "tokens": 0,
+      "ms": 0.29
+    },
+    {
+      "id": "q07",
+      "category": "time",
+      "query": "我们上次吃火锅是什么时候",
+      "expect": "m07",
+      "rank": 2,
+      "hits": 2,
+      "tokens": 48,
+      "ms": 0.76
+    },
+    {
+      "id": "q08",
+      "category": "time",
+      "query": "她明天早上有什么安排",
+      "expect": "m08",
+      "rank": 1,
+      "hits": 5,
+      "tokens": 120,
+      "ms": 0.62
+    },
+    {
+      "id": "q09",
+      "category": "time",
+      "query": "我们第一次见面是哪个季节",
+      "expect": "m09",
+      "rank": 1,
+      "hits": 2,
+      "tokens": 48,
+      "ms": 0.5
+    },
+    {
+      "id": "q10",
+      "category": "time",
+      "query": "她每天早上几点跑步",
+      "expect": "m10",
+      "rank": 1,
+      "hits": 5,
+      "tokens": 120,
+      "ms": 0.64
+    },
+    {
+      "id": "q11",
+      "category": "time",
+      "query": "她什么时候交房租",
+      "expect": "m11",
+      "rank": 1,
+      "hits": 2,
+      "tokens": 50,
+      "ms": 0.39
+    },
+    {
+      "id": "q12",
+      "category": "time",
+      "query": "她昨天加班到几点",
+      "expect": "m12",
+      "rank": 1,
+      "hits": 1,
+      "tokens": 21,
+      "ms": 0.36
+    },
+    {
+      "id": "q13",
+      "category": "conflict",
+      "query": "她现在最喜欢什么颜色",
+      "expect": "m14",
+      "rank": 1,
+      "hits": 5,
+      "tokens": 118,
+      "ms": 0.55
+    },
+    {
+      "id": "q14",
+      "category": "conflict",
+      "query": "她现在住在哪",
+      "expect": "m16",
+      "rank": 1,
+      "hits": 5,
+      "tokens": 116,
+      "ms": 0.4
+    },
+    {
+      "id": "q15",
+      "category": "conflict",
+      "query": "她现在喝不喝咖啡",
+      "expect": "m18",
+      "rank": 4,
+      "hits": 5,
+      "tokens": 114,
+      "ms": 0.45
+    },
+    {
+      "id": "q16",
+      "category": "no-evidence",
+      "query": "她喜欢什么牌子的钢笔",
+      "expect": null,
+      "rank": null,
+      "hits": 5,
+      "tokens": 117,
+      "ms": 0.38
+    },
+    {
+      "id": "q17",
+      "category": "no-evidence",
+      "query": "她上周去爬了哪座山",
+      "expect": null,
+      "rank": null,
+      "hits": 2,
+      "tokens": 48,
+      "ms": 0.34
+    },
+    {
+      "id": "q18",
+      "category": "no-evidence",
+      "query": "她弟弟叫什么名字",
+      "expect": null,
+      "rank": null,
+      "hits": 0,
+      "tokens": 0,
+      "ms": 0.12
+    },
+    {
+      "id": "q19",
+      "category": "no-evidence",
+      "query": "她最喜欢的电影是哪部",
+      "expect": null,
+      "rank": null,
+      "hits": 5,
+      "tokens": 117,
+      "ms": 1.52
+    },
+    {
+      "id": "q20",
+      "category": "no-evidence",
+      "query": "她会弹什么乐器",
+      "expect": null,
+      "rank": null,
+      "hits": 0,
+      "tokens": 0,
+      "ms": 0.12
+    },
+    {
+      "id": "q21",
+      "category": "no-evidence",
+      "query": "她养过什么品种的狗",
+      "expect": null,
+      "rank": null,
+      "hits": 0,
+      "tokens": 0,
+      "ms": 0.06
+    }
+  ]
+}

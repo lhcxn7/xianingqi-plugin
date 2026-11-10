@@ -27,8 +27,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MemoryCore } from "../../core/src/index.ts";
-import { apply, hasTaskBlocklistWord, inject, INVALIDATION_AUDIT_FILE, isPersonaTrigger, MODEL_REVIEW_AUTO_RELEASE_TURNS, name, parseEmotion, shouldMarkPersona } from "../src/index.ts";
+import { HybridRetriever, MemoryCore } from "../../core/src/index.ts";
+import { apply, hasTaskActionWord, hasTaskBlocklistWord, hasTaskTechnicalWord, inject, INVALIDATION_AUDIT_FILE, isBareTaskPhrase, isPersonaTrigger, MODEL_REVIEW_AUTO_RELEASE_TURNS, name, parseEmotion, rewriteQuery, shouldMarkPersona } from "../src/index.ts";
 import { compileWithDshTools, normalizeToolSpec } from "../src/define-tool.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -287,6 +287,54 @@ const lastLog = (): Record<string, unknown> => {
   return JSON.parse(lines[lines.length - 1]) as Record<string, unknown>;
 };
 
+check("0.5.0 step 2: greetings that happen to contain a task-action word now mark (0.4.8: 6 openings, 4 unmarked)", () => {
+  // The four 0.4.8 failures — ordinary chat use of 同步 / 测试 /
+  // 创建 / 更新 — must mark now.
+  assert.equal(shouldMarkPersona("夏柠柒，我想和你同步一下近况"), true);
+  assert.equal(shouldMarkPersona("夏柠柒，测试一下，你在吗"), true);
+  assert.equal(shouldMarkPersona("夏柠柒，我今天创建了一个新习惯"), true);
+  assert.equal(shouldMarkPersona("夏柠柒，我想更新一下我的近况，跟你说说今天的事"), true);
+  // Baselines still mark.
+  assert.equal(shouldMarkPersona("夏柠柒，在吗"), true);
+  assert.equal(shouldMarkPersona("柠柒，我回来了"), true);
+  // A question that happens to contain 版本 also marks.
+  assert.equal(shouldMarkPersona("夏柠柒，你是什么版本"), true);
+});
+
+check("0.5.0 step 2: task-shaped action words still do NOT mark", () => {
+  // Imperative + action word = instruction.
+  assert.equal(shouldMarkPersona("夏柠柒，帮我更新一下你的记忆"), false);
+  assert.equal(shouldMarkPersona("夏柠柒，把测试跑一下"), false);
+  // Bare task phrase (trigger + action word, nothing chatty left).
+  assert.equal(shouldMarkPersona("夏柠柒，更新一下"), false);
+  assert.equal(shouldMarkPersona("夏柠柒，恢复测试"), false);
+  // Technical words still block on their own.
+  assert.equal(shouldMarkPersona("夏柠柒的 SKILL.md 改一下"), false);
+  assert.equal(shouldMarkPersona("夏柠柒，GitHub 上那个仓库推一下"), false);
+  // 0.5.0 fix (P0): action word + memory object is a task even when
+  // the ≤2-char bare rule would miss it (0.4.8 blocked all of these).
+  assert.equal(shouldMarkPersona("夏柠柒，更新一下记忆"), false);
+  assert.equal(shouldMarkPersona("夏柠柒，同步一下记忆"), false);
+  assert.equal(shouldMarkPersona("夏柠柒，删除这条记忆"), false);
+  assert.equal(shouldMarkPersona("夏柠柒，测试一下记忆"), false);
+  assert.equal(shouldMarkPersona("夏柠柒，创建一条记忆"), false);
+  // Chatty context still marks.
+  assert.equal(shouldMarkPersona("夏柠柒，更新一下记忆，我想你"), true);
+  // Narrative "你让我..." is not an imperative.
+  assert.equal(shouldMarkPersona("夏柠柒，你让我更新一下心情"), true);
+  // Split helpers agree with the gate.
+  assert.equal(hasTaskTechnicalWord("这段代码跑不起来"), true);
+  assert.equal(hasTaskTechnicalWord("夏柠柒，在吗"), false);
+  assert.equal(hasTaskActionWord("我想同步一下近况"), true);
+  assert.equal(hasTaskActionWord("夏柠柒，在吗"), false);
+  assert.equal(isBareTaskPhrase("夏柠柒，恢复测试"), true);
+  assert.equal(isBareTaskPhrase("夏柠柒，测试一下，你在吗"), false);
+  assert.equal(isBareTaskPhrase("夏柠柒，我想和你同步一下近况"), false);
+  // The raw union check is unchanged (old callers see the same).
+  assert.equal(hasTaskBlocklistWord("帮我更新一下"), true);
+  assert.equal(hasTaskBlocklistWord("夏柠柒，在吗"), false);
+});
+
 check("plugin exports name/inject/apply", () => {
   assert.equal(name, "memory-plugin");
   assert.deepEqual(inject, ["tools", "systemPrompt"]);
@@ -368,7 +416,7 @@ check("apply never reads ctx.config (real-DSH regression)", () => {
   apply(strictProxy as never, { dataDir: strictDir } as never);
 });
 
-check("registers directives section and all thirteen tools (compiled JSON Schema)", () => {
+check("registers directives section and all seventeen tools (compiled JSON Schema)", () => {
   assert.ok(
     ctx.sections.some((s) => s.name === "memory-plugin:directives"),
   );
@@ -387,6 +435,10 @@ check("registers directives section and all thirteen tools (compiled JSON Schema
     "memory_belief",
     "memory_reflect",
     "memory_proact",
+    "memory_feedback",
+    "memory_forget",
+    "memory_goal",
+    "memory_experience",
   ]) {
     assert.ok(names.includes(n), `tool ${n} registered`);
   }
@@ -867,6 +919,52 @@ check("memory_search tool returns hits + layer 1", () => {
       (h) => typeof h.id === "string" && (h.id as string).length > 0,
     ),
     `every hit carries a log entry id: ${JSON.stringify(searchResult.hits)}`,
+  );
+});
+
+check("0.5.0 step 3: memory_search hits carry provenance (sourceId / type / confidence / verification)", () => {
+  assert.ok(searchResult.hits.length > 0, "hits exist to check");
+  for (const h of searchResult.hits) {
+    // Source ids always resolve to this hit's own log entry for a
+    // verbatim hit (fragment-backed hits carry the fragment's).
+    assert.ok(Array.isArray(h.sourceIds), "sourceIds present");
+    assert.ok(
+      (h.sourceIds as string[]).length > 0,
+      "sourceIds non-empty",
+    );
+    assert.ok(
+      typeof h.sourceType === "string" && (h.sourceType as string).length > 0,
+      "sourceType present",
+    );
+    assert.ok(
+      typeof h.sourceTypeCn === "string" && (h.sourceTypeCn as string).length > 0,
+      "sourceTypeCn present",
+    );
+    assert.ok(
+      h.confidence === null || typeof h.confidence === "number",
+      "confidence is a number or null (never a model-written string)",
+    );
+    assert.ok(typeof h.verifyCount === "number", "verifyCount present");
+    assert.ok(
+      h.lastVerifiedAt === null || typeof h.lastVerifiedAt === "number",
+      "lastVerifiedAt is a timestamp or null",
+    );
+    assert.ok(
+      typeof h.sourceSummary === "string" &&
+        (h.sourceSummary as string).includes(h.date as string),
+      `sourceSummary carries the date: ${h.sourceSummary}`,
+    );
+  }
+  // The 查岗 hits are verbatim user lines: user_quote, 0.9, never verified.
+  const first = searchResult.hits[0];
+  assert.equal(first.sourceType, "user_quote");
+  assert.equal(first.sourceTypeCn, "用户原话");
+  assert.equal(first.confidence, 0.9);
+  assert.equal(first.verifyCount, 0);
+  assert.equal(first.lastVerifiedAt, null);
+  assert.ok(
+    (first.sourceSummary as string).includes("用户原话"),
+    `sourceSummary names the kind: ${first.sourceSummary}`,
   );
 });
 
@@ -1969,7 +2067,7 @@ const fragGood = await fragment030.execute(
     sourceIds: cakeEntries.map((e) => e.id),
     text: "她很喜欢蓝莓蛋糕",
     tone: "很喜欢",
-    quotes: ["很好吃"],
+    quotes: ["蛋糕很好吃"],
     topic: "蓝莓蛋糕",
   },
   execEdge,
@@ -1990,7 +2088,7 @@ const fragNovel = await fragment030.execute(
     sourceIds: cakeEntries.map((e) => e.id),
     text: "她很喜欢粉色筷子",
     tone: "很喜欢",
-    quotes: ["很好吃"],
+    quotes: ["蛋糕很好吃"],
     topic: "粉色筷子",
   },
   execEdge,
@@ -2006,13 +2104,13 @@ const fragFreeTone = await fragment030.execute(
     sourceIds: [cakeEntries[0].id],
     text: "蓝莓蛋糕还行",
     tone: "嘴上嫌弃心里喜欢",
-    quotes: ["很好吃"],
+    quotes: ["蛋糕很好吃"],
     topic: "蓝莓蛋糕",
   },
   execEdge,
 );
 check("0.3.0: memory_fragment accepts a free-form tone (not a fixed list)", () => {
-  // "很好吃" is a mild-positive marker; the free-form tone maps to
+  // "蛋糕很好吃" is a mild-positive marker; the free-form tone maps to
   // level unknown, so the tone check is skipped — keyword + quote
   // checks still pass.
   assert.equal(fragFreeTone.ok, true, `free-form tone accepted: ${JSON.stringify(fragFreeTone)}`);
@@ -2029,7 +2127,7 @@ const fragTask = await fragment030.execute(
     sourceIds: [cakeEntries[0].id],
     text: "她很喜欢蓝莓蛋糕",
     tone: "很喜欢",
-    quotes: ["很好吃"],
+    quotes: ["蛋糕很好吃"],
   },
   { agent: { session: { id: "s-never-triggered" } } },
 );
@@ -2039,7 +2137,7 @@ check("0.3.0: memory_fragment refuses in a task window", () => {
 });
 
 const fragNoSource = await fragment030.execute(
-  { sourceIds: [], text: "她很喜欢蓝莓蛋糕", tone: "很喜欢", quotes: ["很好吃"] },
+  { sourceIds: [], text: "她很喜欢蓝莓蛋糕", tone: "很喜欢", quotes: ["蛋糕很好吃"] },
   execEdge,
 );
 check("0.3.0: memory_fragment refuses without sourceIds (no provenance, no fragment)", () => {
@@ -2774,6 +2872,12 @@ await ctxBel.emit("session/event", {
   source: { kind: "user" },
   message: { content: "夏柠柒，答应陪你看星星结果没去成", source: { kind: "user" } },
 });
+await ctxBel.emit("session/event", {
+  type: "user/message",
+  sessionId: "s-bel",
+  source: { kind: "user" },
+  message: { content: "夏柠柒，你说过会一直在我身边", source: { kind: "user" } },
+});
 const logEntriesBel = (): Array<Record<string, unknown>> => {
   const file = join(dirBel, "log.jsonl");
   if (!existsSync(file)) return [];
@@ -2789,7 +2893,10 @@ const belEntry1 = logEntriesBel().find(
 const belEntry2 = logEntriesBel().find(
   (e) => (e.text as string).includes("答应陪你看星星结果没去成"),
 ) as { id: string };
-assert.ok(belEntry1 && belEntry2, "both belief evidence entries recorded");
+const belEntry3 = logEntriesBel().find(
+  (e) => (e.text as string).includes("你说过会一直在我身边"),
+) as { id: string };
+assert.ok(belEntry1 && belEntry2 && belEntry3, "all three belief evidence entries recorded");
 const execBel = { agent: { session: { id: "s-bel" } } };
 type BeliefToolResult = {
   ok: boolean;
@@ -2849,12 +2956,15 @@ check("0.4.0 item 2: memory_belief create with a paraphrased quote is rejected a
 });
 
 // support without delta: the tool must ask the model to supply it.
+// 0.5.1 (0.4.3 item 7): support uses a FRESH entry here —
+// belEntry1 is already the create evidence, so supporting with it
+// is a duplicate (no move), not a second proof.
 const noDelta = await beliefBel.execute(
-  { action: "support", beliefId: "BEL_TRUST_001", entryId: belEntry1.id, quote: "昨晚难过的时候第一个想到的就是你" },
+  { action: "support", beliefId: "BEL_TRUST_001", entryId: belEntry3.id, quote: "你说过会一直在我身边" },
   execBel,
 );
 const overCap = await beliefBel.execute(
-  { action: "support", beliefId: "BEL_TRUST_001", entryId: belEntry1.id, quote: "昨晚难过的时候第一个想到的就是你", delta: 0.5 },
+  { action: "support", beliefId: "BEL_TRUST_001", entryId: belEntry3.id, quote: "你说过会一直在我身边", delta: 0.5 },
   execBel,
 );
 check("0.4.0 item 2: memory_belief support requires delta, clamps an over-cap delta to 0.2 without erroring", () => {
@@ -4141,6 +4251,328 @@ check("0.4.0 item 5: a pre-step after a direct search adds no further tool calls
 });
 for (const dispose of ctxSpot.disposers) dispose();
 
+// ---- 0.5.0 step 4: memory_feedback (tool only, no UI) -----------
+// Isolated dir + ctx: the wrong-feedback below invalidates a real
+// entry, which must not disturb the main dir's later checks.
+const dirFb = mkdtempSync(join(tmpdir(), "memory-plugin-feedback-"));
+writeFileSync(join(dirFb, "MEMORY.md"), fixtureMemory, "utf8");
+const ctxFb = new MockContext(dirFb);
+apply(ctxFb as never, { dataDir: dirFb } as never);
+await sleep(50);
+const fbTools = (name: string) =>
+  ctxFb.registeredTools.find((t) => t.name === name) as unknown as {
+    execute: (
+      args: Record<string, unknown>,
+      exec?: unknown,
+    ) => Promise<Record<string, unknown>>;
+  };
+const fbSearch = fbTools("memory_search");
+const fbFragment = fbTools("memory_fragment");
+const fbFeedback = fbTools("memory_feedback");
+const fbStatus = fbTools("memory_status");
+
+check("0.5.0 step 4: 17 tools register, memory_feedback is deferred (deferLoading)", () => {
+  const names = ctxFb.registeredTools.map((t) => t.name as string);
+  assert.equal(names.length, 17, `17 tools registered: ${names.join(",")}`);
+  assert.ok(names.includes("memory_feedback"), "memory_feedback registered");
+  const spec = ctxFb.registeredTools.find(
+    (t) => t.name === "memory_feedback",
+  ) as Record<string, unknown>;
+  assert.equal(
+    spec.deferLoading,
+    true,
+    "deferLoading survives compilation (description loads on demand, not every round)",
+  );
+});
+
+const fbStatusRes = await fbStatus.execute({});
+check("0.5.0 step 4: memory_status reports 17 tools by name", () => {
+  assert.equal(fbStatusRes.ok, true);
+  assert.equal(fbStatusRes.tools, 17);
+  assert.ok(
+    ((fbStatusRes.toolNames as string[]) ?? []).includes("memory_feedback"),
+    `toolNames lists memory_feedback: ${JSON.stringify(fbStatusRes.toolNames)}`,
+  );
+});
+
+// Mark a persona session and record one line through the real events.
+await ctxFb.emit("agent/created", { agent: { id: "s-fb" } });
+await ctxFb.emit("agent/pre-step", {
+  agent: { id: "s-fb", ctx: ctxFb.agentCtx("s-fb") },
+  messages: [
+    { role: "user", content: "夏柠柒，我最喜欢喝酸梅汤", source: { kind: "user" } },
+  ],
+});
+await ctxFb.emit("session/event", {
+  type: "user/message",
+  sessionId: "s-fb",
+  source: { kind: "user" },
+  message: {
+    content: "夏柠柒，我最喜欢喝酸梅汤",
+    source: { kind: "user" },
+  },
+});
+
+const fbSearch1 = await fbSearch.execute({ query: "酸梅汤" });
+const fbHitId = ((fbSearch1.hits as Array<Record<string, unknown>>)[0]?.id ??
+  "") as string;
+check("0.5.0 step 4: setup — the recorded line is searchable", () => {
+  assert.ok(fbHitId.length > 0, "search finds the recorded line");
+});
+
+// A fragment on top of it, so the correct-feedback path has a
+// provenance counter to move.
+const fbFrag = await fbFragment.execute({
+  sourceIds: [fbHitId],
+  text: "他喜欢酸梅汤",
+  tone: "喜欢",
+  quotes: ["喜欢喝酸梅汤"],
+});
+check("0.5.0 step 4: setup — fragment created for the feedback loop", () => {
+  assert.equal(fbFrag.ok, true, JSON.stringify(fbFrag));
+});
+const fbFragId = fbFrag.id as string;
+
+const fbSearch2 = await fbSearch.execute({ query: "酸梅汤" });
+const fbHit2 = (fbSearch2.hits as Array<Record<string, unknown>>).find(
+  (h) => h.fragmentId === fbFragId,
+);
+const fbVerifiedBefore = (fbHit2?.verifyCount ?? 0) as number;
+const fbCorrect = await fbFeedback.execute({
+  entryId: fbHitId,
+  feedback: "correct",
+  fragmentId: fbFragId,
+});
+check("0.5.0 step 4: feedback correct counts as a verification", () => {
+  assert.equal(fbCorrect.ok, true, JSON.stringify(fbCorrect));
+  assert.equal(fbCorrect.feedback, "correct");
+});
+const fbSearch3 = await fbSearch.execute({ query: "酸梅汤" });
+const fbHit3 = (fbSearch3.hits as Array<Record<string, unknown>>).find(
+  (h) => h.fragmentId === fbFragId,
+);
+check("0.5.0 step 4: the same question re-asked shows the higher verification count", () => {
+  assert.ok(fbHit3, "fragment hit still surfaces after correct feedback");
+  assert.ok(
+    ((fbHit3?.verifyCount ?? 0) as number) > fbVerifiedBefore,
+    `verifyCount rose (${fbVerifiedBefore} -> ${fbHit3?.verifyCount})`,
+  );
+});
+
+const fbBadKind = await fbFeedback.execute({
+  entryId: fbHitId,
+  feedback: "meh",
+});
+check("0.5.0 step 4: an unknown feedback kind is refused", () => {
+  assert.equal(fbBadKind.ok, false);
+});
+const fbUnknown = await fbFeedback.execute({
+  entryId: "no-such-id",
+  feedback: "wrong",
+});
+check("0.5.0 step 4: an unknown entry id is refused", () => {
+  assert.equal(fbUnknown.ok, false);
+});
+const fbTask = await fbFeedback.execute(
+  { entryId: fbHitId, feedback: "wrong" },
+  { agent: { session: { id: "s-task-never-marked" } } },
+);
+check("0.5.0 step 4: a task window cannot give feedback (persona gate)", () => {
+  assert.equal(fbTask.ok, false);
+  assert.ok(((fbTask.error as string) ?? "").includes("人设窗口"));
+});
+
+const fbWrong = await fbFeedback.execute({
+  entryId: fbHitId,
+  feedback: "wrong",
+  fragmentId: fbFragId,
+  reason: "她不喜欢酸梅汤",
+});
+check("0.5.0 step 4: feedback wrong invalidates the entry", () => {
+  assert.equal(fbWrong.ok, true, JSON.stringify(fbWrong));
+  assert.deepEqual(fbWrong.invalidated, [fbHitId]);
+});
+const fbSearch4 = await fbSearch.execute({ query: "酸梅汤" });
+check("0.5.0 step 4: the same question re-asked no longer recalls the wrong memory", () => {
+  assert.equal(
+    (fbSearch4.hits as unknown[]).length,
+    0,
+    "invalidated entry is gone from recall",
+  );
+});
+check("0.5.0 step 4: wrong feedback writes an audit line (same file as memory_invalidate)", () => {
+  const audit = readFileSync(join(dirFb, INVALIDATION_AUDIT_FILE), "utf8");
+  assert.ok(audit.includes("memory_feedback wrong"), "audit names the feedback");
+  assert.ok(audit.includes(fbHitId), "audit names the entry");
+});
+
+// ---- 0.5.0 step 5: 查询改写版混合召回 ----------------------------
+// No embedding: the rewrite is a host-injected async function; the
+// tests use a deterministic stub (a real model call lives with the
+// host — this plugin's context exposes no model-call API).
+// (check() is sync, so the awaits run at top level first.)
+const rwNoRewriter = await rewriteQuery("酸梅汤", undefined);
+const rwUnchanged = await rewriteQuery("酸梅汤", async () => "酸梅汤");
+const rwEmpty = await rewriteQuery("酸梅汤", async () => "");
+const rwNull = await rewriteQuery("酸梅汤", async () => null);
+const rwThrowing = await rewriteQuery("酸梅汤", async () => {
+  throw new Error("model down");
+});
+const rwExpanded = await rewriteQuery(
+  "酸梅汤",
+  async () => "酸梅汤 冰镇",
+  3000,
+);
+const rwHangT0 = Date.now();
+const rwHang = await rewriteQuery(
+  "酸梅汤",
+  () => new Promise<string>(() => {}),
+  20,
+);
+const rwHangMs = Date.now() - rwHangT0;
+check("0.5.0 step 5: rewriteQuery falls back to null on every failure mode", () => {
+  assert.equal(rwNoRewriter, null);
+  assert.equal(rwUnchanged, null, "an unchanged rewrite is null (nothing to add)");
+  assert.equal(rwEmpty, null, "an empty rewrite is null");
+  assert.equal(rwNull, null, "a null rewrite is null");
+  assert.equal(rwThrowing, null, "a throwing rewriter falls back");
+  assert.equal(rwExpanded, "酸梅汤 冰镇", "a real expansion comes back");
+  assert.equal(rwHang, null, "a hanging rewriter times out");
+  assert.ok(rwHangMs < 1000, "the timeout does not block the turn");
+});
+
+// Isolated dir + ctx with a stub rewriter: 天气现象 -> 打雷.
+const dirRw = mkdtempSync(join(tmpdir(), "memory-plugin-rewrite-"));
+writeFileSync(join(dirRw, "MEMORY.md"), fixtureMemory, "utf8");
+const stubRewriter = async (q: string): Promise<string | null> =>
+  q.includes("天气现象") ? `${q} 打雷 雷声` : null;
+const ctxRw = new MockContext(dirRw);
+apply(ctxRw as never, {
+  dataDir: dirRw,
+  queryRewriter: stubRewriter,
+} as never);
+await sleep(50);
+const rwSearch = ctxRw.registeredTools.find(
+  (t) => t.name === "memory_search",
+) as unknown as {
+  execute: (args: Record<string, unknown>) => Promise<{
+    hits: Array<Record<string, unknown>>;
+  }>;
+};
+// Seed one line through the real events (persona session s-rw).
+await ctxRw.emit("agent/created", { agent: { id: "s-rw" } });
+await ctxRw.emit("agent/pre-step", {
+  agent: { id: "s-rw", ctx: ctxRw.agentCtx("s-rw") },
+  messages: [
+    { role: "user", content: "夏柠柒，我最怕打雷", source: { kind: "user" } },
+  ],
+});
+await ctxRw.emit("session/event", {
+  type: "user/message",
+  sessionId: "s-rw",
+  source: { kind: "user" },
+  message: {
+    content: "夏柠柒，我最怕打雷",
+    source: { kind: "user" },
+  },
+});
+
+const rwSearchNoRewrite = await rwSearch.execute({
+  query: "她害怕什么天气现象",
+});
+check("0.5.0 step 5: memory_search with the stub rewriter finds what keyword-only misses", () => {
+  assert.ok(
+    (rwSearchNoRewrite.hits as unknown[]).length >= 1,
+    "the rewritten search finds the 打雷 line",
+  );
+  assert.ok(
+    ((rwSearchNoRewrite.hits as Array<Record<string, unknown>>)[0].text as string).includes("打雷"),
+    "the hit is the 打雷 line",
+  );
+});
+
+// Same question, no rewriter: a second ctx proves the miss is real.
+const dirRw0 = mkdtempSync(join(tmpdir(), "memory-plugin-rewrite0-"));
+writeFileSync(join(dirRw0, "MEMORY.md"), fixtureMemory, "utf8");
+const ctxRw0 = new MockContext(dirRw0);
+apply(ctxRw0 as never, { dataDir: dirRw0 } as never);
+await sleep(50);
+await ctxRw0.emit("agent/created", { agent: { id: "s-rw0" } });
+await ctxRw0.emit("agent/pre-step", {
+  agent: { id: "s-rw0", ctx: ctxRw0.agentCtx("s-rw0") },
+  messages: [
+    { role: "user", content: "夏柠柒，我最怕打雷", source: { kind: "user" } },
+  ],
+});
+await ctxRw0.emit("session/event", {
+  type: "user/message",
+  sessionId: "s-rw0",
+  source: { kind: "user" },
+  message: {
+    content: "夏柠柒，我最怕打雷",
+    source: { kind: "user" },
+  },
+});
+const rw0Search = ctxRw0.registeredTools.find(
+  (t) => t.name === "memory_search",
+) as unknown as {
+  execute: (args: Record<string, unknown>) => Promise<{
+    hits: Array<Record<string, unknown>>;
+  }>;
+};
+const rw0Res = await rw0Search.execute({ query: "她害怕什么天气现象" });
+check("0.5.0 step 5: without a rewriter the same question misses (control)", () => {
+  assert.equal(
+    (rw0Res.hits as unknown[]).length,
+    0,
+    "keyword-only misses the synonym question",
+  );
+});
+
+// Pre-step path: turn 1 recall with the stub rewriter appends the hit.
+const dRw = {
+  agent: { id: "s-rw2", ctx: ctxRw.agentCtx("s-rw2") },
+  messages: [
+    {
+      role: "user",
+      content: "夏柠柒，她害怕什么天气现象",
+      source: { kind: "user" },
+    },
+  ],
+};
+await ctxRw.emit("agent/pre-step", dRw);
+check("0.5.0 step 5: pre-step recall with the rewriter injects the rewritten hit", () => {
+  const msgs = dRw.messages as Array<Record<string, unknown>>;
+  assert.equal(msgs.length, 2, "turn 1 appends (1 original + 1 injected)");
+  const text = (msgs[1].content as Array<{ text: string }>)[0].text;
+  assert.ok(text.includes("打雷"), "the injected recall carries the 打雷 line");
+});
+
+// Hanging rewriter + short timeout: the turn still completes,
+// keyword-only.
+const dirRwHang = mkdtempSync(join(tmpdir(), "memory-plugin-rewrite-hang-"));
+writeFileSync(join(dirRwHang, "MEMORY.md"), fixtureMemory, "utf8");
+const ctxRwHang = new MockContext(dirRwHang);
+apply(ctxRwHang as never, {
+  dataDir: dirRwHang,
+  queryRewriter: () => new Promise<string>(() => {}),
+  rewriteTimeoutMs: 20,
+} as never);
+await sleep(50);
+const rwHangSearch = ctxRwHang.registeredTools.find(
+  (t) => t.name === "memory_search",
+) as unknown as {
+  execute: (args: Record<string, unknown>) => Promise<{
+    hits: Array<Record<string, unknown>>;
+  }>;
+};
+const tHang0 = Date.now();
+const rwHangRes = await rwHangSearch.execute({ query: "酸梅汤" });
+check("0.5.0 step 5: a hanging rewriter times out instead of blocking the search", () => {
+  assert.ok(Date.now() - tHang0 < 1000, "the search returned promptly");
+  assert.ok(Array.isArray(rwHangRes.hits), "a result still comes back (keyword-only)");
+});
+
 // ---- unload + MEMORY.md untouched ---------------------------------------
 for (const dispose of ctx.disposers) dispose();
 
@@ -4151,6 +4583,533 @@ check("M5/M12: unload runs endSession (a second snapshot exists)", () => {
 
 check("MEMORY.md bytes unchanged by every shell operation", () => {
   assert.equal(readFileSync(join(dir, "MEMORY.md"), "utf8"), memoryBefore);
+});
+
+// ---- 0.5.1 ---------------------------------------------------------
+// One check per 0.5.1 item that lives on the shell side (0.4.3
+// items 12/14, 0.4.5 new issues 8/9, §四 small items). Each on its
+// own dir/context.
+
+// 0.5.1 (0.4.3 item 12): memory_search is persona-only. A
+// task-window entry can only get into the log by a direct core
+// write (the plugin's session/event never records task windows)
+// — which is exactly the hole: once in, it must never surface
+// in a persona search.
+const srch051Dir = mkdtempSync(join(tmpdir(), "memory-plugin-051-search-window-"));
+writeFileSync(join(srch051Dir, "MEMORY.md"), fixtureMemory, "utf8");
+const seedSrch051 = new MemoryCore({ dataDir: srch051Dir });
+const taskHit051 = seedSrch051.record({ role: "user", text: "任务窗口的秘密备忘酸梅汤", window: "task", sessionId: "s-task" });
+const personaHit051 = seedSrch051.record({ role: "user", text: "夏柠柒，酸梅汤真好喝", window: "persona", sessionId: "s-srch" });
+seedSrch051.flush();
+const srch051Ctx = new MockContext(srch051Dir);
+apply(srch051Ctx as never, { dataDir: srch051Dir } as never);
+await sleep(50);
+const search051 = srch051Ctx.registeredTools.find(
+  (t) => t.name === "memory_search",
+) as unknown as {
+  execute: (args: Record<string, unknown>) => Promise<{
+    hits: Array<{ id: string; text: string }>;
+  }>;
+};
+const search051Res = await search051.execute({ query: "酸梅汤", limit: 5 });
+check("0.5.1 (0.4.3 item 12): memory_search never returns a task-window entry", () => {
+  assert.ok(search051Res.hits.some((h) => h.id === personaHit051.id), "persona entry surfaces");
+  assert.ok(!search051Res.hits.some((h) => h.id === taskHit051.id), "task entry does not surface");
+});
+
+// 0.5.2: an explicit memory_search from a task window is refused.
+const searchTask051 = await (
+  search051 as unknown as {
+    execute: (
+      args: Record<string, unknown>,
+      exec: unknown,
+    ) => Promise<{ hits: unknown[]; error?: string }>;
+  }
+).execute(
+  { query: "酸梅汤", limit: 5 },
+  { agent: { session: { id: "s-task" } } },
+);
+check("0.5.2: task window cannot call memory_search to read persona memory", () => {
+  assert.equal(searchTask051.hits.length, 0, "no hits cross the window boundary");
+  assert.ok(
+    (searchTask051.error ?? "").includes("只在人设窗口"),
+    "the refusal is explicit",
+  );
+});
+
+check("0.5.1 (0.4.3 §四): belief/reflect/proact load their descriptions on demand", () => {
+  for (const n of ["memory_belief", "memory_reflect", "memory_proact", "memory_feedback"]) {
+    const t = srch051Ctx.registeredTools.find((x) => x.name === n) as unknown as { deferLoading?: boolean } | undefined;
+    assert.equal(t?.deferLoading, true, `${n} has deferLoading`);
+  }
+});
+check("0.5.1 (0.4.5 item 6): memory_status says pending checks await the next review", () => {
+  const t = srch051Ctx.registeredTools.find((x) => x.name === "memory_status") as unknown as { description?: string } | undefined;
+  assert.ok((t?.description ?? "").includes("待下次复盘确认"), "status copy says the count awaits the next review");
+});
+for (const dispose of srch051Ctx.disposers) dispose();
+
+// 0.5.1 (0.4.3 item 14): memory_restore is persona-gated;
+// memory_snapshot stays open (it only copies files).
+const rst051Dir = mkdtempSync(join(tmpdir(), "memory-plugin-051-restore-gate-"));
+writeFileSync(join(rst051Dir, "MEMORY.md"), fixtureMemory, "utf8");
+const rst051Ctx = new MockContext(rst051Dir);
+apply(rst051Ctx as never, { dataDir: rst051Dir } as never);
+await sleep(50);
+await rst051Ctx.emit("agent/created", { agent: { id: "s-rst" } });
+await rst051Ctx.emit("agent/pre-step", { agent: { id: "s-rst", ctx: rst051Ctx.agentCtx("s-rst") }, messages: [{ role: "user", content: "夏柠柒，在吗", source: { kind: "user" } }] });
+const snapshot051 = rst051Ctx.registeredTools.find(
+  (t) => t.name === "memory_snapshot",
+) as unknown as {
+  execute: (args: Record<string, unknown>) => Promise<{ ok: boolean; snapshot?: string; error?: string }>;
+};
+const restore051 = rst051Ctx.registeredTools.find(
+  (t) => t.name === "memory_restore",
+) as unknown as {
+  execute: (args: Record<string, unknown>, exec?: unknown) => Promise<{ ok: boolean; safety?: string; error?: string }>;
+};
+const snap051 = await snapshot051.execute({});
+assert.ok(snap051.ok && typeof snap051.snapshot === "string", "snapshot taken");
+const snapsBefore051 = readdirSync(join(rst051Dir, ".snapshots"));
+const taskRestore051 = await restore051.execute({ name: snap051.snapshot }, { agent: { session: { id: "s-never-triggered" } } });
+check("0.5.1 (0.4.3 item 14): memory_restore refuses in a task window and writes nothing", () => {
+  assert.equal(taskRestore051.ok, false, "task restore refused");
+  assert.ok((taskRestore051.error ?? "").includes("人设窗口"), `refusal names the persona window: ${taskRestore051.error}`);
+  assert.deepEqual(readdirSync(join(rst051Dir, ".snapshots")), snapsBefore051, "no safety snapshot was taken — nothing was written");
+});
+const snapTask051 = await snapshot051.execute({});
+check("0.5.1 (0.4.3 item 14): memory_snapshot stays open — it only copies files, never changes memory", () => {
+  assert.equal(snapTask051.ok, true, "snapshot works without a persona gate");
+});
+const personaRestore051 = await restore051.execute({ name: snap051.snapshot }, { agent: { session: { id: "s-rst" } } });
+check("0.5.1 (0.4.3 item 14): memory_restore works in a persona window", () => {
+  assert.equal(personaRestore051.ok, true, `persona restore works: ${JSON.stringify(personaRestore051)}`);
+  assert.equal(typeof personaRestore051.safety, "string", "a safety snapshot was taken first");
+});
+for (const dispose of rst051Ctx.disposers) dispose();
+
+// 0.5.1 (0.4.5 item 8): yesterday empty, but the code review
+// left proposals (a non-empty day builds a proact proposal) —
+// the review still registers instead of early-returning.
+const rev4051Dir = mkdtempSync(join(tmpdir(), "memory-plugin-051-review-empty-yesterday-"));
+writeFileSync(join(rev4051Dir, "MEMORY.md"), fixtureMemory, "utf8");
+const seed4051Core = new MemoryCore({ dataDir: rev4051Dir });
+seed4051Core.record({ role: "user", text: "今天去爬山了，累坏了", window: "persona", sessionId: "s-rev4", ts: Date.now() - 3600000 });
+seed4051Core.record({ role: "assistant", text: "今天吃了拉面，真好吃", window: "persona", sessionId: "s-rev4", ts: Date.now() - 1800000 });
+seed4051Core.flush();
+const rev4051Ctx = new MockContext(rev4051Dir);
+apply(rev4051Ctx as never, { dataDir: rev4051Dir } as never);
+await sleep(50);
+const rev4051Decision = (id: string, content: string): Record<string, unknown> => ({
+  agent: { id, ctx: rev4051Ctx.agentCtx(id) },
+  messages: [{ role: "user", content, source: { kind: "user" } }],
+});
+const rev4051Live = (id: string) =>
+  rev4051Ctx
+    .agentCtx(id)
+    .contexts.filter((c) => c.name === "memory-plugin:daily-review" && !c.disposed);
+await rev4051Ctx.emit("agent/created", { agent: { id: "s-rev4" } });
+await rev4051Ctx.emit("agent/pre-step", rev4051Decision("s-rev4", "夏柠柒，在吗"));
+await rev4051Ctx.emit("agent/created", { agent: { id: "s-rev4" } });
+await rev4051Ctx.emit("agent/pre-step", rev4051Decision("s-rev4", "夏柠柒，在吗"));
+check("0.5.1 (0.4.5 item 8): yesterday empty but proposals present — the review still registers", () => {
+  const live = rev4051Live("s-rev4");
+  assert.equal(live.length, 1, "one live review context despite an empty yesterday");
+  assert.ok(live[0].text.includes("主动提议"), "the proact proposal rides along");
+  assert.ok(
+    live[0].text.includes("今天去爬山了") || live[0].text.includes("今天吃了拉面"),
+    "today's entries are in the merged recent section",
+  );
+  // 0.4.5 item 9b: the merged section tells her the proact
+  // prompt in the review carries no token — act only after a
+  // fresh memory_proact({}) gate call.
+  assert.ok(
+    live[0].text.includes("先调用 memory_proact 工具（空参数）"),
+    "the review says to take a fresh gate call before acting",
+  );
+});
+for (const dispose of rev4051Ctx.disposers) dispose();
+
+// Control for the same fix: yesterday empty AND no proposals —
+// still no review.
+const rev6051Dir = mkdtempSync(join(tmpdir(), "memory-plugin-051-review-empty-no-proposals-"));
+writeFileSync(join(rev6051Dir, "MEMORY.md"), fixtureMemory, "utf8");
+const rev6051Ctx = new MockContext(rev6051Dir);
+apply(rev6051Ctx as never, { dataDir: rev6051Dir } as never);
+await sleep(50);
+const rev6051Decision = (id: string, content: string): Record<string, unknown> => ({
+  agent: { id, ctx: rev6051Ctx.agentCtx(id) },
+  messages: [{ role: "user", content, source: { kind: "user" } }],
+});
+const rev6051Live = (id: string) =>
+  rev6051Ctx
+    .agentCtx(id)
+    .contexts.filter((c) => c.name === "memory-plugin:daily-review" && !c.disposed);
+await rev6051Ctx.emit("agent/created", { agent: { id: "s-rev6" } });
+await rev6051Ctx.emit("agent/pre-step", rev6051Decision("s-rev6", "夏柠柒，在吗"));
+await rev6051Ctx.emit("agent/created", { agent: { id: "s-rev6" } });
+await rev6051Ctx.emit("agent/pre-step", rev6051Decision("s-rev6", "夏柠柒，在吗"));
+check("0.5.1 (0.4.5 item 8): yesterday empty and no proposals — still no review", () => {
+  assert.equal(rev6051Live("s-rev6").length, 0, "nothing to review, nothing registered");
+});
+for (const dispose of rev6051Ctx.disposers) dispose();
+
+// 0.5.1 (0.4.3 §四): memory_daily_review checks the prompt
+// whitelist. Fresh fixture (the revCtx one already submitted).
+const rev5051Dir = mkdtempSync(join(tmpdir(), "memory-plugin-051-review-allowlist-"));
+writeFileSync(join(rev5051Dir, "MEMORY.md"), fixtureMemory, "utf8");
+const seed5051Core = new MemoryCore({ dataDir: rev5051Dir });
+const wE1051 = seed5051Core.record({ role: "user", text: "昨天去爬山了", window: "persona", sessionId: "s-rev5", ts: yTs });
+const wE2051 = seed5051Core.record({ role: "assistant", text: "昨天吃了拉面", window: "persona", sessionId: "s-rev5", ts: yTs + 60000 });
+seed5051Core.record({ role: "user", text: "今天要去买菜", window: "persona", sessionId: "s-rev5", ts: Date.now() });
+seed5051Core.flush();
+const rev5051Ctx = new MockContext(rev5051Dir);
+apply(rev5051Ctx as never, { dataDir: rev5051Dir } as never);
+await sleep(50);
+const rev5051Decision = (id: string, content: string): Record<string, unknown> => ({
+  agent: { id, ctx: rev5051Ctx.agentCtx(id) },
+  messages: [{ role: "user", content, source: { kind: "user" } }],
+});
+await rev5051Ctx.emit("agent/created", { agent: { id: "s-rev5" } });
+await rev5051Ctx.emit("agent/pre-step", rev5051Decision("s-rev5", "夏柠柒，在吗"));
+await rev5051Ctx.emit("agent/created", { agent: { id: "s-rev5" } });
+await rev5051Ctx.emit("agent/pre-step", rev5051Decision("s-rev5", "夏柠柒，在吗"));
+const daily5051 = rev5051Ctx.registeredTools.find(
+  (t) => t.name === "memory_daily_review",
+) as unknown as {
+  execute: (args: unknown, exec?: unknown) => Promise<Record<string, unknown>>;
+};
+const rev5051Exec = { agent: { session: { id: "s-rev5" } } };
+const readRev5051Attrs = () =>
+  JSON.parse(readFileSync(join(rev5051Dir, "attributes.json"), "utf8")) as {
+    entries: Record<string, { significance: number; modelMarked?: boolean }>;
+  };
+// Whitelist live: an in-prompt id applies, a made-up one does not.
+const mixed5051 = await daily5051.execute({ ids: [wE1051.id, "made-up-id"] }, rev5051Exec);
+check("0.5.1 (0.4.3 §四): a whitelisted id applies, an out-of-prompt id lands in unknown", () => {
+  assert.equal(mixed5051.ok, true);
+  assert.deepEqual(mixed5051.applied, [wE1051.id]);
+  assert.deepEqual(mixed5051.unknown, ["made-up-id"]);
+  assert.equal(readRev5051Attrs().entries[wE1051.id]?.significance, 0.9, "whitelisted id raised to 0.9");
+});
+// The submit above cleared the whitelist (single-use). An entry
+// recorded AFTER the review registered is in the log but was
+// never in the prompt: the cold-call fallback (yesterday's ids)
+// must still refuse it — the old code would have applied it.
+const late5051 = seed5051Core.record({ role: "user", text: "刚想起来昨天还买了西瓜", window: "persona", sessionId: "s-rev5", ts: Date.now() });
+seed5051Core.flush();
+const lateRes5051 = await daily5051.execute({ ids: [late5051.id] }, rev5051Exec);
+check("0.5.1 (0.4.3 §四): after the whitelist clears, a non-yesterday id still cannot be marked", () => {
+  assert.equal(lateRes5051.ok, true);
+  assert.deepEqual(lateRes5051.applied, []);
+  assert.deepEqual(lateRes5051.unknown, [late5051.id]);
+  assert.notEqual(readRev5051Attrs().entries[late5051.id]?.significance, 0.9, "never shown, never marked");
+});
+// And the fallback still lets a real yesterday id through.
+const fallback5051 = await daily5051.execute({ ids: [wE2051.id] }, rev5051Exec);
+check("0.5.1 (0.4.3 §四): cold call falls back to yesterday's ids", () => {
+  assert.equal(fallback5051.ok, true);
+  assert.deepEqual(fallback5051.applied, [wE2051.id]);
+  assert.equal(readRev5051Attrs().entries[wE2051.id]?.significance, 0.9, "yesterday id applies without a live whitelist");
+});
+for (const dispose of rev5051Ctx.disposers) dispose();
+
+// ---- 0.5.1 expansion: forget / goals / experiences tools,
+// factKey remember, status fields, semantic config fallback ------
+// One section, one dir/context, persona session s-exp.
+const exp051Dir = mkdtempSync(join(tmpdir(), "memory-plugin-051-expansion-"));
+writeFileSync(join(exp051Dir, "MEMORY.md"), fixtureMemory, "utf8");
+const seedExp051 = new MemoryCore({ dataDir: exp051Dir });
+const blueExp051 = seedExp051.record({ role: "user", text: "我最喜欢的颜色是蓝色", window: "persona", sessionId: "s-exp", ts: Date.now() - 60 * 24 * 3600 * 1000, factKey: "最喜欢的颜色" });
+seedExp051.flush();
+const exp051Ctx = new MockContext(exp051Dir);
+apply(exp051Ctx as never, { dataDir: exp051Dir } as never);
+await sleep(50);
+await exp051Ctx.emit("agent/created", { agent: { id: "s-exp" } });
+await exp051Ctx.emit("agent/pre-step", { agent: { id: "s-exp", ctx: exp051Ctx.agentCtx("s-exp") }, messages: [{ role: "user", content: "夏柠柒，在吗", source: { kind: "user" } }] });
+const expExec = { agent: { session: { id: "s-exp" } } };
+const tool051 = (name: string) =>
+  exp051Ctx.registeredTools.find((t) => t.name === name) as unknown as {
+    execute: (args: Record<string, unknown>, exec?: unknown) => Promise<Record<string, unknown>>;
+    deferLoading?: boolean;
+  };
+const forget051 = tool051("memory_forget");
+const goal051 = tool051("memory_goal");
+const expTool051 = tool051("memory_experience");
+const remember051 = tool051("memory_remember");
+const searchExp051 = tool051("memory_search");
+const status051 = tool051("memory_status");
+
+check("0.5.1 exp: all seventeen tools are registered, incl. forget/goal/experience, all three deferLoading", () => {
+  const names = exp051Ctx.registeredTools.map((t) => t.name as string);
+  for (const n of ["memory_forget", "memory_goal", "memory_experience"]) {
+    assert.ok(names.includes(n), `tool ${n} registered`);
+  }
+  assert.equal(names.length, 17, `17 tools total, got ${names.length}: ${names.join(",")}`);
+  for (const n of ["memory_forget", "memory_goal", "memory_experience"]) {
+    assert.equal(tool051(n).deferLoading, true, `${n} has deferLoading`);
+  }
+});
+
+// memory_remember with factKey: the green version supersedes blue.
+const green051 = await remember051.execute(
+  { text: "我现在最喜欢的颜色是绿色，早就不是蓝色了", importance: "light", factKey: "最喜欢的颜色", supersedes: blueExp051.id },
+  expExec,
+);
+check("0.5.1 exp item 1: memory_remember takes factKey/supersedes", () => {
+  assert.equal(green051.ok, true, `remember with factKey works: ${JSON.stringify(green051)}`);
+  assert.ok(typeof green051.id === "string", "new version has an id");
+});
+const nowSearch051 = (await searchExp051.execute({ query: "她现在最喜欢什么颜色", limit: 5 }, expExec)) as unknown as { hits: Array<{ id: string; text: string }> };
+check("0.5.1 exp item 1: memory_search answers '现在' with the current version first", () => {
+  assert.ok(nowSearch051.hits.length >= 1, "hits come back");
+  assert.equal(nowSearch051.hits[0].text, "我现在最喜欢的颜色是绿色，早就不是蓝色了", "current green first");
+});
+const histSearch051 = (await searchExp051.execute({ query: "她以前最喜欢什么颜色", limit: 5 }, expExec)) as unknown as { hits: Array<{ id: string; text: string }> };
+check("0.5.1 exp item 1: memory_search answers '以前' with the old version first", () => {
+  assert.ok(histSearch051.hits.length >= 1, "hits come back");
+  assert.equal(histSearch051.hits[0].text, "我最喜欢的颜色是蓝色", "old blue first for a history question");
+});
+
+// memory_forget: request + dry-run + list; no approve/execute.
+const dry051 = (await forget051.execute({ action: "dry-run", entryIds: [blueExp051.id] }, expExec)) as unknown as { ok: boolean; preview: { entries: Array<{ id: string }> } };
+check("0.5.1 exp item 1: memory_forget dry-run previews without changing anything", () => {
+  assert.equal(dry051.ok, true, "dry-run works");
+  assert.equal(dry051.preview.entries.length, 1, "dry-run previews the entry");
+  assert.equal(dry051.preview.entries[0].id, blueExp051.id, "dry-run names the entry");
+});
+const req051 = (await forget051.execute({ action: "request", mode: "hide", entryIds: [blueExp051.id], reason: "mock 测试" }, expExec)) as unknown as { ok: boolean; requestId: string; status: string; note: string };
+check("0.5.1 exp item 1: memory_forget request files a pending request and says chat agreement does not count", () => {
+  assert.equal(req051.ok, true, "request works");
+  assert.equal(req051.status, "pending", "request starts pending");
+  assert.ok(typeof req051.requestId === "string", "request has an id");
+  assert.ok((req051.note ?? "").includes("我同意"), "note says chat agreement does not count");
+});
+const list051 = (await forget051.execute({ action: "list" }, expExec)) as unknown as { ok: boolean; requests: Array<{ id: string; status: string }> };
+check("0.5.1 exp item 1: memory_forget list shows the pending request, and the entry is still recallable", () => {
+  assert.equal(list051.ok, true, "list works");
+  assert.ok(list051.requests.some((r) => r.id === req051.requestId && r.status === "pending"), "pending request listed");
+});
+const noApprove051 = (await forget051.execute({ action: "approve", entryIds: [blueExp051.id] }, expExec)) as unknown as { ok: boolean; error: string };
+check("0.5.1 exp item 1: memory_forget has NO approve/execute action", () => {
+  assert.equal(noApprove051.ok, false, "approve is not an action");
+  assert.ok((noApprove051.error ?? "").includes("request / dry-run / list"), `refusal names the allowed actions: ${noApprove051.error}`);
+});
+const stillThere051 = (await searchExp051.execute({ query: "蓝色", limit: 5 }, expExec)) as unknown as { hits: Array<{ id: string }> };
+check("0.5.1 exp item 1: a filed request hides nothing until the admin approves", () => {
+  assert.ok(stillThere051.hits.some((h) => h.id === blueExp051.id), "entry still surfaces after request");
+});
+
+// memory_goal: create / list / complete / reopen / get / drop.
+const goalCreate051 = (await goal051.execute({ action: "create", title: "增肌到 130 斤", notes: "每周称体重" }, expExec)) as unknown as { ok: boolean; goal: { id: string; status: string } };
+check("0.5.1 exp item 5: memory_goal create works", () => {
+  assert.equal(goalCreate051.ok, true, "create works");
+  assert.equal(goalCreate051.goal.status, "open", "a goal starts open");
+});
+const goalList051 = (await goal051.execute({ action: "list" }, expExec)) as unknown as { ok: boolean; goals: Array<{ id: string; status: string }> };
+check("0.5.1 exp item 5: memory_goal list shows the open goal", () => {
+  assert.equal(goalList051.ok, true, "list works");
+  assert.ok(goalList051.goals.some((g) => g.id === goalCreate051.goal.id && g.status === "open"), "open goal listed");
+});
+const goalDone051 = (await goal051.execute({ action: "complete", goalId: goalCreate051.goal.id }, expExec)) as unknown as { ok: boolean; goal: { status: string } };
+check("0.5.1 exp item 5: memory_goal complete marks it done", () => {
+  assert.equal(goalDone051.ok, true, "complete works");
+  assert.equal(goalDone051.goal.status, "done", "status is done");
+});
+const goalReopen051 = (await goal051.execute({ action: "reopen", goalId: goalCreate051.goal.id }, expExec)) as unknown as { ok: boolean; goal: { status: string } };
+check("0.5.1 exp item 5: memory_goal reopen brings it back to open", () => {
+  assert.equal(goalReopen051.ok, true, "reopen works");
+  assert.equal(goalReopen051.goal.status, "open", "status is open again");
+});
+const goalGet051 = (await goal051.execute({ action: "get", goalId: goalCreate051.goal.id }, expExec)) as unknown as { ok: boolean; goal: { title: string } };
+check("0.5.1 exp item 5: memory_goal get reads it back", () => {
+  assert.equal(goalGet051.ok, true, "get works");
+  assert.equal(goalGet051.goal.title, "增肌到 130 斤", "title round-trips");
+});
+
+// memory_experience: add / list / match.
+const expAdd051 = (await expTool051.execute({ action: "add", rule: "测试规矩：问颜色只答当前版", trigger: ["颜色"], source: "mock 测试", sourceIds: [blueExp051.id] }, expExec)) as unknown as { ok: boolean; experience: { id: string; verified: boolean } };
+check("0.5.1 exp item 4: memory_experience add works", () => {
+  assert.equal(expAdd051.ok, true, "add works");
+  assert.ok(typeof expAdd051.experience.id === "string", "experience has an id");
+  assert.equal(expAdd051.experience.verified, false, "a new rule is a candidate, not verified");
+});
+const expConfirm051 = (await expTool051.execute({ action: "confirm", id: expAdd051.experience.id }, expExec)) as unknown as { ok: boolean; error?: string };
+check("0.5.4 exp: the model tool cannot confirm its own rule", () => {
+  assert.equal(expConfirm051.ok, false, "confirm is refused");
+  assert.ok(
+    (expConfirm051.error ?? "").includes("只能由用户"),
+    "the refusal names the CLI/API channel",
+  );
+});
+const expList051 = (await expTool051.execute({ action: "list" }, expExec)) as unknown as { ok: boolean; experiences: Array<{ id: string }> };
+check("0.5.1 exp item 4: memory_experience list includes the new rule (empty store, no seeds)", () => {
+  assert.equal(expList051.ok, true, "list works");
+  assert.ok(expList051.experiences.length >= 1, `at least 1 experience, got ${expList051.experiences.length}`);
+  assert.ok(expList051.experiences.some((e) => e.id === expAdd051.experience.id), "new rule listed");
+});
+const expMatch051 = (await expTool051.execute({ action: "match", query: "她现在最喜欢什么颜色" }, expExec)) as unknown as { ok: boolean; matched: Array<{ rule: string }> };
+check("0.5.1 exp item 4: memory_experience match finds the rule by trigger", () => {
+  assert.equal(expMatch051.ok, true, "match works");
+  assert.ok(expMatch051.matched.some((m) => m.rule === "测试规矩：问颜色只答当前版"), "rule matches the colour question");
+});
+
+// memory_status carries the new fields.
+const statusExp051 = (await status051.execute({}, expExec)) as unknown as {
+  ok: boolean;
+  openGoals: number;
+  doneGoals: number;
+  pendingForgets: number;
+  semantic: { enabled: boolean; modelPresent: boolean; indexSize: number };
+};
+check("0.5.1 exp: memory_status reports openGoals, doneGoals, pendingForgets and semantic", () => {
+  assert.equal(statusExp051.ok, true, "status works");
+  assert.equal(statusExp051.openGoals, 1, "one open goal");
+  assert.equal(statusExp051.doneGoals, 0, "no done goals (reopened)");
+  assert.equal(statusExp051.pendingForgets, 1, "one pending forget request");
+  assert.equal(statusExp051.semantic.enabled, false, "semantic off by default");
+  assert.equal(
+    statusExp051.semantic.modelPresent,
+    existsSync(join(process.cwd(), "models", "bge-small-zh-v1.5", "config.json")),
+    "modelPresent reflects whether this package variant bundles the model",
+  );
+});
+
+// The three new tools refuse in a task window.
+const taskExec051 = { agent: { session: { id: "s-never-triggered" } } };
+const taskRefusals051 = [] as Array<{ ok: boolean; error: string }>;
+for (const [tool, args] of [
+  [forget051, { action: "list" }],
+  [goal051, { action: "list" }],
+  [expTool051, { action: "list" }],
+] as const) {
+  taskRefusals051.push((await tool.execute(args, taskExec051)) as unknown as { ok: boolean; error: string });
+}
+check("0.5.1 exp: forget/goal/experience refuse in a task window", () => {
+  for (const res of taskRefusals051) {
+    assert.equal(res.ok, false, "task window refused");
+    assert.ok((res.error ?? "").includes("人设窗口"), `refusal names the persona window: ${res.error}`);
+  }
+});
+for (const dispose of exp051Ctx.disposers) dispose();
+
+// 0.5.1 exp item 2: semantic enabled but the model missing —
+// apply must not crash, search stays keyword-only, status says so.
+const sem051Dir = mkdtempSync(join(tmpdir(), "memory-plugin-051-semantic-fallback-"));
+writeFileSync(join(sem051Dir, "MEMORY.md"), fixtureMemory, "utf8");
+const seedSem051 = new MemoryCore({ dataDir: sem051Dir });
+const plumSem051 = seedSem051.record({ role: "user", text: "我最喜欢喝酸梅汤，夏天一定要冰的", window: "persona", sessionId: "s-sem" });
+seedSem051.flush();
+const sem051Ctx = new MockContext(sem051Dir);
+apply(sem051Ctx as never, {
+  dataDir: sem051Dir,
+  semanticRecall: { enabled: true, modelDir: join(sem051Dir, "models", "bge-small-zh-v1.5") },
+} as never);
+await sleep(50);
+const semSearch051 = sem051Ctx.registeredTools.find(
+  (t) => t.name === "memory_search",
+) as unknown as {
+  execute: (args: Record<string, unknown>, exec?: unknown) => Promise<{ hits: Array<{ id: string }> }>;
+};
+const semStatus051 = sem051Ctx.registeredTools.find(
+  (t) => t.name === "memory_status",
+) as unknown as {
+  execute: (args: Record<string, unknown>, exec?: unknown) => Promise<Record<string, unknown>>;
+};
+const semSearchRes051 = await semSearch051.execute({ query: "酸梅汤", limit: 5 });
+check("0.5.1 exp item 2: semantic enabled with a missing model still searches keyword-only", () => {
+  assert.ok(semSearchRes051.hits.some((h) => h.id === plumSem051.id), "keyword hit still surfaces with the model missing");
+});
+const semStatusRes051 = await semStatus051.execute({});
+check("0.5.1 exp item 2: memory_status reports semantic enabled but no model present", () => {
+  const sem = semStatusRes051.semantic as { enabled: boolean; modelPresent: boolean; indexSize: number };
+  assert.equal(sem.enabled, true, "enabled is true from config");
+  assert.equal(sem.modelPresent, false, "modelPresent is false — the dir is empty");
+  assert.equal(sem.indexSize, 0, "no index was built");
+});
+for (const dispose of sem051Ctx.disposers) dispose();
+
+// 0.5.1 exp item 2: HybridRetriever with a mock semantic
+// retriever (no model) — the fusion itself, at the provider
+// level: a semantic-only hit surfaces, scored by similarity.
+{
+  const hyCore = new MemoryCore({ dataDir: mkdtempSync(join(tmpdir(), "memory-plugin-051-hybrid-")) });
+  const plumHy = hyCore.record({ role: "user", text: "我最喜欢喝酸梅汤，夏天一定要冰的", window: "persona", sessionId: "s-hy" });
+  hyCore.record({ role: "user", text: "我不喝咖啡，喝了心慌", window: "persona", sessionId: "s-hy" });
+  const entries = hyCore.allEntries();
+  const mockRetriever = {
+    kind: "semantic" as const,
+    retrieveIds: () => [plumHy.id],
+    similarityOf: (id: string) => (id === plumHy.id ? 0.9 : undefined),
+  };
+  const hybrid = new HybridRetriever(mockRetriever);
+  const kwOnly = hybrid.retrieve("她爱喝的那种甜饮料叫什么", entries, null, { window: "persona", limit: 5, tokenCap: 1500 });
+  check("0.5.1 exp item 2: HybridRetriever with a mock semantic retriever surfaces the semantic-only hit first", () => {
+    assert.ok(kwOnly.hits.some((h) => h.entry.id === plumHy.id), "semantic-only hit surfaces");
+    assert.equal(kwOnly.hits[0].entry.id, plumHy.id, "it ranks first on similarity 0.9");
+  });
+  const noSim = new HybridRetriever({
+    kind: "semantic" as const,
+    retrieveIds: () => [plumHy.id],
+  });
+  const noSimRes = noSim.retrieve("她爱喝的那种甜饮料叫什么", entries, null, { window: "persona", limit: 5, tokenCap: 1500 });
+  check("0.5.1 exp item 2: a semantic retriever without similarities scores its hits 0", () => {
+    assert.ok(noSimRes.hits.some((h) => h.entry.id === plumHy.id), "the hit still surfaces (valve off)");
+    assert.equal(noSimRes.hits.find((h) => h.entry.id === plumHy.id)?.score, 0, "no similarity means score 0");
+  });
+}
+
+// ---- DSH output contract (regression for the 0.5.5 real-DSH bugs) ----
+// Real DSH calls output.render(args, value); a one-param render used to
+// render the CALL ARGUMENTS as the tool result. The mock suite never
+// called render, so 0.5.5 passed 219 checks and still broke on real DSH.
+check("DSH contract: render(args, value) renders the result, not the call args", () => {
+  for (const t of ctx.registeredTools) {
+    const out = t.output as {
+      render?: (args: unknown, value: unknown) => unknown;
+    };
+    assert.equal(typeof out.render, "function", `${t.name} declares render`);
+    assert.ok(
+      (out.render as unknown as { length: number }).length >= 2,
+      `${t.name} render takes (args, value)`,
+    );
+    const rendered = JSON.stringify(
+      out.render!({ __probe: "ARGS" }, { marker: "VALUE" }),
+    );
+    assert.ok(rendered.includes("VALUE"), `${t.name} renders the value`);
+    assert.ok(!rendered.includes("__probe"), `${t.name} never renders the args`);
+  }
+});
+
+// Free-form output objects (beliefDimensions, semantic, ...) must stay
+// open: DSH closes every object with additionalProperties:false, and a
+// closed free-form object rejects every key at output validation time
+// (0.5.5 memory_status: INVALID_TOOL_OUTPUT on real DSH).
+function assertOpenObjectSchemas(node: unknown, path: string): void {
+  if (Array.isArray(node)) {
+    node.forEach((child, i) =>
+      assertOpenObjectSchemas(child, `${path}[${i}]`),
+    );
+    return;
+  }
+  if (typeof node !== "object" || node === null) return;
+  const schema = node as Record<string, unknown>;
+  if (schema.type === "object" && schema.properties === undefined) {
+    assert.equal(
+      schema.additionalProperties,
+      true,
+      `${path} free-form object must stay open`,
+    );
+  }
+  for (const [key, child] of Object.entries(schema)) {
+    assertOpenObjectSchemas(child, `${path}.${key}`);
+  }
+}
+check("DSH contract: free-form output objects stay open", () => {
+  for (const t of ctx.registeredTools) {
+    const out = t.output as { schema?: unknown };
+    assertOpenObjectSchemas(out.schema, String(t.name));
+  }
 });
 
 console.log(`\nALL PASS (data dir: ${dir})`);

@@ -30,7 +30,7 @@ import { monthKey } from "./dates.ts";
 import type { MemoryGraph } from "./graph.ts";
 import type { KeywordIndex } from "./keyword-index.ts";
 import { formatDate } from "./dates.ts";
-import { tokenize } from "./tokenize.ts";
+import { CJK_SINGLE_STOP, tokenize } from "./tokenize.ts";
 import { buildReflectionPrompt, reflectionGate } from "./reflection.ts";
 import { buildProactPrompt } from "./loop.ts";
 import type {
@@ -100,6 +100,7 @@ export function defaultReviewState(): ReviewState {
       promoted: 0,
       compressed: 0,
       edgesAdded: 0,
+      edgesUpgraded: 0,
       entries: 0,
     },
   };
@@ -128,12 +129,52 @@ function saveReviewState(dataDir: string, state: ReviewState): void {
   atomicWriteText(join(dataDir, REVIEW_FILE), JSON.stringify(state));
 }
 
+/** 0.5.1 (0.4.3 item 13): what counts as a review topic token.
+ *  Without a segmenter, tokenize() emits every overlapping bigram
+ *  of a CJK run — including garbage that straddles a word boundary
+ *  ("把这" from 把这件事, "不到" from 不到明天) and aspect /
+ *  particle bigrams ("吃完" from 吃完饭). A topic must be 2+
+ *  chars, not a common word, and contain no stop character
+ *  (CJK_SINGLE_STOP) and none of the function / aspect characters
+ *  below (把/被/给/对/向/从/到/中/里/外/前/后/时/只/条/件/种/
+ *  样/完/着/过/得/地). Latin words pass through (they carry no
+ *  stop chars). Honest limit: without a real segmenter a
+ *  cross-boundary bigram whose two chars are both content chars
+ *  cannot be fully detected — the filter kills the reported cases
+ *  (把这/不到/吃完) and every bigram of the same shape, not every
+ *  possible garbage bigram. Shared by the fragment and belief
+ *  candidate blocks below. */
+const REVIEW_TOPIC_EXTRA_STOP = new Set([
+  "把", "被", "给", "对", "向", "从", "到", "中", "里", "外", "前",
+  "后", "时", "只", "条", "件", "种", "样", "完", "着", "过",
+  "得", "地",
+]);
+
+export function isReviewTopicToken(t: string): boolean {
+  if (typeof t !== "string" || t.length < 2) return false;
+  if (COMMON_TOKENS.has(t)) return false;
+  for (const ch of t) {
+    if (CJK_SINGLE_STOP.has(ch) || REVIEW_TOPIC_EXTRA_STOP.has(ch)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** Read every summary-YYYY-MM.jsonl into entryId -> one-line summary.
- *  Torn lines are skipped, like the log. */
+ *  Torn lines are skipped, like the log. A directory that cannot
+ *  be listed at all (0.5.1 §四: the readdirSync used to throw
+ *  uncaught) returns an empty map instead of breaking the review. */
 export function loadSummaries(dataDir: string): Map<string, string> {
   const out = new Map<string, string>();
   if (!existsSync(dataDir)) return out;
-  for (const name of readdirSync(dataDir)) {
+  let names: string[];
+  try {
+    names = readdirSync(dataDir);
+  } catch {
+    return out;
+  }
+  for (const name of names) {
     if (!/^summary-\d{4}-\d{2}\.jsonl$/.test(name)) continue;
     let raw: string;
     try {
@@ -158,7 +199,7 @@ export function loadSummaries(dataDir: string): Map<string, string> {
 
 function appendSummary(dataDir: string, row: CompressedSummary): void {
   const file = join(dataDir, `summary-${row.month}.jsonl`);
-  const fd = openSync(file, "a");
+  const fd = openSync(file, "a", 0o600);
   try {
     appendFileSync(fd, `${JSON.stringify(row)}\n`, "utf8");
     fsyncSync(fd);
@@ -227,6 +268,10 @@ export function runReview(input: ReviewInput): ReviewResult {
     }
   }
   const edgesAdded = input.graph.backfill(input.entries, input.index, now);
+  // 0.5.1 (0.4.5 item 7): backfill upgrades session edges to
+  // keyword edges in place — those are not new edges, but the
+  // summary used to say nothing about them at all.
+  const edgesUpgraded = input.graph.lastBackfillUpgraded;
   input.graph.decay(now);
   // 0.3.0: propose fragment clusters — groups of 2+ entries sharing
   // a rare topic token (document frequency 2..5), none of them
@@ -248,7 +293,7 @@ export function runReview(input: ReviewInput): ReviewResult {
       if (entry.window !== "persona") continue;
       if (alreadyFragmented.has(entry.id)) continue;
       for (const token of new Set(
-        tokenize(entry.text).filter((t) => t.length >= 2),
+        tokenize(entry.text).filter(isReviewTopicToken),
       )) {
         const list = df.get(token) ?? [];
         list.push(entry.id);
@@ -292,7 +337,7 @@ export function runReview(input: ReviewInput): ReviewResult {
       if (entry.window !== "persona") continue;
       if (alreadyBelieved.has(entry.id)) continue;
       for (const token of new Set(
-        tokenize(entry.text).filter((t) => t.length >= 2),
+        tokenize(entry.text).filter(isReviewTopicToken),
       )) {
         const list = df.get(token) ?? [];
         list.push(entry.id);
@@ -320,6 +365,7 @@ export function runReview(input: ReviewInput): ReviewResult {
     `${formatDate(now)} 复盘：共 ${input.entries.length} 条记忆；` +
     `${decayed} 条清晰度衰减；${promoted} 条提了上去；` +
     `${compressed} 条旧记忆压成一行；新连 ${edgesAdded} 条线。` +
+    (edgesUpgraded > 0 ? `（另有 ${edgesUpgraded} 条边升级。）` : "") +
     (fragmentCandidates.length > 0
       ? `${fragmentCandidates.length} 组可提炼成片段。`
       : "") +
@@ -500,6 +546,7 @@ export function runReview(input: ReviewInput): ReviewResult {
       promoted,
       compressed,
       edgesAdded,
+      edgesUpgraded,
       entries: input.entries.length,
     },
   };

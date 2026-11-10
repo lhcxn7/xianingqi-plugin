@@ -19,7 +19,9 @@ const WORD_RUN = /[a-z0-9]+(?:[.'-][a-z0-9]+)*/g;
 // therefore never emitted as single-character tokens — but they still
 // match through bigrams and whole runs, so "不许忘" and "怎么说"
 // keep working. Content characters (汤、琴、岗、查…) are unaffected.
-const CJK_SINGLE_STOP = new Set([
+// Exported (0.5.1 item 13) for the review topic filter, which needs
+// the same stop set.
+export const CJK_SINGLE_STOP = new Set([
   "的", "了", "在", "是", "有", "和", "就", "都", "也", "还",
   "不", "没", "很", "这", "那", "我", "你", "他", "她", "它", "们",
   "个", "一", "上", "下", "来", "去", "吗", "呢", "吧", "啊", "哦",

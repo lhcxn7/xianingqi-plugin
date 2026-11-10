@@ -23,7 +23,7 @@ asking her to go look.
 
 ## Requirements
 
-- DSH `0.2.1-rc.5 || >=0.2.0 <0.3.0` (verified on 0.2.1-rc.5).
+- DSH `0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.0 <0.3.0` (verified on 0.2.1-rc.5; 0.2.2-rc.1 is in range but not yet smoke-tested).
 - Node `^22.19.0 || >=24.0.0`.
 - No build step: the plugin runs TypeScript directly (erasable syntax
   only), so a GitHub install works without `tsc` or `prepare`.
@@ -37,7 +37,7 @@ install the `dsh-plugin/` folder alone.
 ### Option A — one line (DSH plugin command)
 
 ```sh
-dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v0.4.8&path:/memory-plugin/dsh-plugin"
+dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v0.5.1&path:/memory-plugin/dsh-plugin"
 ```
 
 Replace `<name>` with your DSH profile name (often `web` or
@@ -60,7 +60,7 @@ Paste this into your own DSH agent and let it do the work. It installs
 the plugin; you restart DSH by hand afterwards.
 
 > 帮我装一个 DSH 记忆插件：从 GitHub 把 lhcxn7/xianingqi-plugin
-> 这个仓库的 v0.4.8 版装进来（我的 profile 是 <你的 profile 名>）。
+> 这个仓库的 v0.5.1 版装进来（我的 profile 是 <你的 profile 名>）。
 > 插件在仓库的 memory-plugin/dsh-plugin 子目录，core 在 memory-plugin/core 目录，两个目录
 > 必须在一起，装的时候别只拷 dsh-plugin 一个目录。装完告诉我
 > 结果，报错原文发我；装好后我自己重启 DSH。我的记忆数据文件夹
@@ -110,12 +110,142 @@ memory-plugin/
                         # memory_snapshot/memory_restore/memory_status/
                         # memory_starmap tools
     src/                # apply(ctx), trigger-based session tracking
+    models/             # bge-small-zh-v1.5 ONNX int8 files; bundled
+                        # here so a DSH install carries them (see
+                        # MODELS.md; <dataDir>/models/ overrides)
     test/mock-test.ts   # mock-DSH test, no real DSH needed
   mcp-server/           # DEFERRED (DSH first, per user decision)
+  MODELS.md             # model list, sizes, sha256, pinned revision
+  LOCAL-EMBEDDING.md    # how local semantic recall works (0.5.4)
 ```
 
 ## Status
 
+- [x] 0.5.5 (2026-11-10) — the three local-only fixes:
+      (1) `composeInjection` enforces ONE total token budget across
+      profile + hits + belief + experience, trimming experience →
+      belief → hits → profile; (2) fact chains are validated as a
+      version DAG (missing targets, branches, cycles, multiple
+      currents), and an invalid chain contributes no ranking factor;
+      (3) Experience governance: CLI/API-only confirm, revoke,
+      optional expiry, and triggers shorter than 2 chars / single-char
+      token overlaps no longer fire. Model stays bundled and automatic;
+      these three need no real DSH/BGE to verify.
+- [x] 0.5.4 (2026-11-10) — fixes the two external 0.5.3 reviews:
+      Admin CLI now prints the bearer token (`--token` supported);
+      Experience `confirm` is CLI/API-only (the model tool refuses)
+      and records `confirmedBy/confirmedAt`; Goal/Experience writes
+      run through Core's write lock; delete snapshots include
+      `forgotten.json` / `forget-requests.json`, and a failed recovery
+      keeps the journal; snapshots include `experiences.json` /
+      `goals.json` and restore revalidates their sources; the model is
+      bundled under `dsh-plugin/models/` and found automatically (no
+      manual copy), with `<dataDir>/models/` as override; nomodel
+      install docs distinguish the two package variants.
+- [x] 0.5.3 (2026-11-10) — closes the remaining audit P1/P2 items:
+      delete now writes an operation journal (prepared/committing →
+      committed) and a restart rolls an interrupted delete back to its
+      pre-delete snapshot; the optional embedding runtime resolves from
+      `<dataDir>/node_modules` (`npm install --prefix <dataDir>`), not
+      only from `core/`; Experience rules require live persona
+      `sourceIds` and only inject after `confirm`; `memory_forget
+      dry-run` discloses `MEMORY.md` / month-archive copies and an
+      opt-in `purgeSkillFiles` removes exact lines with a backup;
+      admin HTTP API now requires a bearer token; JSONL middle corrupt
+      lines warn; review excludes task entries; Goal/Experience CLI+API
+      validation is shared.
+- [x] 0.5.2 (2026-11-10) — fixes for the 0.5.1 audit: unified hidden
+      filtering (recall, review, proact, reflection gate, starmap,
+      fragment/belief/reflection sources), fail-closed tombstone load,
+      owner-only log/data permissions on POSIX, restore now removes
+      plugin-owned files absent from the snapshot and drops the
+      semantic index/pending gate, no developer `Experience` seeds,
+      `memory_search` refuses a task-window caller, `Goal.update`
+      validates `dueAt`/`notes`/`sourceIds`, `editEntry` refreshes the
+      vector, and the semantic index is cleared on rebuild and
+      filtered before top-N. Test portability: Windows-safe mode
+      assertions + a type shim for the optional embedding runtime.
+- [x] 0.5.1 (2026-11-10) — review fixes from the 0.4.3 and 0.4.5
+      reviews. Persona windows only, all the way down: `memory_search`
+      now defaults to `window: "persona"` (a task-window log entry
+      never surfaces in a persona search), `memory_restore` refuses in
+      a task window, fragments can only be built from persona sources
+      (`createFragment` checks the source window), and a model review
+      submit is checked against the ids actually shown in the review
+      prompt (whitelist, capped at 60, single-use; a cold call falls
+      back to yesterday's ids). `memory_snapshot` is deliberately
+      ungated — it only copies files and changes no memory. Corrupt
+      stores are backed up (`.corrupt-<ts>`), warned, and never
+      silently emptied; `beliefs.json` joins the snapshot whitelist.
+      Cross-process writes no longer clobber each other: the stale
+      check now fingerprints every store file (mtime + size), not just
+      the log. Recall: weak single tokens are dropped only when no
+      strong token anchors the hit, and multi-token scores are
+      rarity-weighted; benchmark no-evidence false positives fall from
+      0.5 to 0.167 with Recall@5 0.8 and MRR 0.683 unchanged
+      (`--rewrite`: 1.0 / 0.956). Fragments: case-insensitive source
+      compare, quotes ≥ 4 chars sharing a real word with the text,
+      negation polarity is checked (`我没有生气` → `我生气了` is
+      refused). Beliefs: `support` dedupes by entry id
+      (`duplicate: true`) and `uncertainty = 0.8 / (1 + proofCount)`.
+      Review: topic tokens reuse the shared stop lists, the summary
+      counts upgraded edges, the early exit is "yesterday empty AND
+      no proposals", over-large first entries are truncated to the
+      8000-char budget, and `pendingInvalidationChecks` now reads
+      "awaiting the next review". Small items: `deferLoading: true`
+      on belief/reflect/proact, one hit caps at ~400 chars, newlines
+      are flattened out of review prompts and proact text,
+      `loadSummaries` catches a missing dir, the lock records host +
+      start time and the arbiter goes stale after 1 s, atomic writes
+      are 0o600 with temp cleanup at startup, the starmap backfills a
+      missing date from the timestamp, `belief id` is the max suffix
+      + 1, reflections cap at 1000 chars / 200 rows, `yesterday`
+      is a calendar day, and a MIT `LICENSE` is included. Tests: core
+      233 PASS, mock 194 PASS, `tsc` 0 errors.
+- [x] 0.5.1 expansion (2026-11-10, same version, no split) —
+      everything except multi-space isolation, multimodality
+      (image/voice/video) and MCP, which are explicitly not done.
+      **Fact version chain + forgetting:** `factKey` / `supersedes`
+      (0.6.0's content, pulled forward) — "现在" answers the current
+      version, "以前" the old one, q15 美式 rank 4 → 1 (benchmark
+      MRR 0.683 → 0.733, `--rewrite` 0.956 → 1.0, conflict class
+      MRR 1.0). Forgetting is governed, never a chat line:
+      request (7-day TTL) → approve on a non-model channel
+      (CLI / local API) → execute (hide tombstone / delete with
+      snapshot first + audit); `memory_forget` has no approve /
+      execute action. **Local embedding:** bge-small-zh-v1.5
+      (ONNX int8, pinned revision, ~23.3 MiB in the package under
+      `models/`, see `MODELS.md`), default off, timeout falls back
+      to keyword-only, semantic-only hits score by similarity × 4
+      with a measured 0.5 floor — synonym Recall@5 0.625 → 0.875,
+      MRR 0.500 → 0.667, false positives 1/6 (see
+      `LOCAL-EMBEDDING.md`). **Admin centre:** CLI + localhost-only
+      HTTP API (view / edit / correct / delete, forget workflow,
+      goals, experiences, semantic status/rebuild); no web UI yet.
+      **Experience learning:** rules from mistakes, matched and
+      injected as `经验：` rows. **Goals/todos:** model-readable and
+      writable with completion status. Seventeen tools total.
+      Tests after the expansion: core 248 PASS, mock 217 PASS,
+      `tsc` 0 errors. Still unverified: `deferLoading` on real
+      DSH, the rewrite model, semantic on real DSH, and a
+      real-DSH install of 0.4.8 or later.
+- [x] 0.5.0 (2026-11-10) — five-step release: an honest benchmark set,
+      the record-side split, provenance / trust, the 14th tool
+      (`memory_feedback`), and query-rewrite hybrid recall. Embedding
+      stays out of scope — no model file ships. Provenance is
+      code-computed from source type + verification count; pre-0.5.0
+      rows load as `legacy` / `confidence: null`, never forged.
+      `memory_search` hits carry all seven provenance fields.
+      Benchmark: keyword-only coverage 0.923 / Recall@5 0.8 / MRR
+      0.683 / no-evidence FP 0.5 / 62.6 injected tokens; the
+      `--rewrite` stub reaches 1.0 / 0.922 but proves the pipeline
+      only (emptying the stub table falls back to 0.8 / 0.5).
+      Fixes: action word + memory object (`更新一下记忆`,
+      `删除这条记忆`) no longer marks a persona session; `irrelevant`
+      stops halving significance after two calls; legacy fragments no
+      longer gain a verifyCount from recall; the rewrite timeout is
+      cleared; lock files say 0.5.0; `engines.dsh` also lists
+      `0.2.2-rc.1`.
 - [x] 0.4.8 (2026-11-10) — fixes the Codex real-environment
       finding: with dependencies installed, the tool compiler
       rejected the tool schemas (`required: false` in parameters,

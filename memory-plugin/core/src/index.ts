@@ -1,7 +1,12 @@
 // @memory-plugin/core — public surface.
 
 export { MemoryCore } from "./core.ts";
-export type { PrepareProactPromptResult, RecordInput } from "./core.ts";
+export type {
+  FeedbackKind,
+  FeedbackResult,
+  PrepareProactPromptResult,
+  RecordInput,
+} from "./core.ts";
 export { MemoryFile, parseArchiveText, parseMemoryText } from "./memory-file.ts";
 export { KeywordIndex, fingerprintLogFiles, fingerprintsEqual } from "./keyword-index.ts";
 export { AppendLog } from "./log.ts";
@@ -27,10 +32,12 @@ export {
 export {
   DEFAULT_TOKEN_CAP,
   formatLayer1,
+  composeInjection,
   formatProfileBlock,
   formatRecallBlock,
   invalidateEntries,
   isExpired,
+  matchTokensFor,
   memoryDedupeTexts,
   normalizeForDedupe,
   recallFromEntries,
@@ -38,6 +45,97 @@ export {
   selectSpotlightCandidates,
 } from "./recall.ts";
 export type { RecallOptions } from "./recall.ts";
+// 0.5.0 step 3: 来源 / 可信度 — the model proposes the source
+// type, the code computes the confidence and checks the sources
+// exist; legacy rows read as unknown, never forged.
+export {
+  MODEL_SOURCE_TYPES,
+  PROVENANCE_BASE_CONFIDENCE,
+  SOURCE_TYPE_CN,
+  confidenceFactor,
+  confidenceFor,
+  entryProvenance,
+  isSourceType,
+  legacyProvenance,
+  newProvenance,
+  normalizeProvenance,
+  validateSourceIds,
+} from "./provenance.ts";
+export type { Provenance, SourceType } from "./provenance.ts";
+// 0.5.0 step 5: retrieval providers — KeywordRetriever is the
+// default (the existing keyword path, unchanged); SemanticRetriever
+// is the slot the real embedding provider plugs into (0.5.1 item
+// 2: core/src/semantic.ts); HybridRetriever merges keyword +
+// semantic into the same ranking.
+export {
+  HybridRetriever,
+  KeywordRetriever,
+  defaultRetriever,
+} from "./retrieval.ts";
+export type {
+  RetrievalProvider,
+  SemanticRetriever,
+} from "./retrieval.ts";
+// 0.5.1 item 1: fact version chain + forgetting governance.
+export {
+  HISTORY_QUERY_WORDS,
+  currentVersionOf,
+  factChains,
+  factVersionFactor,
+  isHistoryQuery,
+  isSuperseded,
+} from "./facts.ts";
+export type { FactVersion } from "./facts.ts";
+export {
+  FORGET_REQUEST_TTL_MS,
+  ForgetStore,
+  buildForgetPreview,
+} from "./forget.ts";
+export type {
+  ForgetChannel,
+  ForgetMode,
+  ForgetPreview,
+  ForgetRequest,
+  ForgetStatus,
+} from "./forget.ts";
+// 0.5.1 item 2: local embedding (bge-small-zh-v1.5, ONNX int8).
+export {
+  SEMANTIC_DEFAULT_MAX_CANDIDATES,
+  SEMANTIC_DEFAULT_MIN_SIMILARITY,
+  SEMANTIC_DEFAULT_TIMEOUT_MS,
+  SEMANTIC_DIMENSIONS,
+  SEMANTIC_DTYPE,
+  SEMANTIC_INDEX_FILE,
+  SEMANTIC_INDEX_VERSION,
+  SEMANTIC_MODEL_ID,
+  SEMANTIC_MODEL_REVISION,
+  SEMANTIC_POOLING,
+  SEMANTIC_QUERY_PREFIX,
+  SemanticIndex,
+  SemanticSearcher,
+  TransformersEmbeddingProvider,
+  buildSemanticIndex,
+  cosineSimilarity,
+  normalizeVector,
+  semanticCandidateIds,
+} from "./semantic.ts";
+export type {
+  EmbeddingProvider,
+  SemanticIndexJson,
+  SemanticIndexLoadStatus,
+  SemanticRetriever as SemanticRetrieverAsync,
+} from "./semantic.ts";
+// 0.5.1 item 4: experience learning.
+export { ExperienceStore } from "./experiences.ts";
+export type { Experience, MatchedExperience } from "./experiences.ts";
+// 0.5.1 item 5: goals / todos.
+export { GoalStore } from "./goals.ts";
+export type { Goal, GoalStatus } from "./goals.ts";
+// 0.5.1 item 3: management centre (CLI + localhost API).
+export { MemoryAdmin } from "./admin.ts";
+export type { AdminStats } from "./admin.ts";
+export { startAdminServer } from "./admin-server.ts";
+export type { AdminServerHandle, AdminServerOptions } from "./admin-server.ts";
 // 0.4.1 item 1: memory_profile write path — the standing profile
 // lives in profile.json (plugin-owned, never MEMORY.md), and
 // loadProfile/saveProfile/mergeProfile are the only way in or out.
@@ -162,6 +260,8 @@ export type { ReviewInput } from "./review.ts";
 // the parser turns her output into memory ids.
 export {
   MODEL_REVIEW_CATEGORIES,
+  MODEL_REVIEW_MAX_CHARS,
+  MODEL_REVIEW_MAX_ENTRIES,
   RECENT_MAX_CHARS,
   RECENT_MAX_ENTRIES,
   buildModelReviewPrompt,

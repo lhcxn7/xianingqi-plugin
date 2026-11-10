@@ -9,7 +9,7 @@
 // - Recall injects only raw-log / archive detail, never layer 1.
 
 import { strict as assert } from "node:assert";
-import { execFile, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import {
   appendFileSync,
   existsSync,
@@ -18,10 +18,11 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createContext, Script } from "node:vm";
@@ -37,8 +38,8 @@ import {
   extractReflectionQuotes,
   FragmentStore,
   KeywordIndex,
-  LOOP_FILE,
-  LOOP_MAX_PENDING,
+  KeywordRetriever,
+  LOOP_FILE,  LOOP_MAX_PENDING,
   LOOP_TRIGGER_COOLDOWN_MS,
   LoopStore,
   MemoryCore,
@@ -47,11 +48,14 @@ import {
   MODEL_REVIEW_CATEGORIES,
   acquireWriteLock,
   attentionFactor,
+  atomicWriteText,
   buildModelReviewPrompt,
   clarityLambda,
   COMMON_TOKENS,
   computeActivation,
   contentTokens,
+  composeInjection,
+  defaultClarity,
   detailLambda,
   emotionColor,
   emotionFactor,
@@ -74,6 +78,7 @@ import {
   loadReviewState,
   loadSummaries,
   lockDirPath,
+  matchTokensFor,
   mergeProfile,
   normalizeForDedupe,
   parseArchiveText,
@@ -91,6 +96,7 @@ import {
   renderStarmapHtml,
   restoreSnapshot,
   retrievability,
+  runReview,
   saveProfile,
   saveReflection,
   selectCappedEntries,
@@ -99,14 +105,52 @@ import {
   summarizeBeliefs,
   tagEmotion,
   tokenize,
+  SOURCE_TYPE_CN,
+  confidenceFactor,
+  confidenceFor,
+  entryProvenance,
+  isSourceType,
+  legacyProvenance,
+  newProvenance,
+  normalizeProvenance,
+  validateSourceIds,
   verifyBeliefEvidence,
   verifyReflection,
+  // 0.5.1 expansion: fact chain + forgetting, local embedding,
+  // admin centre, experience learning, goals/todos.
+  FORGET_REQUEST_TTL_MS,
+  ForgetStore,
+  MemoryAdmin,
+  startAdminServer,
+  ExperienceStore,
+  GoalStore,
+  SEMANTIC_DEFAULT_MIN_SIMILARITY,
+  SemanticIndex,
+  SemanticSearcher,
+  buildSemanticIndex,
+  cosineSimilarity,
+  currentVersionOf,
+  factChains,
+  factVersionFactor,
+  isHistoryQuery,
+  isSuperseded,
+  normalizeVector,
+  semanticCandidateIds,
 } from "../src/index.ts";
 import { timeFactor } from "../src/activation.ts";
-import type { MemoryEntry, RecallHit } from "../src/index.ts";
+import { cleanTempLeftovers } from "../src/atomic.ts";
+import { uncertaintyFor } from "../src/beliefs.ts";
+import { FRAGMENT_MIN_QUOTE_CHARS } from "../src/fragments.ts";
+import { ARBITER_STALE_MS } from "../src/lock.ts";
+import { REFLECTION_MAX_CHARS, REFLECTION_MAX_COUNT } from "../src/reflection.ts";
+import { isReviewTopicToken } from "../src/review.ts";
+import { safeJsonForHtml } from "../src/starmap.ts";
+import type { Fragment, MemoryEntry, RecallHit } from "../src/index.ts";
 
 const local = (y: number, m: number, d: number, hh: number, mm: number) =>
   new Date(y, m - 1, d, hh, mm).getTime();
+
+const DAY_MS = 86_400_000;
 
 // Evidence header (review-9 m-8): every run labels its OS + Node, so
 // a Linux-only green run can never again pass for a Windows failure.
@@ -114,6 +158,11 @@ console.log(`os: ${process.platform} / node: ${process.version}`);
 
 function check(name: string, fn: () => void): void {
   fn();
+  console.log(`PASS ${name}`);
+}
+
+async function checkAsync(name: string, fn: () => Promise<void>): Promise<void> {
+  await fn();
   console.log(`PASS ${name}`);
 }
 
@@ -771,32 +820,37 @@ check("snapshots cover only plugin-owned files, never MEMORY.md", () => {
   assert.equal(coreD.stats().totalEntries, 6);
 });
 
-check("0.4.3 snapshot: profile.json is snapshotted and restored; audit / beliefs / loop still are not", () => {
+check("0.4.3 snapshot: profile.json is snapshotted and restored; audit / loop still are not — beliefs joined the snapshot in 0.5.1", () => {
   const dirS = mkdtempSync(join(tmpdir(), "memory-core-snapshot-profile-"));
   writeFileSync(join(dirS, "MEMORY.md"), fixtureMemory, "utf8");
   const coreS = new MemoryCore({ dataDir: dirS });
   coreS.updateProfile({ name: "快照前", stage: "早期" });
-  // The three still-excluded files, placed with marker content so
+  // The two still-excluded files, placed with marker content so
   // the snapshot-contents assertion reads the filename rule, not
   // the absence of the files.
   writeFileSync(join(dirS, "invalidation-audit.jsonl"), "{}\n", "utf8");
-  writeFileSync(join(dirS, "beliefs.json"), JSON.stringify({ version: 1, beliefs: [] }), "utf8");
   writeFileSync(join(dirS, "loop.json"), JSON.stringify({ version: 1, pendingActions: [] }), "utf8");
+  writeFileSync(join(dirS, "beliefs.json"), JSON.stringify({ version: 1, beliefs: [] }), "utf8");
   const snap = coreS.snapshot();
   const snapFiles = readdirSync(join(dirS, ".snapshots", snap));
   assert.ok(snapFiles.includes("profile.json"), `snapshot carries profile.json, got ${JSON.stringify(snapFiles)}`);
   assert.ok(!snapFiles.includes("invalidation-audit.jsonl"), "audit trail is never snapshotted");
-  assert.ok(!snapFiles.includes("beliefs.json"), "beliefs are never snapshotted");
   assert.ok(!snapFiles.includes("loop.json"), "loop state is never snapshotted");
-  // Change the profile, restore, and the profile comes back.
+  // 0.5.1 (0.4.3 audit item 10): beliefs.json IS snapshotted now —
+  // beliefs cite log entries as evidence, so a restore that reverts
+  // the log but not the beliefs would leave them pointing at
+  // pre-restore evidence (same reason fragments.json is in).
+  assert.ok(snapFiles.includes("beliefs.json"), "beliefs are snapshotted since 0.5.1");
+  // Change the profile and the beliefs, restore, and both come back.
   coreS.updateProfile({ name: "快照后", stage: "中期" });
   assert.equal(coreS.readLayer1().name, "快照后", "profile changed after the snapshot");
+  writeFileSync(join(dirS, "beliefs.json"), JSON.stringify({ version: 1, beliefs: [{ id: "BEL_X_001" }] }), "utf8");
   coreS.restore(snap);
   assert.equal(coreS.readLayer1().name, "快照前", "restore brings the profile back");
   assert.equal(coreS.readLayer1().stage, "早期", "restore brings the profile stage back");
+  assert.equal(readFileSync(join(dirS, "beliefs.json"), "utf8"), JSON.stringify({ version: 1, beliefs: [] }), "restore brings beliefs.json back");
   // The excluded files were never in the snapshot, so the restore
   // leaves the live copies exactly as they were.
-  assert.equal(readFileSync(join(dirS, "beliefs.json"), "utf8"), JSON.stringify({ version: 1, beliefs: [] }), "restore leaves beliefs.json alone");
   assert.equal(readFileSync(join(dirS, "loop.json"), "utf8"), JSON.stringify({ version: 1, pendingActions: [] }), "restore leaves loop.json alone");
 });
 
@@ -2367,11 +2421,16 @@ check("0.3.1 recall: 那天 no longer counts as a shared attention token (review
 // review-20 (r5 follow-up): review-19's 那天 edit silently dropped 这个
 // from COMMON_TOKENS — the list lost a member and no test noticed,
 // because the new tests only covered 那天 and the day words. The full
-// list is snapshotted here: 52 members, no more, no fewer. Any future
+// list is snapshotted here: 59 members, no more, no fewer. Any future
 // add/remove must update this test deliberately, with a review note.
+// 0.5.1 (0.4.3 item 6): the seven relative-time words (上周/这周/
+// 下周/去年/今年/上次/这次) join the day words — they only anchor
+// a sentence in time, never a topic.
 check("0.3.1 activation: COMMON_TOKENS membership is pinned (review-20)", () => {
   const expected = [
-    "今天", "明天", "昨天", "那天", "这个", "那个", "什么", "怎么",
+    "今天", "明天", "昨天", "那天",
+    "上周", "这周", "下周", "去年", "今年", "上次", "这次",
+    "这个", "那个", "什么", "怎么",
     "为什么", "可以", "应该", "觉得", "知道", "时候", "东西", "事情",
     "一下", "有点", "真的", "很好", "不错", "好的", "现在", "然后",
     "就是", "还是", "没有", "不用", "不要", "这样", "那样", "这里",
@@ -2379,7 +2438,7 @@ check("0.3.1 activation: COMMON_TOKENS membership is pinned (review-20)", () => 
     "如果", "因为", "所以", "但是", "不过", "而且", "或者", "已经",
     "正在", "刚才", "一直", "总是",
   ];
-  assert.equal(COMMON_TOKENS.size, expected.length, "52 members, no more, no fewer");
+  assert.equal(COMMON_TOKENS.size, expected.length, "59 members, no more, no fewer");
   for (const w of expected) assert.ok(COMMON_TOKENS.has(w), `COMMON_TOKENS still has ${w}`);
 });
 
@@ -2540,7 +2599,12 @@ check("0.3.1 mapping: fragment star keeps tone + sources, sources fold in", () =
     entries: Record<string, { clarity: number }>;
   };
   const got = attrs.entries[e.id].clarity;
-  assert.ok(Math.abs(got - Math.exp(-0.03 * 30)) < 0.01, `single decay ~0.4066, got ${got.toFixed(4)} (double decay would be ~0.1653)`);
+  // 0.5.1 (§四): defaultClarity now runs at the detail rate
+  // (light S=0.4 -> half-life 26 d, lambda ln2/26), not the old
+  // fixed 0.03 — a single decay over ~30 days is exp(-ln2/26*30)
+  // ≈ 0.449, and a double decay would square it to ~0.202.
+  const single = Math.exp(-detailLambda(0.4) * 30);
+  assert.ok(Math.abs(got - single) < 0.01, `single decay ~${single.toFixed(4)}, got ${got.toFixed(4)} (double decay would be ~${(single * single).toFixed(4)})`);
   console.log("PASS 0.2.0 M1: first review decays clarity once, not twice");
 }
 
@@ -2819,7 +2883,7 @@ check("0.3.0 fragment: creation accepts a good fragment (keywords + quotes + ton
     sourceIds: [e1.id, e2.id],
     text: "他很喜欢酸梅湯",
     tone: "很喜欢",
-    quotes: ["真好喝"],
+    quotes: ["酸梅湯真好喝"],
     topic: "酸梅湯",
   });
   assert.equal(r.ok, true, `good fragment accepted, got ${JSON.stringify(r.reasons)}`);
@@ -2849,7 +2913,7 @@ check("0.3.0 fragment: creation REJECTS novel contamination (粉色筷子)", () 
     sourceIds: [e1.id],
     text: "他很喜欢粉色筷子",
     tone: "很喜欢",
-    quotes: ["真好喝"],
+    quotes: ["酸梅湯真好喝"],
     topic: "粉色筷子",
   });
   assert.equal(r.ok, false, "contaminated fragment rejected");
@@ -2933,7 +2997,7 @@ check("0.3.0 fragment: free-form tone is accepted, unknown tone never fails on t
     sourceIds: [e1.id],
     text: "他很喜欢酸梅湯",
     tone: "很喜欢",
-    quotes: ["真好喝"],
+    quotes: ["酸梅湯真好喝"],
     topic: "酸梅湯",
   });
   assert.equal(created.ok, true, "setup fragment accepted");
@@ -2986,7 +3050,7 @@ check("0.3.0 fragment: free-form tone is accepted, unknown tone never fails on t
     sourceIds: [e1.id],
     text: "他很喜欢酸梅湯",
     tone: "很喜欢",
-    quotes: ["真好喝"],
+    quotes: ["酸梅湯真好喝"],
     topic: "酸梅湯",
   });
   assert.equal(created.ok, true, "setup fragment accepted");
@@ -3026,7 +3090,7 @@ check("0.3.0 fragment: free-form tone is accepted, unknown tone never fails on t
     sourceIds: [e1.id, e2.id],
     text: "他很喜欢酸梅湯",
     tone: "很喜欢",
-    quotes: ["真好喝"],
+    quotes: ["酸梅湯真好喝"],
     topic: "酸梅湯",
   });
   assert.equal(created.ok, true, "setup fragment accepted");
@@ -3067,7 +3131,7 @@ check("0.3.0 fragment: free-form tone is accepted, unknown tone never fails on t
     sourceIds: [e1.id, e2.id],
     text: "他很喜欢酸梅湯",
     tone: "很喜欢",
-    quotes: ["真好喝"],
+    quotes: ["酸梅湯真好喝"],
     topic: "酸梅湯",
   });
   assert.equal(created.ok, true, "setup fragment accepted");
@@ -3125,7 +3189,7 @@ check("0.3.0 fragment: free-form tone is accepted, unknown tone never fails on t
     sourceIds: [e1.id, e2.id],
     text: "他很喜欢酸梅湯",
     tone: "很喜欢",
-    quotes: ["真好喝"],
+    quotes: ["酸梅湯真好喝"],
     topic: "酸梅湯",
   });
   assert.equal(created.ok, true, "setup fragment accepted");
@@ -3176,7 +3240,7 @@ check("0.3.0 fragment: free-form tone is accepted, unknown tone never fails on t
     sourceIds: [e1.id],
     text: "他很喜欢酸梅湯",
     tone: "很喜欢",
-    quotes: ["真好喝"],
+    quotes: ["酸梅湯真好喝"],
     topic: "酸梅湯",
   });
   assert.equal(created.ok, true, "setup fragment accepted");
@@ -4460,7 +4524,9 @@ check("0.4.0 item 2: create + support — model delta moves strength, clamped to
   assert.ok(created.belief, "belief created");
   assert.equal(created.belief?.id, "BEL_TRUST_001", "id is assigned per-dimension, not invented by the model");
   assert.equal(created.belief?.strength, 0.5, "initial strength defaults to 0.5");
-  assert.equal(created.belief?.uncertainty, 0.8, "initial uncertainty defaults to 0.8");
+  // 0.5.1 (0.4.3 item 7): uncertainty is derived — 0.8/(1+proofCount),
+  // so one proof means 0.4, not the old stored 0.8.
+  assert.equal(created.belief?.uncertainty, 0.4, "uncertainty is 0.8/(1+1 proof) = 0.4");
   assert.equal(created.belief?.proofCount, 1, "first evidence counts");
   const supported = coreBel.supportBelief(
     "BEL_TRUST_001",
@@ -4471,11 +4537,34 @@ check("0.4.0 item 2: create + support — model delta moves strength, clamped to
   assert.equal(supported.ok, true, JSON.stringify(supported.reasons));
   assert.equal(supported.belief?.strength, 0.65, "model delta 0.15 applied as-is");
   assert.equal(supported.belief?.proofCount, 2, "support is proofCount + 1");
-  // Over-cap delta clamps to 0.2, no error.
-  const clamped = coreBel.supportBelief(
+  // 0.5.1 (0.4.3 item 7): the SAME entry supporting twice is a
+  // duplicate, not a second proof — same shape as contradict's
+  // no-double-charge rule. ok, duplicate: true, nothing moves,
+  // no second write.
+  const dup = coreBel.supportBelief(
     "BEL_TRUST_001",
     belE2.id,
     "半夜睡不着也想找你聊天",
+    0.5,
+  );
+  assert.equal(dup.ok, true);
+  assert.equal(dup.duplicate, true, "same entryId twice is a duplicate");
+  assert.ok(
+    Math.abs((dup.belief?.strength ?? 0) - 0.65) < 1e-9,
+    "duplicate support moves nothing",
+  );
+  assert.equal(dup.belief?.proofCount, 2, "duplicate support counts nothing");
+  // Uncertainty follows the proof count: 0.8/(1+2) ≈ 0.2667.
+  assert.ok(
+    Math.abs((dup.belief?.uncertainty ?? 0) - 0.8 / 3) < 1e-9,
+    "uncertainty is 0.8/(1+2 proofs)",
+  );
+  // Over-cap delta clamps to 0.2, no error — on a FRESH entry
+  // (the duplicate above already used belE2).
+  const clamped = coreBel.supportBelief(
+    "BEL_TRUST_001",
+    belE3.id,
+    "答应陪你看星星结果没去成",
     0.5,
   );
   assert.equal(clamped.ok, true);
@@ -4485,11 +4574,13 @@ check("0.4.0 item 2: create + support — model delta moves strength, clamped to
   );
   assert.equal(clamped.belief?.proofCount, 3, "clamped support still counts its evidence");
   // A paraphrased quote is not verbatim: rejected, nothing moves.
+  // (On a fresh entry — belE5 — so the duplicate rule above does
+  // not swallow the rejection.)
   const before = coreBel.listBeliefs()[0];
   const paraphrased = coreBel.supportBelief(
     "BEL_TRUST_001",
-    belE1.id,
-    "昨晚难过第一个想到你",
+    belE5.id,
+    "明明约好一起吃饭他却爽约了",
     0.1,
   );
   assert.equal(paraphrased.ok, false, "paraphrase must be rejected");
@@ -4565,7 +4656,8 @@ check("0.4.1 (A) core persona-source check: a task-window entry can never create
   writeFileSync(join(dirT, "MEMORY.md"), fixtureMemory, "utf8");
   const coreT = new MemoryCore({ dataDir: dirT });
   const personaE = coreT.record({ role: "user", text: "昨晚难过的时候想找你聊天", window: "persona", sessionId: "s1", ts: local(2026, 11, 6, 10, 0) });
-  const taskE = coreT.record({ role: "user", text: "任务清单：买一张地铁卡", window: "task", sessionId: "s1", ts: local(2026, 11, 6, 10, 5) });
+  const personaE2 = coreT.record({ role: "user", text: "半夜睡不着也想找你聊天", window: "persona", sessionId: "s1", ts: local(2026, 11, 6, 10, 5) });
+  const taskE = coreT.record({ role: "user", text: "任务清单：买一张地铁卡", window: "task", sessionId: "s1", ts: local(2026, 11, 6, 10, 10) });
   // Persona source still passes (regression): the belief is created.
   const created = coreT.createBelief({
     dimension: "trust",
@@ -4609,11 +4701,13 @@ check("0.4.1 (A) core persona-source check: a task-window entry can never create
   assert.equal(coreT.listBeliefs().length, 1, "rejected writes store nothing new");
   assert.equal(coreT.listBeliefs()[0]?.strength, 0.5, "rejected writes move nothing");
   assert.deepEqual(coreT.listBeliefs()[0]?.contradicting, [], "rejected contradict charges nothing");
-  // Persona source still moves the belief afterwards (regression).
+  // Persona source still moves the belief afterwards (regression) —
+  // on a FRESH persona entry: supporting with the creation entry
+  // itself is a duplicate under the 0.5.1 rule, not a second proof.
   const supported = coreT.supportBelief(
     "BEL_TRUST_001",
-    personaE.id,
-    "昨晚难过的时候想找你聊天",
+    personaE2.id,
+    "半夜睡不着也想找你聊天",
     0.1,
   );
   assert.equal(supported.ok, true, JSON.stringify(supported.reasons));
@@ -6351,4 +6445,1651 @@ check("0.4.6 (0.4.3 item 16): a failing stale-lock reclaim yields and times out 
   assert.equal(existsSync(staleDir), false, "with the hook off, the stale lock breaks normally");
 });
 
+// ---- 0.5.0 step 2: 单字 token 噪声 ---------------------------------
+// 0.4.8 的召回把 "今天天气怎么样" 里的单字 "天" 也当匹配词，
+// 一句闲聊能召回五条不相干的记忆（基准集无证据类 6/6 误召）。
+// 修法：查询同时有多字词时，单字只留在分词里（单字查询 "汤"
+// 仍要靠它命中 "酸梅汤"，audit m4），不进匹配集。
+
+check("0.5.0 step 2: matchTokensFor drops lone singles when multi-char tokens exist, keeps them for a single-char query", () => {
+  const multi = matchTokensFor("今天天气怎么样");
+  assert.ok(multi.length > 0, "multi-char query still has tokens");
+  assert.ok(
+    multi.every((t) => t.length > 1),
+    `no single-char token in the match set: ${multi.join(",")}`,
+  );
+  assert.ok(multi.includes("今天") && multi.includes("天气"), "bigrams kept");
+  assert.deepEqual(matchTokensFor("汤"), ["汤"]);
+  assert.deepEqual(matchTokensFor(""), []);
+});
+
+check("0.5.0 step 2: a multi-char query sharing only single characters with entries recalls nothing", () => {
+  const mkE = (id: string, text: string): MemoryEntry => ({
+    id,
+    ts: local(2026, 11, 9, 10, 0),
+    date: "2026/11/09",
+    time: "10:00",
+    role: "user",
+    window: "persona",
+    sessionId: "s1",
+    importance: "light",
+    text,
+  });
+  // Both entries share only the single char 天 with the query —
+  // no shared bigram — so neither may surface.
+  const entries = [
+    mkE("n1", "那天我去爬山了"),
+    mkE("n2", "天冷了多穿点"),
+  ];
+  const r = recallFromEntries(entries, null, "今天天气怎么样", { limit: 5 });
+  assert.equal(r.hits.length, 0, "single-char overlap alone recalls nothing");
+  // Control: a shared bigram still recalls.
+  const withBigram = [...entries, mkE("n3", "今天天气真不错")];
+  const r2 = recallFromEntries(withBigram, null, "今天天气怎么样", { limit: 5 });
+  assert.equal(r2.hits.length, 1, "shared-bigram entry still recalls");
+  assert.equal(r2.hits[0].entry.id, "n3");
+  // Benchmark case: "狗" only links to the cat entry through the
+  // single char 养 — that must not recall either.
+  const cat = [mkE("n4", "我养了一只叫团团的橘猫，胖乎乎的")];
+  const r3 = recallFromEntries(cat, null, "她养过什么品种的狗", { limit: 5 });
+  assert.equal(r3.hits.length, 0, "dog query must not recall the cat entry");
+});
+
+check("0.5.0 step 2: a single-char query still matches through the entry's single char (audit m4)", () => {
+  const mkE = (id: string, text: string): MemoryEntry => ({
+    id,
+    ts: local(2026, 11, 9, 10, 0),
+    date: "2026/11/09",
+    time: "10:00",
+    role: "user",
+    window: "persona",
+    sessionId: "s1",
+    importance: "light",
+    text,
+  });
+  const r = recallFromEntries(
+    [mkE("s1", "我最喜欢喝酸梅汤，夏天一定要冰的")],
+    null,
+    "汤",
+    { limit: 5 },
+  );
+  assert.equal(r.hits.length, 1, "one-char query 汤 still finds 酸梅汤");
+  assert.equal(r.hits[0].entry.id, "s1");
+});
+
+// ---- 0.5.0 step 3: 来源 / 可信度 ----------------------------------
+// 模型只提来源类型的判断，可信度那个数永远是代码算的；旧数据
+// 缺来源就标 legacy/unknown，绝不伪造。
+
+check("0.5.0 step 3: confidence is code-computed from type + verification count, never model-written", () => {
+  assert.equal(confidenceFor("user_quote", 0), 0.9);
+  assert.equal(confidenceFor("user_quote", 1), 0.92);
+  assert.equal(confidenceFor("model_summary", 1), 0.72);
+  assert.equal(confidenceFor("model_inference", 0), 0.5);
+  assert.equal(confidenceFor("model_inference", 100), 0.6);
+  assert.equal(confidenceFor("legacy", 5), null);
+  assert.equal(confidenceFactor(undefined), 1);
+  assert.equal(confidenceFactor(legacyProvenance(["x"])), 0.85);
+  assert.equal(
+    confidenceFactor(newProvenance(["x"], "model_inference", 1000)),
+    0.5 + 0.5 * 0.52,
+  );
+  assert.equal(isSourceType("model_summary"), true);
+  assert.equal(isSourceType("legacy"), true);
+  assert.equal(isSourceType("foobar"), false);
+  assert.equal(isSourceType(""), false);
+  // A stored confidence is never trusted: normalise recomputes it.
+  const forged = normalizeProvenance(
+    { sourceIds: ["a"], sourceType: "model_inference", confidence: 0.99, verifyCount: 0, lastVerifiedAt: null },
+    ["a"],
+  );
+  assert.equal(forged.confidence, 0.5, "a smuggled 0.99 is recomputed to 0.5");
+  // Missing / malformed provenance reads as legacy, never forged.
+  const missing = normalizeProvenance(undefined, ["a", "b"]);
+  assert.equal(missing.sourceType, "legacy");
+  assert.equal(missing.confidence, null);
+  assert.deepEqual(missing.sourceIds, ["a", "b"]);
+  assert.equal(SOURCE_TYPE_CN.model_summary, "模型总结");
+  assert.equal(SOURCE_TYPE_CN.legacy, "未知（旧数据）");
+});
+
+check("0.5.0 step 3: fragment creation carries code-computed provenance; unknown source types and missing sources are rejected", () => {
+  const dirP = mkdtempSync(join(tmpdir(), "memory-core-050-prov-frag-"));
+  const core = new MemoryCore({ dataDir: dirP });
+  const e = core.record({
+    role: "user",
+    text: "我最喜欢喝酸梅汤，夏天一定要冰的",
+    window: "persona",
+    sessionId: "s1",
+    ts: local(2026, 11, 9, 10, 0),
+  });
+  const created = core.createFragment({
+    sourceIds: [e.id],
+    text: "他喜欢酸梅汤",
+    tone: "喜欢",
+    quotes: ["喜欢喝酸梅汤"],
+    sourceType: "user_quote",
+  });
+  assert.equal(created.ok, true, "fragment accepted");
+  assert.equal(created.fragment?.provenance?.sourceType, "user_quote");
+  assert.equal(created.fragment?.provenance?.confidence, 0.92);
+  assert.equal(created.fragment?.provenance?.verifyCount, 1);
+  assert.deepEqual(created.fragment?.provenance?.sourceIds, [e.id]);
+  // Default is model_summary when the model says nothing.
+  const def = core.createFragment({
+    sourceIds: [e.id],
+    text: "他喜欢酸梅汤",
+    tone: "喜欢",
+    quotes: ["喜欢喝酸梅汤"],
+  });
+  assert.equal(def.fragment?.provenance?.sourceType, "model_summary");
+  assert.equal(def.fragment?.provenance?.confidence, 0.72);
+  // Unknown source type is rejected, nothing stored.
+  const bad = core.createFragment({
+    sourceIds: [e.id],
+    text: "他喜欢酸梅汤",
+    tone: "喜欢",
+    quotes: ["喜欢喝酸梅汤"],
+    sourceType: "totally-made-up",
+  });
+  assert.equal(bad.ok, false, "unknown sourceType rejected");
+  assert.ok(bad.reasons.some((r) => r.includes("来源类型")), "rejection names the source type");
+  // Missing source id is rejected by the core existence check.
+  const missing = core.createFragment({
+    sourceIds: ["no-such-id"],
+    text: "他喜欢酸梅汤",
+    tone: "喜欢",
+    quotes: ["喜欢喝酸梅汤"],
+  });
+  assert.equal(missing.ok, false, "missing source rejected");
+  assert.ok(missing.reasons.some((r) => r.includes("来源条目不存在")));
+  assert.equal(
+    validateSourceIds(["x", e.id], new Map([[e.id, e]])).missing.join(","),
+    "x",
+  );
+});
+
+check("0.5.0 fix: legacy fragments load as unknown (never forged), and a recall re-check does not invent a count", () => {
+  const dirL = mkdtempSync(join(tmpdir(), "memory-core-050-prov-legacy-"));
+  // Hand-write a pre-0.5.0 fragments.json: no provenance at all.
+  writeFileSync(
+    join(dirL, "fragments.json"),
+    JSON.stringify({
+      version: 1,
+      fragments: [
+        {
+          id: "frag-old-1",
+          sourceIds: ["e-old-1"],
+          text: "他喜欢酸梅汤",
+          tone: { label: "喜欢", level: "mild-positive", intensity: 0.7 },
+          quotes: ["喜欢喝酸梅汤"],
+          topic: "酸梅汤",
+          keywords: ["酸梅", "梅汤"],
+          createdAt: 1000,
+          verified: true,
+        },
+      ],
+    }),
+    "utf8",
+  );
+  const store = new FragmentStore(dirL);
+  assert.equal(store.size, 1, "legacy row still loads");
+  const f = store.get("frag-old-1");
+  assert.equal(f?.provenance?.sourceType, "legacy");
+  assert.equal(f?.provenance?.confidence, null);
+  assert.equal(f?.provenance?.verifyCount, 0);
+  // 0.5.0 fix: a legacy row has no real verification history — a
+  // recall re-check must not manufacture a count or a timestamp.
+  assert.equal(store.markVerified("frag-old-1", 2000), true);
+  assert.equal(store.get("frag-old-1")?.provenance?.verifyCount, 0);
+  assert.equal(store.get("frag-old-1")?.provenance?.lastVerifiedAt, null);
+  assert.equal(store.get("frag-old-1")?.provenance?.sourceType, "legacy");
+  assert.equal(store.get("frag-old-1")?.provenance?.confidence, null);
+});
+
+check("0.5.0 step 3: low-confidence fragment-backed hits are demoted in ranking, and hits carry provenance", () => {
+  const dirR = mkdtempSync(join(tmpdir(), "memory-core-050-prov-rank-"));
+  const core = new MemoryCore({ dataDir: dirR });
+  const ts = local(2026, 11, 9, 10, 0);
+  const e1 = core.record({ role: "user", text: "我最喜欢喝酸梅汤，夏天一定要冰的", window: "persona", sessionId: "s1", ts });
+  const e2 = core.record({ role: "user", text: "昨天又喝了一杯酸梅汤，真过瘾", window: "persona", sessionId: "s1", ts });
+  // e2 gets a bare-inference fragment (lowest confidence): its hit
+  // must rank BELOW the verbatim e1 hit with the same keywords.
+  const created = core.createFragment({
+    sourceIds: [e2.id],
+    text: "他喜欢酸梅汤",
+    tone: "喜欢",
+    // 0.5.1 (0.4.3 item 9): quotes must be >= 4 chars — the old
+    // "酸梅汤" (3) no longer verifies.
+    quotes: ["一杯酸梅汤"],
+    sourceType: "model_inference",
+  });
+  assert.equal(created.ok, true, "setup fragment accepted");
+  const r = core.recall("酸梅汤", { limit: 5 });
+  assert.equal(r.hits.length, 2, "both entries surface");
+  assert.equal(r.hits[0].entry.id, e1.id, "verbatim hit outranks the low-confidence fragment hit");
+  assert.equal(r.hits[1].entry.id, e2.id);
+  assert.equal(r.hits[1].fragmentId, created.fragment?.id);
+  assert.equal(r.hits[1].provenance?.sourceType, "model_inference");
+  assert.equal(r.hits[1].provenance?.confidence, 0.54, "inference + 1 recall re-check = 0.52 + 0.02");
+  assert.equal(r.hits[1].provenance?.verifyCount, 2, "creation (1) + this recall re-check (1)");
+  // The verbatim hit carries the log line itself as provenance.
+  assert.equal(r.hits[0].provenance?.sourceType, "user_quote");
+  assert.deepEqual(r.hits[0].provenance?.sourceIds, [e1.id]);
+  // Entry-level provenance helper: assistant lines are model_quote.
+  assert.equal(
+    entryProvenance({ ...e1, role: "assistant" }).sourceType,
+    "model_quote",
+  );
+});
+
+check("0.5.0 step 3: belief provenance follows its evidence (inference, count = proofCount)", () => {
+  const dirB = mkdtempSync(join(tmpdir(), "memory-core-050-prov-belief-"));
+  const core = new MemoryCore({ dataDir: dirB });
+  const e = core.record({
+    role: "user",
+    text: "昨晚难过的时候想找你聊天",
+    window: "persona",
+    sessionId: "s1",
+    ts: local(2026, 11, 9, 10, 0),
+  });
+  const created = core.createBelief({
+    dimension: "trust",
+    statement: "他难过时会来找我",
+    entryId: e.id,
+    quote: "昨晚难过的时候想找你聊天",
+  });
+  assert.equal(created.ok, true, "belief created");
+  assert.equal(created.belief?.provenance?.sourceType, "model_inference");
+  assert.deepEqual(created.belief?.provenance?.sourceIds, [e.id]);
+  assert.equal(created.belief?.provenance?.verifyCount, 1);
+  // Legacy beliefs.json (no provenance field) loads with the
+  // evidence-derived provenance, never as unknown.
+  const dirL = mkdtempSync(join(tmpdir(), "memory-core-050-prov-belief-legacy-"));
+  writeFileSync(
+    join(dirL, "beliefs.json"),
+    JSON.stringify({
+      version: 1,
+      beliefs: [
+        {
+          id: "BEL_TRUST_001",
+          dimension: "trust",
+          statement: "他难过时会来找我",
+          strength: 0.6,
+          evidence: [{ entryId: e.id, quote: "昨晚难过的时候想找你聊天" }],
+          proofCount: 1,
+          uncertainty: 0.7,
+          updatedAt: 5000,
+          contradicting: [],
+        },
+      ],
+    }),
+    "utf8",
+  );
+  const store = new BeliefStore(dirL);
+  assert.equal(store.size, 1, "legacy belief still loads");
+  const b = store.get("BEL_TRUST_001");
+  assert.equal(b?.provenance?.sourceType, "model_inference");
+  assert.deepEqual(b?.provenance?.sourceIds, [e.id]);
+  assert.equal(b?.provenance?.verifyCount, 1);
+  assert.equal(b?.provenance?.lastVerifiedAt, 5000);
+});
+
+// ---- 0.5.0 step 4: 反馈工具 ---------------------------------------
+// 用户说对了 / 错了 / 不相关，记忆真改，不只是降个分。
+
+check("0.5.0 step 4: feedback wrong invalidates (same question re-asked no longer recalls it)", () => {
+  const dirF = mkdtempSync(join(tmpdir(), "memory-core-050-feedback-"));
+  const core = new MemoryCore({ dataDir: dirF });
+  const e = core.record({
+    role: "user",
+    text: "我最喜欢喝酸梅汤，夏天一定要冰的",
+    window: "persona",
+    sessionId: "s1",
+    ts: local(2026, 11, 9, 10, 0),
+  });
+  assert.equal(core.recall("酸梅汤", { limit: 5 }).hits.length, 1, "setup: recalled before feedback");
+  const res = core.applyFeedback({ entryId: e.id, kind: "wrong", reason: "她不喜欢酸梅汤" });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.invalidated, [e.id]);
+  assert.equal(res.feedback.wrong, 1);
+  assert.equal(core.recall("酸梅汤", { limit: 5 }).hits.length, 0, "wrong feedback removes it from recall");
+  // The log text stays: invalidation never deletes.
+  assert.equal(core.entriesByIds([e.id]).length, 1, "log entry still readable");
+  // Unknown entry id is reported, never created.
+  const unknown = core.applyFeedback({ entryId: "no-such-id", kind: "wrong" });
+  assert.equal(unknown.ok, false);
+  assert.equal(unknown.reason, "记忆条目不存在。");
+});
+
+check("0.5.0 step 4: feedback irrelevant demotes in ranking (a newer hit drops below an older one)", () => {
+  const dirF = mkdtempSync(join(tmpdir(), "memory-core-050-feedback-irrel-"));
+  const core = new MemoryCore({ dataDir: dirF });
+  const old = core.record({
+    role: "user",
+    text: "我最喜欢喝酸梅汤，夏天一定要冰的",
+    window: "persona",
+    sessionId: "s1",
+    ts: local(2026, 10, 10, 10, 0),
+  });
+  const fresh = core.record({
+    role: "user",
+    text: "昨天又喝了一杯酸梅汤，真过瘾",
+    window: "persona",
+    sessionId: "s1",
+    ts: local(2026, 11, 9, 10, 0),
+  });
+  const before = core.recall("酸梅汤", { limit: 5 });
+  assert.equal(before.hits[0].entry.id, fresh.id, "setup: the newer hit ranks first");
+  const res = core.applyFeedback({ entryId: fresh.id, kind: "irrelevant", reason: "这条和问题无关" });
+  assert.equal(res.ok, true);
+  assert.equal(res.feedback.irrelevant, 1);
+  assert.ok((res.significance as number) < 0.5, "significance halves");
+  const after = core.recall("酸梅汤", { limit: 5 });
+  assert.equal(after.hits[0].entry.id, old.id, "one irrelevant feedback drops the newer hit below the older one");
+  assert.equal(after.hits[1].entry.id, fresh.id, "demoted, not deleted");
+});
+
+check("0.5.0 fix: irrelevant stops halving significance after two feedbacks", () => {
+  const dirF = mkdtempSync(join(tmpdir(), "memory-core-050-feedback-irrel-cap-"));
+  const core = new MemoryCore({ dataDir: dirF });
+  const e = core.record({
+    role: "user",
+    text: "我最喜欢喝酸梅汤，夏天一定要冰的",
+    window: "persona",
+    sessionId: "s1",
+    ts: local(2026, 11, 9, 10, 0),
+  });
+  const first = core.applyFeedback({ entryId: e.id, kind: "irrelevant" });
+  const second = core.applyFeedback({ entryId: e.id, kind: "irrelevant" });
+  const third = core.applyFeedback({ entryId: e.id, kind: "irrelevant" });
+  assert.equal(first.ok, true);
+  assert.equal(second.significance, 0.1);
+  assert.equal(
+    third.significance,
+    second.significance,
+    "third irrelevant feedback no longer lowers significance",
+  );
+  assert.equal(third.feedback.irrelevant, 3);
+});
+
+check("0.5.0 fix: recalling a legacy fragment does not manufacture a verification count", () => {
+  const dirF = mkdtempSync(join(tmpdir(), "memory-core-050-legacy-verify-"));
+  const core = new MemoryCore({ dataDir: dirF });
+  const e = core.record({
+    role: "user",
+    text: "我今天很开心",
+    window: "persona",
+    sessionId: "s1",
+    ts: local(2026, 11, 9, 10, 0),
+  });
+  const created = core.createFragment({
+    sourceIds: [e.id],
+    text: "开心",
+    tone: "开心",
+    quotes: ["我今天很开心"],
+    topic: "开心",
+    keywords: ["开心"],
+  });
+  assert.equal(created.ok, true, "setup fragment accepted");
+  const fragId = created.fragment?.id as string;
+  core.flush();
+  // Simulate a 0.4.8 row: no provenance field.
+  const file = join(dirF, "fragments.json");
+  const raw = JSON.parse(readFileSync(file, "utf8")) as {
+    fragments: Array<{ id: string; provenance?: unknown }>;
+  };
+  const row = raw.fragments.find((f) => f.id === fragId);
+  assert.ok(row, "fragment persisted");
+  delete row.provenance;
+  writeFileSync(file, JSON.stringify(raw, null, 2));
+  // Reload: legacy / null, then recall (which injects the fragment).
+  const reloaded = new MemoryCore({ dataDir: dirF });
+  const store = new FragmentStore(dirF);
+  assert.equal(store.get(fragId)?.provenance?.sourceType, "legacy");
+  const hit = reloaded
+    .recall("开心", { limit: 5 })
+    .hits.find((h) => h.fragmentId === fragId);
+  assert.ok(hit, "fragment hit injected");
+  assert.equal(hit?.provenance?.verifyCount, 0, "legacy row stays unverified");
+  assert.equal(hit?.provenance?.confidence, null, "legacy confidence stays unknown");
+});
+
+check("0.5.0 step 4: feedback correct counts as a verification (entry + fragment), and counts persist across reload", () => {
+  const dirF = mkdtempSync(join(tmpdir(), "memory-core-050-feedback-correct-"));
+  const core = new MemoryCore({ dataDir: dirF });
+  const e = core.record({
+    role: "user",
+    text: "我最喜欢喝酸梅汤，夏天一定要冰的",
+    window: "persona",
+    sessionId: "s1",
+    ts: local(2026, 11, 9, 10, 0),
+  });
+  const created = core.createFragment({
+    sourceIds: [e.id],
+    text: "他喜欢酸梅汤",
+    tone: "喜欢",
+    quotes: ["喜欢喝酸梅汤"],
+  });
+  assert.equal(created.ok, true, "setup fragment accepted");
+  const fragId = created.fragment?.id as string;
+  assert.equal(created.fragment?.provenance?.verifyCount, 1, "creation counts as the first verification");
+  const res = core.applyFeedback({ entryId: e.id, kind: "correct", fragmentId: fragId });
+  assert.equal(res.ok, true);
+  assert.equal(res.feedback.correct, 1);
+  // The fragment's provenance moved: verifyCount 2, confidence up.
+  const frag = core.listFragments().find((f) => f.id === fragId);
+  assert.equal(frag?.provenance?.verifyCount, 2);
+  assert.equal(frag?.provenance?.confidence, 0.74, "model_summary + 2 verifications = 0.7 + 0.04");
+  // Wrong on a fragment marks it suspect (the verbatim source is
+  // what recall falls back to — and here the entry is invalidated
+  // too, so the whole thing stops recalling).
+  const resWrong = core.applyFeedback({ entryId: e.id, kind: "wrong", fragmentId: fragId, reason: "记错了" });
+  assert.equal(resWrong.ok, true);
+  assert.equal(
+    core.listFragments().find((f) => f.id === fragId)?.suspect,
+    true,
+    "wrong feedback marks the fragment suspect",
+  );
+  // Counts survive a reload: the attributes file keeps them.
+  const store = new AttributeStore(dirF);
+  assert.equal(store.get(e.id)?.feedbackCorrect, 1);
+  assert.equal(store.get(e.id)?.feedbackWrong, 1);
+  assert.ok(Number.isFinite(store.get(e.id)?.lastFeedbackAt as number));
+});
+
+// ---- 0.5.0 step 5: 查询改写版混合召回 ----------------------------
+// 不引 embedding：改写只是多一串查询词，和原查询取并集；语义
+// 那头只留接口插槽，真实 embedding 另立项。
+
+check("0.5.0 step 5: KeywordRetriever is the existing keyword path, unchanged", () => {
+  const mkE = (id: string, text: string): MemoryEntry => ({
+    id,
+    ts: local(2026, 11, 9, 10, 0),
+    date: "2026/11/09",
+    time: "10:00",
+    role: "user",
+    window: "persona",
+    sessionId: "s1",
+    importance: "light",
+    text,
+  });
+  const entries = [mkE("k1", "我最喜欢喝酸梅汤，夏天一定要冰的")];
+  const direct = recallFromEntries(entries, null, "酸梅汤", { limit: 5 });
+  const via = new KeywordRetriever().retrieve("酸梅汤", entries, null, { limit: 5 });
+  assert.deepEqual(
+    via.hits.map((h) => h.entry.id),
+    direct.hits.map((h) => h.entry.id),
+    "the provider returns exactly the keyword recall",
+  );
+  assert.equal(via.hits[0].entry.id, "k1");
+});
+
+check("0.5.0 step 5: a rewritten query unions with the original — it finds what the original words cannot, and never loses the original recall", () => {
+  const dirR = mkdtempSync(join(tmpdir(), "memory-core-050-rewrite-"));
+  const core = new MemoryCore({ dataDir: dirR });
+  const e = core.record({
+    role: "user",
+    text: "我最怕打雷，雷声一响就捂耳朵",
+    window: "persona",
+    sessionId: "s1",
+    ts: local(2026, 11, 9, 10, 0),
+  });
+  // No bigram links "天气现象" to "打雷": keyword-only misses.
+  assert.equal(
+    core.recall("她害怕什么天气现象", { limit: 5 }).hits.length,
+    0,
+    "keyword-only misses the synonym question",
+  );
+  // The rewrite adds the words; the union finds it.
+  const rewritten = core.recall("她害怕什么天气现象", {
+    limit: 5,
+    rewrittenQuery: "打雷 雷声",
+  });
+  assert.equal(rewritten.hits.length, 1, "rewrite finds it");
+  assert.equal(rewritten.hits[0].entry.id, e.id);
+  // A garbage rewrite never loses the original recall.
+  const e2 = core.record({
+    role: "user",
+    text: "我最喜欢喝酸梅汤，夏天一定要冰的",
+    window: "persona",
+    sessionId: "s1",
+    ts: local(2026, 11, 9, 10, 5),
+  });
+  const kept = core.recall("酸梅汤", {
+    limit: 5,
+    rewrittenQuery: "汽车 飞机 火箭",
+  });
+  assert.ok(
+    kept.hits.some((h) => h.entry.id === e2.id),
+    "garbage rewrite keeps the original 酸梅汤 hit",
+  );
+  // matchTokensFor applies the single-char filter to the union.
+  assert.ok(
+    matchTokensFor("她害怕什么天气现象", "打雷").every((t) => t.length > 1),
+    "no single-char noise from the union",
+  );
+});
+
+check("0.5.0 step 5: semantic slot — a mock provider's ids surface in explicit search, never in valve-gated injection, and a throwing provider falls back to keyword-only", () => {
+  const mkE = (id: string, text: string): MemoryEntry => ({
+    id,
+    ts: local(2026, 11, 9, 10, 0),
+    date: "2026/11/09",
+    time: "10:00",
+    role: "user",
+    window: "persona",
+    sessionId: "s1",
+    importance: "light",
+    text,
+  });
+  const entries = [
+    mkE("s1", "我最喜欢喝酸梅汤，夏天一定要冰的"),
+    mkE("s2", "昨天去爬山了，山顶风很大"),
+  ];
+  const mockSemantic = {
+    kind: "semantic" as const,
+    retrieveIds: (_query: string, _entries: MemoryEntry[]) => ["s2"],
+  };
+  // Explicit search (valve off): the semantic id surfaces even
+  // with zero keyword overlap.
+  const explicit = recallFromEntries(entries, null, "酸梅汤", {
+    limit: 5,
+    semantic: mockSemantic,
+  });
+  assert.ok(
+    explicit.hits.some((h) => h.entry.id === "s2"),
+    "semantic id surfaces in explicit search",
+  );
+  assert.equal(explicit.hits[0].entry.id, "s1", "the keyword hit still ranks first");
+  // Valve-gated injection: a semantic-only hit carries no keyword
+  // content (activation 0), so the valve drops it — injection
+  // never smuggles in a zero-content hit.
+  const injected = recallFromEntries(entries, null, "酸梅汤", {
+    semantic: mockSemantic,
+  });
+  assert.ok(
+    injected.hits.every((h) => h.entry.id !== "s2"),
+    "semantic-only hit is gated out of injection",
+  );
+  assert.ok(injected.hits.some((h) => h.entry.id === "s1"), "keyword hit still injects");
+  // Unknown ids from the provider are ignored, never created.
+  const unknown = recallFromEntries(entries, null, "酸梅汤", {
+    limit: 5,
+    semantic: {
+      kind: "semantic" as const,
+      retrieveIds: () => ["no-such-id"],
+    },
+  });
+  assert.ok(unknown.hits.every((h) => h.entry.id !== "no-such-id"));
+  // A throwing provider degrades to keyword-only.
+  const throwing = recallFromEntries(entries, null, "酸梅汤", {
+    limit: 5,
+    semantic: {
+      kind: "semantic" as const,
+      retrieveIds: () => {
+        throw new Error("embedding down");
+      },
+    },
+  });
+  assert.deepEqual(
+    throwing.hits.map((h) => h.entry.id),
+    recallFromEntries(entries, null, "酸梅汤", { limit: 5 }).hits.map((h) => h.entry.id),
+    "throwing semantic falls back to keyword-only",
+  );
+});
+
+// ---- 0.5.1 ---------------------------------------------------------
+// One check per 0.5.1 item (0.4.3 items 6/7/9/10/11/12/13, 0.4.5
+// new issues 5/6/7/8/9, §四 small items). Each on its own temp
+// dir so the fixtures never interfere with the earlier suites.
+
+check("0.5.1 (0.4.3 item 10): a corrupt beliefs.json is backed up, warned about, never silently emptied", () => {
+  const dirC = mkdtempSync(join(tmpdir(), "memory-core-051-corrupt-beliefs-"));
+  writeFileSync(join(dirC, "MEMORY.md"), fixtureMemory, "utf8");
+  const garbage = "{not json,,,";
+  writeFileSync(join(dirC, "beliefs.json"), garbage, "utf8");
+  const store = new BeliefStore(dirC);
+  assert.equal(store.hasLoadFailed, true, "load failure is flagged");
+  const backup = store.corruptBackupPath;
+  assert.ok(backup !== null && existsSync(backup), "a .corrupt-* backup was taken");
+  assert.equal(readFileSync(backup as string, "utf8"), garbage, "the backup holds the original bytes");
+  assert.equal(store.size, 0, "in-memory list is empty but the file is untouched");
+  assert.equal(readFileSync(join(dirC, "beliefs.json"), "utf8"), garbage, "the corrupt file was not overwritten on load");
+  assert.throws(() => store.save(), /拒绝覆盖/, "save refuses while the load has failed");
+  assert.equal(readFileSync(join(dirC, "beliefs.json"), "utf8"), garbage, "the refused save left the file alone");
+});
+
+check("0.5.1 (0.4.3 item 10): corrupt fragments/attributes are backed up too, and their saves refuse", () => {
+  const dirC = mkdtempSync(join(tmpdir(), "memory-core-051-corrupt-frag-attr-"));
+  writeFileSync(join(dirC, "MEMORY.md"), fixtureMemory, "utf8");
+  writeFileSync(join(dirC, "fragments.json"), "{broken", "utf8");
+  writeFileSync(join(dirC, "attributes.json"), "[1,2", "utf8");
+  const frags = new FragmentStore(dirC);
+  assert.equal(frags.hasLoadFailed, true, "fragments load failure flagged");
+  assert.ok(frags.corruptBackupPath !== null && existsSync(frags.corruptBackupPath as string), "fragments backup taken");
+  assert.throws(() => frags.save(), /拒绝覆盖/, "fragments save refuses");
+  const attrs = new AttributeStore(dirC);
+  assert.equal(attrs.hasLoadFailed, true, "attributes load failure flagged");
+  assert.ok(attrs.corruptBackupPath !== null && existsSync(attrs.corruptBackupPath as string), "attributes backup taken");
+  assert.throws(() => attrs.save(), /拒绝覆盖/, "attributes save refuses");
+});
+
+check("0.5.1 (0.4.3 item 10): a corrupt graph.json keeps its old edges in memory, flags backfill, still saves", () => {
+  const dirC = mkdtempSync(join(tmpdir(), "memory-core-051-corrupt-graph-"));
+  const e1 = { id: "g-1", ts: 1000, date: "2026/11/07", time: "10:00", role: "user", window: "persona", sessionId: "s1", importance: "light", text: "我最喜欢喝酸梅汤" } as MemoryEntry;
+  const e2 = { id: "g-2", ts: 2000, date: "2026/11/07", time: "10:01", role: "user", window: "persona", sessionId: "s1", importance: "light", text: "酸梅汤真好喝" } as MemoryEntry;
+  const idx = new KeywordIndex(join(dirC, "index.json"));
+  idx.build([e1, e2]);
+  const graph = new MemoryGraph(dirC);
+  graph.backfill([e1, e2], idx, 3000);
+  assert.ok(graph.size >= 1, "backfill linked the shared keyword");
+  const before = graph.size;
+  writeFileSync(join(dirC, "graph.json"), "{broken", "utf8");
+  graph.reload();
+  assert.equal(graph.hasLoadFailed, true, "graph load failure flagged");
+  assert.ok(graph.corruptBackupPath !== null && existsSync(graph.corruptBackupPath as string), "graph backup taken");
+  assert.equal(graph.size, before, "failed reload keeps the old edges");
+  assert.equal(graph.needsBackfill, true, "failed load flags backfill");
+  // The graph is derived data — saving it back (old edges) is
+  // allowed, unlike the other three stores.
+  assert.doesNotThrow(() => graph.save(), "graph save still allowed");
+  assert.ok(JSON.parse(readFileSync(join(dirC, "graph.json"), "utf8")).edges.length >= 1, "saved graph parses again");
+});
+
+check("0.5.1 (0.4.3 item 10): beliefs.json is snapshotted and restored (see the 0.4.3 snapshot check above)", () => {
+  // Covered by the updated "0.4.3 snapshot" check: beliefs.json is
+  // in the snapshot and a restore brings it back. This check pins
+  // the file list so the allowlist cannot silently lose it again.
+  const dirS = mkdtempSync(join(tmpdir(), "memory-core-051-snap-beliefs-"));
+  writeFileSync(join(dirS, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreS = new MemoryCore({ dataDir: dirS });
+  const ev = coreS.record({ role: "user", text: "昨晚难过的时候第一个想到的就是你", window: "persona", sessionId: "s1" });
+  coreS.createBelief({ dimension: "trust", statement: "他难过时会来找我", entryId: ev.id, quote: "昨晚难过的时候第一个想到的就是你" });
+  const snap = coreS.snapshot();
+  assert.ok(
+    readdirSync(join(dirS, ".snapshots", snap)).includes("beliefs.json"),
+    "snapshot carries beliefs.json",
+  );
+});
+
+check("0.5.1 (0.4.3 item 11): a second core's flush does not clobber another core's belief write", () => {
+  const dirD = mkdtempSync(join(tmpdir(), "memory-core-051-dual-"));
+  writeFileSync(join(dirD, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreA = new MemoryCore({ dataDir: dirD });
+  const coreB = new MemoryCore({ dataDir: dirD });
+  const ev = coreA.record({ role: "user", text: "昨晚难过的时候第一个想到的就是你", window: "persona", sessionId: "s1" });
+  coreA.flush();
+  const created = coreA.createBelief({ dimension: "trust", statement: "他难过时会来找我", entryId: ev.id, quote: "昨晚难过的时候第一个想到的就是你" });
+  assert.equal(created.ok, true, "A's belief is stored");
+  // B never saw the belief; its next record flushes all stores.
+  // The store fingerprint must make B reload first.
+  coreB.record({ role: "user", text: "今天天气很好", window: "persona", sessionId: "s2" });
+  coreB.flush();
+  const coreC = new MemoryCore({ dataDir: dirD });
+  assert.equal(coreC.listBeliefs().length, 1, "A's belief survived B's flush");
+  assert.equal(coreC.listBeliefs()[0].statement, "他难过时会来找我");
+});
+
+check("0.5.1 (0.4.3 item 9): the three reported fragment cases — inversion refused, latin case accepted, 1-char quote refused", () => {
+  const dirF = mkdtempSync(join(tmpdir(), "memory-core-051-fragment-"));
+  writeFileSync(join(dirF, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreF = new MemoryCore({ dataDir: dirF });
+  const srcNeg = coreF.record({ role: "user", text: "我没有生气，就是有点累", window: "persona", sessionId: "s1" });
+  const srcDsh = coreF.record({ role: "user", text: "我明天还想跟你聊 DSH 的插件", window: "persona", sessionId: "s1" });
+  coreF.flush();
+  // 1. Semantic inversion: "我没有生气" -> "我生气了" must be refused.
+  const inverted = coreF.createFragment({ sourceIds: [srcNeg.id], text: "我生气了", tone: "很喜欢", quotes: ["没有生气"], topic: "生气" });
+  assert.equal(inverted.ok, false, "inversion is refused");
+  assert.ok((inverted.reasons ?? []).some((r) => /语义反转/.test(r)), `reason names the inversion: ${JSON.stringify(inverted.reasons)}`);
+  // 1b. The same source kept negative is fine (negation bigram kept).
+  const keptNeg = coreF.createFragment({ sourceIds: [srcNeg.id], text: "我没有生气，就是有点累", tone: "很喜欢", quotes: ["没有生气，就是有点累"], topic: "累" });
+  assert.equal(keptNeg.ok, true, `negation bigram kept: ${JSON.stringify(keptNeg)}`);
+  // 2. Latin case: fragment "dsh" against source "DSH" must be accepted.
+  const latin = coreF.createFragment({ sourceIds: [srcDsh.id], text: "他还想跟你聊 dsh 插件", tone: "很喜欢", quotes: ["明天还想跟你聊"], topic: "DSH" });
+  assert.equal(latin.ok, true, `lowercase dsh matches DSH: ${JSON.stringify(latin)}`);
+  // 3. One-char quote must be refused (min 4).
+  assert.equal(FRAGMENT_MIN_QUOTE_CHARS, 4, "min quote is 4 chars");
+  const short = coreF.createFragment({ sourceIds: [srcNeg.id], text: "有点累", tone: "很喜欢", quotes: ["累"], topic: "累" });
+  assert.equal(short.ok, false, "1-char quote is refused");
+  assert.ok((short.reasons ?? []).some((r) => /引用太短/.test(r)), `reason names the quote length: ${JSON.stringify(short.reasons)}`);
+});
+
+check("0.5.1 (0.4.3 item 7): support dedups by entryId; uncertainty is 0.8/(1+proofCount)", () => {
+  const dirB = mkdtempSync(join(tmpdir(), "memory-core-051-belief-"));
+  writeFileSync(join(dirB, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreB = new MemoryCore({ dataDir: dirB });
+  const b1 = coreB.record({ role: "user", text: "昨晚难过的时候第一个想到的就是你", window: "persona", sessionId: "s1" });
+  const b2 = coreB.record({ role: "user", text: "你说过会一直在我身边", window: "persona", sessionId: "s1" });
+  coreB.flush();
+  const created = coreB.createBelief({ dimension: "trust", statement: "他难过时会来找我", entryId: b1.id, quote: "昨晚难过的时候第一个想到的就是你" });
+  assert.equal(created.ok, true);
+  assert.equal(created.belief?.uncertainty, 0.4, "1 proof -> 0.8/2");
+  assert.equal(uncertaintyFor(0), 0.8, "0 proofs -> 0.8");
+  assert.equal(uncertaintyFor(3), 0.2, "3 proofs -> 0.8/4");
+  const dup = coreB.supportBelief(created.belief?.id as string, b1.id, "昨晚难过的时候第一个想到的就是你", 0.1);
+  assert.equal(dup.ok, true);
+  assert.equal(dup.duplicate, true, "same entry supporting twice is a duplicate");
+  assert.equal(dup.belief?.strength, created.belief?.strength, "duplicate moves nothing");
+  assert.equal(dup.belief?.proofCount, 1, "duplicate adds no proof");
+  assert.equal(dup.belief?.uncertainty, 0.4, "uncertainty unchanged by the duplicate");
+  const second = coreB.supportBelief(created.belief?.id as string, b2.id, "你说过会一直在我身边", 0.1);
+  assert.equal(second.ok, true);
+  assert.equal(second.duplicate, undefined, "a fresh entry is a real second proof");
+  assert.equal(second.belief?.proofCount, 2);
+  assert.ok(Math.abs((second.belief?.uncertainty ?? 0) - 0.8 / 3) < 1e-9, "2 proofs -> 0.8/3");
+});
+
+check("0.5.1 (0.4.3 item 13): review topics drop stopword/cross-boundary bigrams, keep real topics", () => {
+  for (const junk of ["把这", "不到", "吃完"]) {
+    assert.equal(isReviewTopicToken(junk), false, `${junk} is not a topic`);
+  }
+  for (const good of ["补偿", "查岗", "酸梅汤"]) {
+    assert.equal(isReviewTopicToken(good), true, `${good} is a topic`);
+  }
+});
+
+check("0.5.1 (0.4.5 item 7): a session edge upgraded to keyword is counted, and the review summary says so", () => {
+  const dirG = mkdtempSync(join(tmpdir(), "memory-core-051-graph-upgrade-"));
+  const e1 = { id: "up-1", ts: 1000, date: "2026/11/07", time: "10:00", role: "user", window: "persona", sessionId: "s1", importance: "light", text: "我最喜欢喝酸梅汤" } as MemoryEntry;
+  const e2 = { id: "up-2", ts: 2000, date: "2026/11/07", time: "10:01", role: "user", window: "persona", sessionId: "s1", importance: "light", text: "酸梅汤真好喝" } as MemoryEntry;
+  // Thin index: no shared token visible, so the pair links as a
+  // session edge only.
+  const idxThin = new KeywordIndex(join(dirG, "index.json"));
+  const graph = new MemoryGraph(dirG);
+  graph.linkNewEntry(e2, idxThin, e1, 3000);
+  assert.equal(graph.find(e1.id, e2.id)?.type, "session", "thin index leaves a session edge");
+  // Full index, onlyNew (the backfill path): the shared keyword
+  // upgrades it in place.
+  const idxFull = new KeywordIndex(join(dirG, "index.json"));
+  idxFull.build([e1, e2]);
+  const before = graph.size;
+  graph.linkNewEntry(e2, idxFull, e1, 3000, true);
+  assert.equal(graph.find(e1.id, e2.id)?.type, "keyword", "the session edge became a keyword edge");
+  assert.equal(graph.size, before, "an upgrade is not a new edge");
+  assert.equal(graph.lastBackfillUpgraded, 1, "the upgrade is counted");
+  // And the review summary carries it — but on a second graph
+  // that still holds only the session edge, because runReview's
+  // own backfill resets the counter first and does the upgrade
+  // itself.
+  const graph2 = new MemoryGraph(dirG);
+  graph2.linkNewEntry(e2, idxThin, e1, 3000);
+  assert.equal(graph2.find(e1.id, e2.id)?.type, "session", "second graph starts from a session edge");
+  const attrs = new AttributeStore(dirG);
+  const result = runReview({ dataDir: dirG, entries: [e1, e2], graph: graph2, attrs, index: idxFull, now: 3000 });
+  assert.ok(result.ran, "review ran");
+  assert.equal(result.lastStats.edgesUpgraded, 1, "lastStats counts the upgrade");
+  assert.ok(result.lastSummary.includes("（另有 1 条边升级。）"), `summary says so: ${result.lastSummary}`);
+});
+
+check("0.5.1 (0.4.3 item 6): a lone weak token is noise without an anchor, context with one", () => {
+  const dirW = mkdtempSync(join(tmpdir(), "memory-core-051-weak-token-"));
+  writeFileSync(join(dirW, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreW = new MemoryCore({ dataDir: dirW });
+  const nowW = Date.now();
+  coreW.record({ role: "user", text: "我最喜欢喝酸梅汤", window: "persona", sessionId: "s1", ts: nowW });
+  coreW.record({ role: "user", text: "我最喜欢的颜色是蓝色", window: "persona", sessionId: "s1", ts: nowW });
+  coreW.record({ role: "user", text: "我最喜欢的颜色是绿色", window: "persona", sessionId: "s1", ts: nowW });
+  const wCoffee = coreW.record({ role: "user", text: "我不喝咖啡，喝了心慌", window: "persona", sessionId: "s1", ts: nowW });
+  const wNow = coreW.record({ role: "user", text: "我现在住在海淀区", window: "persona", sessionId: "s1", ts: nowW });
+  coreW.flush();
+  // "喜欢" (df=3) is the only match and nothing anchors the query:
+  // no-evidence, zero hits.
+  assert.equal(coreW.recall("她喜欢什么牌子的钢笔", { limit: 5, tokenCap: 1500 }).hits.length, 0, "lone weak token, no anchor -> nothing");
+  // m17 anchors the query (不喝/喝咖/咖啡, 3 strong tokens), so the
+  // 现在-only hit is context, not noise — it stays and seeds the
+  // graph walk (benchmark q15: rank 4).
+  const anchored = coreW.recall("她现在喝不喝咖啡", { limit: 5, tokenCap: 1500 });
+  assert.ok(anchored.hits.some((h) => h.entry.id === wCoffee.id), "anchored hit stays");
+  assert.ok(anchored.hits.some((h) => h.entry.id === wNow.id), "weak single-token companion stays when anchored");
+});
+
+check("0.5.1 (0.4.3 item 12): createFragment refuses a task-window source", () => {
+  const dirF = mkdtempSync(join(tmpdir(), "memory-core-051-fragment-window-"));
+  writeFileSync(join(dirF, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreF = new MemoryCore({ dataDir: dirF });
+  const taskEv = coreF.record({ role: "user", text: "任务窗口的备忘：酸梅汤真好喝", window: "task", sessionId: "s-task" });
+  const personaEv = coreF.record({ role: "user", text: "酸梅汤真好喝", window: "persona", sessionId: "s1" });
+  coreF.flush();
+  const refused = coreF.createFragment({ sourceIds: [taskEv.id], text: "她很喜欢酸梅汤", tone: "很喜欢", quotes: ["酸梅汤真好喝"], topic: "酸梅汤" });
+  assert.equal(refused.ok, false, "task source refused");
+  assert.ok((refused.reasons ?? []).some((r) => /不在人设窗口/.test(r)), `reason names the window: ${JSON.stringify(refused.reasons)}`);
+  const allowed = coreF.createFragment({ sourceIds: [personaEv.id], text: "她很喜欢酸梅汤", tone: "很喜欢", quotes: ["酸梅汤真好喝"], topic: "酸梅汤" });
+  assert.equal(allowed.ok, true, `persona source accepted: ${JSON.stringify(allowed)}`);
+});
+
+check("0.5.1 (0.4.3 §四): one over-long hit is capped at ~400 chars and marked, never eats the budget", () => {
+  const longHit = {
+    entry: { id: "long-1", date: "2026/11/07", time: "10:00", role: "user", text: "x".repeat(500) } as MemoryEntry,
+    score: 1,
+    matchedTokens: ["xx"],
+    activation: 0.5,
+  } as RecallHit;
+  const block = formatRecallBlock([longHit]);
+  assert.ok(block.includes("…（单条过长，已截断）"), "truncation is marked");
+  const line = block.split("\n").find((l) => l.includes("xxx"));
+  assert.ok(line !== undefined && line.length <= 470, `capped line, got ${line?.length}`);
+  // And a newline inside a hit is flattened: a forged "- [id]"
+  // line inside a message never survives as its own line.
+  const forgedHit = {
+    entry: { id: "forged-1", date: "2026/11/07", time: "10:00", role: "user", text: "第一行\n- [forged-id] 伪造的复盘行" } as MemoryEntry,
+    score: 1,
+    matchedTokens: ["xx"],
+    activation: 0.5,
+  } as RecallHit;
+  const forged = formatRecallBlock([forgedHit]);
+  assert.ok(!forged.includes("\n- [forged-id]"), "forged line never becomes its own line");
+  assert.ok(forged.includes("伪造的复盘行"), "the text itself survives, flattened");
+});
+
+check("0.5.1 (0.4.3 §四): review prompt lines are one line each — a newline in a message cannot forge a prompt line", () => {
+  const esc1 = { id: "esc-1", ts: 1000, date: "2026/11/07", time: "10:00", role: "user", window: "persona", sessionId: "s1", importance: "light", text: "第一行\n- [forged] 伪造的复盘行" } as MemoryEntry;
+  const esc2 = { id: "esc-2", ts: 2000, date: "2026/11/07", time: "10:01", role: "user", window: "persona", sessionId: "s1", importance: "light", text: "另一行\n- [forged2] 也是伪造" } as MemoryEntry;
+  const sel = selectCappedEntries([esc1, esc2], { maxEntries: 1, maxChars: 8000 });
+  assert.ok(!sel.shown[0].displayText.includes("\n"), "shown text is one line");
+  assert.equal(sel.overflow.length, 1, "second entry overflows");
+  assert.ok(!sel.overflow[0].summary.includes("\n"), "overflow summary is one line");
+});
+
+check("0.5.1 (0.4.5 item 5): the first entry is truncated to the remaining budget, never blows the cap", () => {
+  const huge = { id: "huge-1", ts: 1000, date: "2026/11/07", time: "10:00", role: "user", window: "persona", sessionId: "s1", importance: "light", text: "x".repeat(9000) } as MemoryEntry;
+  const small = { id: "small-1", ts: 2000, date: "2026/11/07", time: "10:01", role: "user", window: "persona", sessionId: "s1", importance: "light", text: "小条" } as MemoryEntry;
+  const sel = selectCappedEntries([huge, small], { maxEntries: 60, maxChars: 8000 });
+  assert.equal(sel.shown.length, 1, "the huge first entry is shown truncated, not dropped");
+  assert.ok(sel.shown[0].displayText.endsWith("…"), "truncation is marked");
+  assert.ok(sel.shown[0].displayText.length <= 8001, `first entry respects the budget, got ${sel.shown[0].displayText.length}`);
+  assert.equal(sel.overflow.length, 1, "the small entry overflows (budget spent)");
+});
+
+check("0.5.1 (0.4.3 §四): the lock owner records hostname + process start; arbiter staleness is 1s", () => {
+  assert.equal(ARBITER_STALE_MS, 1000, "arbiter staleness is 1s, not the 5s acquire timeout");
+  const dirL = mkdtempSync(join(tmpdir(), "memory-core-051-lock-"));
+  const release = acquireWriteLock(dirL, { timeoutMs: 2000 });
+  try {
+    const owner = JSON.parse(readFileSync(join(lockDirPath(dirL), "owner.json"), "utf8")) as { host?: string; startedAt?: number; pid?: number };
+    assert.equal(owner.host, hostname(), "owner records the hostname");
+    assert.equal(typeof owner.startedAt, "number", "owner records the process start");
+    // 0.5.2: process start is approximate (wall clock vs monotonic
+    // uptime) and a long-running demo can exceed a minute; compare
+    // against a generous window, not "<= now".
+    assert.ok(
+      Number.isFinite(owner.startedAt) &&
+        (owner.startedAt as number) > Date.now() - 600000,
+      "startedAt is recent",
+    );
+    assert.equal(owner.pid, process.pid, "owner still records the pid");
+  } finally {
+    release();
+  }
+});
+
+check("0.5.1 (0.4.3 §四): atomic writes are 0600, and stale temp leftovers are cleaned on start", () => {
+  const dirA = mkdtempSync(join(tmpdir(), "memory-core-051-atomic-"));
+  const target = join(dirA, "w.txt");
+  atomicWriteText(target, "hello");
+  // POSIX modes do not apply on Windows (ACL inheritance instead).
+  if (process.platform !== "win32") {
+    assert.equal(statSync(target).mode & 0o777, 0o600, "atomic write is 0600");
+  }
+  const oldTmp = join(dirA, ".tmp-old");
+  const newTmp = join(dirA, ".tmp-new");
+  writeFileSync(oldTmp, "x");
+  writeFileSync(newTmp, "x");
+  const past = new Date(Date.now() - 120000);
+  utimesSync(oldTmp, past, past);
+  cleanTempLeftovers(dirA);
+  assert.equal(existsSync(oldTmp), false, "stale temp cleaned");
+  assert.equal(existsSync(newTmp), true, "fresh temp kept");
+  assert.equal(existsSync(target), true, "real file untouched");
+  // And a fresh core cleans on construction too.
+  writeFileSync(oldTmp, "x");
+  utimesSync(oldTmp, past, past);
+  writeFileSync(join(dirA, "MEMORY.md"), fixtureMemory, "utf8");
+  new MemoryCore({ dataDir: dirA });
+  assert.equal(existsSync(oldTmp), false, "constructor cleans stale temps");
+});
+
+check("0.5.1 (0.4.3 §四): starmap fills a missing date from ts, and safeJson escapes U+2028/U+2029", () => {
+  const dateless = { id: "sm-1", ts: local(2026, 11, 7, 10, 0), text: "没有日期的老行", role: "user", window: "persona", sessionId: "s1", importance: "light" } as unknown as MemoryEntry;
+  const data = buildStarmapData([dateless], [], new Map(), Date.now());
+  assert.equal(data.memories.length, 1, "one star");
+  assert.match(data.memories[0].at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00$/, `date filled from ts, got ${data.memories[0].at}`);
+  const payload = safeJsonForHtml({ t: "a b c" });
+  assert.ok(!payload.includes(" ") && !payload.includes(" "), "no raw line/paragraph separators");
+  assert.ok(payload.includes("\\u2028") && payload.includes("\\u2029"), "escaped as \\u2028/\\u2029");
+});
+
+check("0.5.1 (0.4.3 §四): defaultClarity runs at the detailLambda half-life (heavy 41d, light 26d)", () => {
+  const nowC = Date.now();
+  const heavy = { importance: "heavy", text: "x", ts: nowC - 41 * 86400000 } as MemoryEntry;
+  const light = { importance: "light", text: "x", ts: nowC - 26 * 86400000 } as MemoryEntry;
+  assert.ok(Math.abs(defaultClarity(heavy, nowC) - 0.5) < 0.01, `heavy half-life is 41 days, got ${defaultClarity(heavy, nowC)}`);
+  assert.ok(Math.abs(defaultClarity(light, nowC) - 0.5) < 0.01, `light half-life is 26 days, got ${defaultClarity(light, nowC)}`);
+});
+
+check("0.5.1 (0.4.3 §四): a suspect mark survives a reload before flush", () => {
+  const dirM = mkdtempSync(join(tmpdir(), "memory-core-051-suspect-"));
+  writeFileSync(join(dirM, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreM = new MemoryCore({ dataDir: dirM });
+  const mEv = coreM.record({ role: "user", text: "酸梅汤真好喝", window: "persona", sessionId: "s1" });
+  coreM.flush();
+  const created = coreM.createFragment({ sourceIds: [mEv.id], text: "她很喜欢酸梅汤", tone: "很喜欢", quotes: ["酸梅汤真好喝"], topic: "酸梅汤" });
+  assert.equal(created.ok, true, `fragment created: ${JSON.stringify(created)}`);
+  const fid = created.fragment?.id as string;
+  const store = new FragmentStore(dirM);
+  assert.equal(store.markSuspect(fid, "retrieval check failed"), true);
+  store.reload();
+  assert.equal(store.get(fid)?.suspect, true, "suspect survives a reload before flush");
+  store.save();
+  const store2 = new FragmentStore(dirM);
+  assert.equal(store2.get(fid)?.suspect, true, "suspect persists to disk on flush");
+});
+
+check("0.5.1 (0.4.3 §四): belief ids are max suffix + 1, never reused after a row drops", () => {
+  const dirI = mkdtempSync(join(tmpdir(), "memory-core-051-belief-id-"));
+  writeFileSync(join(dirI, "beliefs.json"), JSON.stringify({ version: 1, beliefs: [
+    { id: "BEL_TRUST_001", dimension: "trust", statement: "s1", strength: 0.5, evidence: [], proofCount: 0, uncertainty: 0.8, updatedAt: 1, contradicting: [] },
+    { id: "BEL_TRUST_003", dimension: "trust", statement: "s3", strength: 0.5, evidence: [], proofCount: 0, uncertainty: 0.8, updatedAt: 1, contradicting: [] },
+  ] }), "utf8");
+  const store = new BeliefStore(dirI);
+  assert.equal(store.size, 2, "both rows load");
+  const made = store.create({ dimension: "trust", statement: "new belief" }, new Map(), Date.now());
+  assert.equal(made.ok, true, `create ok: ${JSON.stringify(made)}`);
+  assert.equal(made.belief?.id, "BEL_TRUST_004", "id is max suffix + 1, not row count + 1");
+});
+
+check("0.5.1 (0.4.3 §四): reflections are capped — 1000 chars, 200 stored", () => {
+  const dirR = mkdtempSync(join(tmpdir(), "memory-core-051-reflection-cap-"));
+  writeFileSync(join(dirR, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreR = new MemoryCore({ dataDir: dirR });
+  const rEv = coreR.record({ role: "user", text: "今天累坏了，跑了十公里", window: "persona", sessionId: "s1" });
+  coreR.flush();
+  const tooLong = coreR.saveReflection("x".repeat(REFLECTION_MAX_CHARS + 1), [rEv.id]);
+  assert.equal(tooLong.ok, false, "over-long conclusion refused");
+  assert.ok((tooLong.reasons ?? []).some((r) => new RegExp(String(REFLECTION_MAX_CHARS)).test(r)), `reason names the cap: ${JSON.stringify(tooLong.reasons)}`);
+  // Count cap, at the unit level: 200 stored reflections refuse the 201st.
+  const store = new FragmentStore(dirR);
+  for (let i = 0; i < REFLECTION_MAX_COUNT; i++) {
+    store.add({ id: `FRG_R_${i}`, type: "reflection", sourceIds: [rEv.id], text: `反思${i}`, tone: { label: "平静", level: "unknown", intensity: 0 }, quotes: [], topic: "", keywords: [], createdAt: Date.now(), verified: true } as unknown as Fragment);
+  }
+  assert.equal(store.all().filter((f) => f.type === "reflection").length, REFLECTION_MAX_COUNT, "200 stored");
+  const capped = saveReflection("他今天很累「跑了十公里」", [rEv.id], new Map([[rEv.id, rEv]]), store);
+  assert.equal(capped.ok, false, "201st reflection refused");
+  assert.ok((capped.reasons ?? []).some((r) => /200/.test(r)), `reason names the count cap: ${JSON.stringify(capped.reasons)}`);
+});
+
+check("0.5.1 (0.4.3 §四): yesterdayEntries is a calendar day, not now minus 24h", () => {
+  const dirY = mkdtempSync(join(tmpdir(), "memory-core-051-yesterday-"));
+  writeFileSync(join(dirY, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreY = new MemoryCore({ dataDir: dirY });
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  const yEv = coreY.record({ role: "user", text: "昨天晚上的事", window: "persona", sessionId: "s1", ts: startOfToday.getTime() - 3600000 });
+  const tEv = coreY.record({ role: "user", text: "今天凌晨的事", window: "persona", sessionId: "s1", ts: startOfToday.getTime() + 3600000 });
+  coreY.flush();
+  const yest = coreY.yesterdayEntries();
+  assert.ok(yest.some((e) => e.id === yEv.id), "yesterday 23:00 is yesterday");
+  assert.ok(!yest.some((e) => e.id === tEv.id), "today 01:00 is not yesterday, even inside 24h");
+});
+
+check("0.5.1 (0.4.3 §四): loadSummaries never throws on a missing dir; entriesByIds keeps input order", () => {
+  const missing = join(tmpdir(), `memory-core-051-no-such-dir-${Date.now()}`);
+  assert.equal(loadSummaries(missing).size, 0, "missing dir reads as no summaries, never throws");
+  const dirE = mkdtempSync(join(tmpdir(), "memory-core-051-entries-by-ids-"));
+  writeFileSync(join(dirE, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreE = new MemoryCore({ dataDir: dirE });
+  const e1 = coreE.record({ role: "user", text: "第一条", window: "persona", sessionId: "s1" });
+  const e2 = coreE.record({ role: "user", text: "第二条", window: "persona", sessionId: "s1" });
+  coreE.flush();
+  assert.deepEqual(coreE.entriesByIds([e2.id, e1.id]).map((e) => e.id), [e2.id, e1.id], "input order kept");
+  assert.deepEqual(coreE.entriesByIds(["no-such"]), [], "unknown ids are skipped");
+});
+
+check("0.5.1 (0.4.5 item 6): a stale-window flag still counts until the next review clears it", () => {
+  const dirP = mkdtempSync(join(tmpdir(), "memory-core-051-pending-stale-"));
+  writeFileSync(join(dirP, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreP = new MemoryCore({ dataDir: dirP });
+  const pOld = coreP.record({ role: "user", text: "他喜欢吃辣", window: "persona", importance: "heavy", sessionId: "s1", ts: local(2026, 9, 28, 10, 0) });
+  coreP.record({ role: "user", text: "他不吃辣了", window: "persona", sessionId: "s1", ts: local(2026, 11, 6, 10, 0) });
+  coreP.flush();
+  const flagged = coreP.review(true, local(2026, 11, 7, 9, 0));
+  assert.ok(flagged?.invalidationChecks?.includes(pOld.id), "flagged");
+  assert.equal(coreP.stats().pendingInvalidationChecks, 1, "flag counts");
+  // The opposition is stale by 2026-12-10, but no review has run
+  // since: the count still says 1 — only the NEXT review clears it.
+  // That is the documented choice (文案 "待下次复盘确认"): stats
+  // counts proposals, not confirmed-invalid memories.
+  const realNow = Date.now;
+  Date.now = () => local(2026, 12, 10, 9, 0);
+  try {
+    assert.equal(coreP.stats().pendingInvalidationChecks, 1, "stale-window flag still counts until the next review runs");
+  } finally {
+    Date.now = realNow;
+  }
+  const lapsed = coreP.review(true, local(2026, 12, 10, 9, 0));
+  assert.ok(!(lapsed?.invalidationChecks ?? []).includes(pOld.id), "lapse review drops it");
+  assert.equal(coreP.stats().pendingInvalidationChecks, 0, "count back to 0 after the lapse review");
+});
+
 console.log(`\nALL PASS (0.4.6 new issue 1 + 5)`);
+
+// ---- 0.5.1 expansion: fact chain + forgetting, local embedding,
+// admin centre, experience learning, goals/todos -------------------
+// Five items, each on its own temp dir. The embedding checks use a
+// deterministic mock provider (a fixed synonym table), never the
+// real model — the real model is measured by
+// test/semantic-benchmark.ts --real, not by this demo.
+const cliPath = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "src",
+  "admin-cli.ts",
+);
+const cliJson = (dir: string, ...args: string[]): any =>
+  JSON.parse(
+    execFileSync(process.execPath, [cliPath, "--dataDir", dir, ...args], {
+      encoding: "utf8",
+    }),
+  );
+
+check("0.5.1 exp item 1: a present question ranks the current version first and marks the old one ·旧版", () => {
+  const dirF = mkdtempSync(join(tmpdir(), "memory-core-051-fact-present-"));
+  writeFileSync(join(dirF, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreF = new MemoryCore({ dataDir: dirF });
+  const old = coreF.record({ role: "user", text: "我最喜欢的颜色是蓝色", window: "persona", importance: "light", sessionId: "s1", ts: Date.now() - 60 * DAY_MS, factKey: "最喜欢的颜色" });
+  const cur = coreF.record({ role: "user", text: "我现在最喜欢的颜色是绿色，早就不是蓝色了", window: "persona", importance: "light", sessionId: "s1", ts: Date.now() - 3 * DAY_MS, factKey: "最喜欢的颜色", supersedes: old.id });
+  void cur;
+  const r = coreF.recall("她现在最喜欢什么颜色", { window: "persona", limit: 5, tokenCap: 1500 });
+  assert.ok(r.hits.length >= 2, "both versions surface");
+  assert.equal(r.hits[0].entry.text, "我现在最喜欢的颜色是绿色，早就不是蓝色了", "current version first");
+  const oldHit = r.hits.find((h) => h.entry.id === old.id);
+  assert.ok(oldHit !== undefined && oldHit.superseded === true, "old version is flagged superseded");
+  assert.ok(formatRecallBlock(r.hits).includes("·旧版"), "injected block marks the old version");
+  // q15: the current 美式 outranks the dead 不喝咖啡 even though
+  // the old wording matches more keywords.
+  const noCoffee = coreF.record({ role: "user", text: "我不喝咖啡，喝了心慌", window: "persona", importance: "light", sessionId: "s1", ts: Date.now() - 40 * DAY_MS, factKey: "喝咖啡" });
+  const americano = coreF.record({ role: "user", text: "我最近开始喝美式了，每天早上来一杯", window: "persona", importance: "light", sessionId: "s1", ts: Date.now() - 1 * DAY_MS, factKey: "喝咖啡", supersedes: noCoffee.id });
+  const q15 = coreF.recall("她现在喝不喝咖啡", { window: "persona", limit: 5, tokenCap: 1500 });
+  assert.equal(q15.hits[0].entry.id, americano.id, "q15: current 美式 first");
+  const q15old = q15.hits.findIndex((h) => h.entry.id === noCoffee.id);
+  assert.ok(q15old === -1 || q15old > 0, "q15: dead 不喝咖啡 never first");
+  assert.equal(currentVersionOf(noCoffee, factChains(coreF.allEntries()))?.id, americano.id, "currentVersionOf points at the newer version");
+});
+
+check("0.5.1 exp item 1: a history question ranks the old version first", () => {
+  const dirH = mkdtempSync(join(tmpdir(), "memory-core-051-fact-history-"));
+  writeFileSync(join(dirH, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreH = new MemoryCore({ dataDir: dirH });
+  const old = coreH.record({ role: "user", text: "我最喜欢的颜色是蓝色", window: "persona", importance: "light", sessionId: "s1", ts: Date.now() - 60 * DAY_MS, factKey: "最喜欢的颜色" });
+  coreH.record({ role: "user", text: "我现在最喜欢的颜色是绿色，早就不是蓝色了", window: "persona", importance: "light", sessionId: "s1", ts: Date.now() - 3 * DAY_MS, factKey: "最喜欢的颜色", supersedes: old.id });
+  assert.equal(isHistoryQuery("她以前最喜欢什么颜色"), true, "以前 is a history question");
+  assert.equal(isHistoryQuery("她现在最喜欢什么颜色"), false, "现在 is not");
+  const r = coreH.recall("她以前最喜欢什么颜色", { window: "persona", limit: 5, tokenCap: 1500 });
+  assert.equal(r.hits[0].entry.id, old.id, "history question answers the old blue first");
+});
+
+check("0.5.1 exp item 1: supersedes is validated and a lone factKey is unweighted", () => {
+  const dirV = mkdtempSync(join(tmpdir(), "memory-core-051-fact-validate-"));
+  writeFileSync(join(dirV, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreV = new MemoryCore({ dataDir: dirV });
+  assert.throws(
+    () => coreV.record({ role: "user", text: "新版", window: "persona", sessionId: "s1", factKey: "颜色", supersedes: "no-such-id" }),
+    /supersedes/,
+    "supersedes must point at a real entry",
+  );
+  const other = coreV.record({ role: "user", text: "我住在朝阳区", window: "persona", sessionId: "s1", factKey: "住在哪里" });
+  assert.throws(
+    () => coreV.record({ role: "user", text: "新版", window: "persona", sessionId: "s1", factKey: "最喜欢的颜色", supersedes: other.id }),
+    /supersedes/,
+    "supersedes must share the factKey",
+  );
+  const lone = coreV.record({ role: "user", text: "我只喜欢这一个颜色", window: "persona", sessionId: "s1", factKey: "独生事实" });
+  const chains = factChains(coreV.allEntries());
+  assert.equal(factVersionFactor(lone, chains, false), 1, "single version scores 1x");
+  assert.equal(isSuperseded(lone, chains), false, "single version is not superseded");
+  assert.equal(currentVersionOf(lone, chains), null, "the current (only) version has no newer version");
+});
+
+check("0.5.1 exp item 1: request + dry-run change nothing, unapproved execute refuses, chat can never approve", () => {
+  const dirG = mkdtempSync(join(tmpdir(), "memory-core-051-forget-guard-"));
+  writeFileSync(join(dirG, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreG = new MemoryCore({ dataDir: dirG });
+  const ev = coreG.record({ role: "user", text: "我最喜欢喝酸梅汤，夏天一定要冰的", window: "persona", sessionId: "s1" });
+  const req = coreG.requestForget({ mode: "hide", entryIds: [ev.id], createdBy: "model", reason: "demo" });
+  assert.equal(req.status, "pending", "request starts pending");
+  assert.ok(coreG.recall("酸梅汤", { window: "persona", limit: 5, tokenCap: 1500 }).hits.some((h) => h.entry.id === ev.id), "request alone hides nothing");
+  const preview = coreG.dryRunForget([ev.id]);
+  assert.equal(preview.entries.length, 1, "dry-run previews the entry");
+  assert.equal(preview.entries[0].id, ev.id, "dry-run names the entry");
+  assert.equal(preview.unknown.length, 0, "dry-run knows the id");
+  assert.ok(coreG.recall("酸梅汤", { window: "persona", limit: 5, tokenCap: 1500 }).hits.some((h) => h.entry.id === ev.id), "dry-run hides nothing either");
+  assert.throws(() => coreG.executeForget(req.id, { by: "demo" }), /only an approved request can execute/, "pending request cannot execute");
+  assert.throws(
+    () => coreG.forget.approve(req.id, { channel: "model" as never, by: "chat" }),
+    /non-model channel/,
+    "a chat '我同意' can never approve — there is no model channel",
+  );
+  assert.equal(coreG.listForgetRequests()[0].status, "pending", "refused approve leaves it pending");
+});
+
+check("0.5.1 exp item 1: CLI-approved hide removes the entry from recall/search/yesterday/entriesByIds, unhide restores it", () => {
+  const dirH = mkdtempSync(join(tmpdir(), "memory-core-051-forget-hide-"));
+  writeFileSync(join(dirH, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreH = new MemoryCore({ dataDir: dirH });
+  const yest = new Date();
+  yest.setDate(yest.getDate() - 1);
+  const ev = coreH.record({ role: "user", text: "我最喜欢喝酸梅汤，夏天一定要冰的", window: "persona", sessionId: "s1", ts: yest.getTime() });
+  coreH.record({ role: "user", text: "今天天气很好", window: "persona", sessionId: "s1" });
+  assert.ok(coreH.yesterdayEntries().some((e) => e.id === ev.id), "entry is in yesterday before hiding");
+  const req = coreH.requestForget({ mode: "hide", entryIds: [ev.id], createdBy: "cli" });
+  coreH.approveForget(req.id, { channel: "cli", by: "demo" });
+  const done = coreH.executeForget(req.id, { by: "demo" });
+  assert.deepEqual(done.hidden, [ev.id], "hide reports the id");
+  assert.equal(coreH.forget.isForgotten(ev.id), true, "tombstoned");
+  assert.ok(!coreH.recall("酸梅汤", { window: "persona", limit: 5, tokenCap: 1500 }).hits.some((h) => h.entry.id === ev.id), "recall hides it");
+  assert.deepEqual(coreH.entriesByIds([ev.id]), [], "entriesByIds hides it");
+  assert.ok(!coreH.yesterdayEntries().some((e) => e.id === ev.id), "yesterday hides it");
+  assert.ok(coreH.allEntries().some((e) => e.id === ev.id), "admin view still sees the tombstoned entry");
+  const cleared = coreH.unforget([ev.id]);
+  assert.deepEqual(cleared, [ev.id], "unhide reports the id");
+  assert.ok(coreH.recall("酸梅汤", { window: "persona", limit: 5, tokenCap: 1500 }).hits.some((h) => h.entry.id === ev.id), "recall finds it again after unhide");
+});
+
+check("0.5.1 exp item 1: delete physically removes the entry, snapshots first, and writes an audit row", () => {
+  const dirD = mkdtempSync(join(tmpdir(), "memory-core-051-forget-delete-"));
+  writeFileSync(join(dirD, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreD = new MemoryCore({ dataDir: dirD });
+  const ev = coreD.record({ role: "user", text: "这句要被删掉", window: "persona", sessionId: "s1" });
+  coreD.record({ role: "user", text: "这句留下来", window: "persona", sessionId: "s1" });
+  const req = coreD.requestForget({ mode: "delete", entryIds: [ev.id], createdBy: "cli" });
+  coreD.approveForget(req.id, { channel: "cli", by: "demo" });
+  const done = coreD.executeForget(req.id, { by: "demo" });
+  assert.deepEqual(done.removed, [ev.id], "delete reports the id");
+  assert.ok(!coreD.allEntries().some((e) => e.id === ev.id), "entry is gone from the log");
+  assert.ok(coreD.recall("删掉", { window: "persona", limit: 5, tokenCap: 1500 }).hits.length === 0, "nothing recalls it");
+  assert.ok(readdirSync(join(dirD, ".snapshots")).length >= 1, "a snapshot was taken before deleting");
+  const audit = readFileSync(join(dirD, "forget-audit.jsonl"), "utf8");
+  assert.ok(audit.includes(req.id), "audit has the request id");
+  assert.ok(audit.includes("delete"), "audit names the mode");
+  const preview = coreD.dryRunForget([ev.id]);
+  assert.equal(preview.entries.length, 0, "dry-run after delete finds no entry");
+  assert.deepEqual(preview.unknown, [ev.id], "the id is now unknown");
+});
+
+check("0.5.1 exp item 1: a forget request expires after 7 days and can no longer be approved", () => {
+  const dirE = mkdtempSync(join(tmpdir(), "memory-core-051-forget-expire-"));
+  writeFileSync(join(dirE, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreE = new MemoryCore({ dataDir: dirE });
+  const ev = coreE.record({ role: "user", text: "过期的请求", window: "persona", sessionId: "s1" });
+  assert.equal(FORGET_REQUEST_TTL_MS, 7 * 24 * 3600 * 1000, "TTL is 7 days");
+  const req = coreE.requestForget({ mode: "hide", entryIds: [ev.id], createdBy: "cli" });
+  // Backdate the request on disk (core.requestForget takes no
+  // `now` — the store does, but the core API is "file now") and
+  // reload: listing must refresh the expiry flag.
+  const reqFile = join(dirE, "forget-requests.json");
+  const reqs = JSON.parse(readFileSync(reqFile, "utf8")) as { id: string; createdAt: number }[];
+  reqs[0].createdAt = Date.now() - FORGET_REQUEST_TTL_MS - 1000;
+  writeFileSync(reqFile, JSON.stringify(reqs, null, 2), "utf8");
+  const coreE2 = new MemoryCore({ dataDir: dirE });
+  assert.equal(coreE2.listForgetRequests()[0].status, "expired", "listing refreshes the expiry flag");
+  assert.throws(() => coreE2.approveForget(req.id, { channel: "cli", by: "demo" }), /expired/, "expired request cannot be approved");
+});
+
+check("0.5.1 exp item 2: cosine/normalize are exact, and the index discards a mismatch or a corrupt file and rebuilds", () => {
+  const a = new Float32Array([1, 0]);
+  const b = new Float32Array([1, 0]);
+  const c = new Float32Array([0, 1]);
+  assert.equal(cosineSimilarity(a, b), 1, "identical vectors score 1");
+  assert.equal(cosineSimilarity(a, c), 0, "orthogonal vectors score 0");
+  const n = normalizeVector(new Float32Array([3, 4]));
+  assert.ok(Math.abs(n[0] - 0.6) < 1e-6 && Math.abs(n[1] - 0.8) < 1e-6, "normalize makes a unit vector");
+  const dirI = mkdtempSync(join(tmpdir(), "memory-core-051-sem-index-"));
+  const idx = new SemanticIndex({ dataDir: dirI, modelId: "mock-a", modelRevision: "r1", dimensions: 2, pooling: "cls", queryPrefix: "" });
+  idx.upsert("e1", new Float32Array([1, 0]));
+  idx.upsert("e2", new Float32Array([0, 1]));
+  idx.save();
+  assert.equal(idx.load(), "loaded", "same identity loads");
+  const wrongModel = new SemanticIndex({ dataDir: dirI, modelId: "mock-b", modelRevision: "r1", dimensions: 2, pooling: "cls", queryPrefix: "" });
+  assert.equal(wrongModel.load(), "discarded-mismatch", "a changed model discards the index");
+  writeFileSync(join(dirI, "semantic-index.json"), "{broken", "utf8");
+  const corrupt = new SemanticIndex({ dataDir: dirI, modelId: "mock-a", modelRevision: "r1", dimensions: 2, pooling: "cls", queryPrefix: "" });
+  assert.equal(corrupt.load(), "discarded-corrupt", "a corrupt index is discarded");
+  assert.ok(readdirSync(dirI).some((f) => f.startsWith("semantic-index.json.corrupt-")), "the corrupt index was backed up");
+  assert.equal(corrupt.size, 0, "discarded index is empty, ready to rebuild");
+});
+
+await checkAsync("0.5.1 exp item 2: a mock provider's semantic-only hit surfaces in recall, scored by similarity", async () => {
+  const dirM = mkdtempSync(join(tmpdir(), "memory-core-051-sem-mock-"));
+  writeFileSync(join(dirM, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreM = new MemoryCore({ dataDir: dirM });
+  const plum = coreM.record({ role: "user", text: "我最喜欢喝酸梅汤，夏天一定要冰的", window: "persona", sessionId: "s1" });
+  coreM.record({ role: "user", text: "我不喝咖啡，喝了心慌", window: "persona", sessionId: "s1" });
+  // Mock embedding: a fixed synonym table, not a model. The query
+  // shares NO bigram with the 酸梅汤 line — only the mock knows
+  // they mean the same thing. That is the whole point of the
+  // fusion test: the hit arrives through the semantic slot.
+  const mock = {
+    modelId: "mock-synonym",
+    dimensions: 2,
+    embed: async (texts: string[]) =>
+      texts.map((t) => {
+        if (t.includes("酸梅汤") || t.includes("甜饮料")) return new Float32Array([1, 0]);
+        return new Float32Array([0, 1]);
+      }),
+  };
+  const idx = new SemanticIndex({ dataDir: dirM, modelId: mock.modelId, modelRevision: "mock", dimensions: 2, pooling: "cls", queryPrefix: "" });
+  await buildSemanticIndex(mock as never, idx, coreM.allEntries());
+  const searcher = new SemanticSearcher(mock as never, idx);
+  const noKeyword = coreM.recall("她爱喝的那种甜饮料叫什么", { window: "persona", limit: 5, tokenCap: 1500 });
+  assert.ok(!noKeyword.hits.some((h) => h.entry.id === plum.id), "keyword alone cannot find it (no shared token)");
+  const sims = new Map<string, number>();
+  const ids = (await semanticCandidateIds({ searcher, query: "她爱喝的那种甜饮料叫什么", candidates: coreM.allEntries(), minSimilarity: 0 }));
+  assert.ok(ids.includes(plum.id), "mock semantic search finds it");
+  // Similarities ride along so recall scores by similarity, not
+  // by recency (see the 0.5 floor in semantic.ts).
+  const found = await searcher.search("她爱喝的那种甜饮料叫什么", coreM.allEntries(), 5);
+  for (const f of found) sims.set(f.entry.id, f.similarity);
+  const hy = coreM.recall("她爱喝的那种甜饮料叫什么", {
+    window: "persona",
+    limit: 5,
+    tokenCap: 1500,
+    semantic: { kind: "semantic", retrieveIds: () => ids, similarityOf: (id: string) => sims.get(id) },
+  });
+  assert.ok(hy.hits.some((h) => h.entry.id === plum.id), "hybrid recall surfaces the semantic-only hit");
+  assert.equal(hy.hits[0].entry.id, plum.id, "the semantic hit ranks first on similarity");
+});
+
+await checkAsync("0.5.1 exp item 2: a hanging provider times out to keyword-only, and semantic is off by default", async () => {
+  const dirT = mkdtempSync(join(tmpdir(), "memory-core-051-sem-timeout-"));
+  writeFileSync(join(dirT, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreT = new MemoryCore({ dataDir: dirT });
+  assert.equal(coreT.semanticEnabled(), false, "semantic is off unless configured");
+  assert.deepEqual(await coreT.semanticCandidateIds("酸梅汤", []), [], "disabled semantic returns no candidates");
+  assert.equal(coreT.semanticStatus().enabled, false, "status reports disabled");
+  assert.equal(coreT.semanticMinSimilarity(), SEMANTIC_DEFAULT_MIN_SIMILARITY, "default floor is the constant");
+  const hanging = {
+    modelId: "mock-hanging",
+    dimensions: 2,
+    embed: async () => new Promise<never>(() => {}),
+  };
+  const idx = new SemanticIndex({ dataDir: dirT, modelId: hanging.modelId, modelRevision: "mock", dimensions: 2, pooling: "cls", queryPrefix: "" });
+  const searcher = new SemanticSearcher(hanging as never, idx);
+  const t0 = Date.now();
+  const ids = await semanticCandidateIds({ searcher, query: "酸梅汤", candidates: [], timeoutMs: 50 });
+  const elapsed = Date.now() - t0;
+  assert.deepEqual(ids, [], "a hanging provider falls back to []");
+  assert.ok(elapsed < 2000, `timeout actually fired (took ${elapsed}ms)`);
+});
+
+check("0.5.1 exp item 3: AdminAPI lists, edits, corrects and deletes — with an audit trail", () => {
+  const dirA = mkdtempSync(join(tmpdir(), "memory-core-051-admin-api-"));
+  writeFileSync(join(dirA, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreA = new MemoryCore({ dataDir: dirA });
+  const admin = new MemoryAdmin(coreA);
+  const ev = coreA.record({ role: "user", text: "我最喜欢的颜色是蓝色", window: "persona", sessionId: "s1", ts: Date.now() - 60 * DAY_MS, factKey: "最喜欢的颜色" });
+  coreA.record({ role: "user", text: "今天天气很好", window: "persona", sessionId: "s1" });
+  const listed = admin.listEntries({ query: "颜色" });
+  assert.equal(listed.total, 1, "list filters by query");
+  assert.equal(listed.entries[0].id, ev.id, "list finds the entry");
+  const edited = admin.editEntry(ev.id, { text: "我最喜欢的颜色是蓝色（笔误）" });
+  assert.equal(edited.text, "我最喜欢的颜色是蓝色（笔误）", "in-place edit changes the text");
+  assert.ok(existsSync(join(dirA, "admin-audit.jsonl")), "edit writes an audit row");
+  const corrected = admin.correctEntry(ev.id, { text: "我现在最喜欢的颜色是绿色", factKey: "最喜欢的颜色" });
+  assert.equal(corrected.factKey, "最喜欢的颜色", "correction carries the factKey");
+  const r = coreA.recall("她现在最喜欢什么颜色", { window: "persona", limit: 5, tokenCap: 1500 });
+  assert.equal(r.hits[0].entry.id, corrected.id, "present question answers the correction");
+  const chain = admin.factChainOf(ev.id);
+  assert.ok(chain !== null && chain.versions.length === 2, "fact chain shows both versions");
+  const before = admin.listEntries({}).total;
+  const removed = admin.deleteEntry(ev.id);
+  assert.deepEqual(removed.removed, [ev.id], "delete removes the entry");
+  assert.equal(admin.listEntries({}).total, before - 1, "list no longer shows it");
+  assert.equal(admin.getEntry(ev.id), undefined, "getEntry no longer finds it");
+  const stats = admin.stats();
+  assert.equal(stats.totalEntries, before - 1, "stats agree with the list");
+  assert.equal(stats.experiences, 0, "a fresh dir starts with no developer seeds");
+});
+
+check("0.5.1 exp item 3: the admin CLI runs stats, goals and forget end to end as a subprocess", () => {
+  const dirC = mkdtempSync(join(tmpdir(), "memory-core-051-admin-cli-"));
+  writeFileSync(join(dirC, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreC = new MemoryCore({ dataDir: dirC });
+  const ev = coreC.record({ role: "user", text: "我最喜欢喝酸梅汤", window: "persona", sessionId: "s1" });
+  const stats = cliJson(dirC, "stats");
+  assert.equal(stats.totalEntries, 1, "CLI stats sees the entry");
+  const listed = cliJson(dirC, "entries", "list", "--query", "酸梅汤");
+  assert.equal((listed.entries as unknown[]).length, 1, "CLI entries list finds it");
+  const added = cliJson(dirC, "goals", "add", "--title", "买酸梅汤") as { goal: { id: string } };
+  const goals = cliJson(dirC, "goals", "list") as unknown[];
+  assert.equal(goals.length, 1, "CLI goals list shows the added goal");
+  const done = cliJson(dirC, "goals", "done", added.goal.id) as { goal: { status: string } };
+  assert.equal(done.goal.status, "done", "CLI goals done completes it");
+  const req = cliJson(dirC, "forget", "request", "--mode", "hide", "--ids", ev.id) as { request: { id: string } };
+  const pending = cliJson(dirC, "forget", "list") as { status: string }[];
+  assert.equal(pending.length, 1, "CLI forget list shows the request");
+  assert.equal(pending[0].status, "pending", "CLI request starts pending");
+  cliJson(dirC, "forget", "approve", req.request.id);
+  const executed = cliJson(dirC, "forget", "execute", req.request.id) as { hidden: string[] };
+  assert.deepEqual(executed.hidden, [ev.id], "CLI forget execute hides it");
+  const after = cliJson(dirC, "stats");
+  assert.equal(after.totalEntries, 1, "hide keeps the entry in the log (admin view)");
+  assert.equal(after.forgotten, 1, "stats count the forgotten entry");
+});
+
+await checkAsync("0.5.1 exp item 3: the admin server answers stats/entries over loopback and edits", async () => {
+  const dirS = mkdtempSync(join(tmpdir(), "memory-core-051-admin-server-"));
+  writeFileSync(join(dirS, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreS = new MemoryCore({ dataDir: dirS });
+  const ev = coreS.record({ role: "user", text: "我最喜欢喝酸梅汤", window: "persona", sessionId: "s1" });
+  const handle = await startAdminServer(coreS, { port: 0 });
+  const auth = { authorization: `Bearer ${handle.token}` };
+  try {
+    const noAuth = await fetch(`${handle.url}/api/stats`);
+    assert.equal(noAuth.status, 401, "a loopback request without the token is refused");
+    const statsRes = await fetch(`${handle.url}/api/stats`, { headers: auth });
+    const stats = (await statsRes.json()) as Record<string, unknown>;
+    assert.equal(stats.ok, true, "stats answers ok");
+    assert.equal(stats.totalEntries, 1, "stats sees the entry");
+    const listRes = await fetch(`${handle.url}/api/entries?query=${encodeURIComponent("酸梅汤")}`, { headers: auth });
+    const listed = (await listRes.json()) as { ok: boolean; entries: { id: string }[] };
+    assert.equal(listed.ok, true, "entries list answers ok");
+    assert.equal(listed.entries.length, 1, "entries list finds it");
+    const patchRes = await fetch(`${handle.url}/api/entries/${ev.id}`, {
+      method: "PATCH",
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ text: "我最喜欢喝酸梅汤，冰的" }),
+    });
+    const patched = (await patchRes.json()) as { ok: boolean; entry: { text: string } };
+    assert.equal(patched.ok, true, "PATCH answers ok");
+    assert.equal(patched.entry.text, "我最喜欢喝酸梅汤，冰的", "PATCH changes the text");
+    const badRes = await fetch(`${handle.url}/api/entries/no-such-id`, { headers: auth });
+    const bad = (await badRes.json()) as { ok: boolean };
+    assert.equal(bad.ok, false, "unknown id answers ok:false");
+  } finally {
+    await handle.close();
+  }
+});
+
+check("0.5.1 exp item 4: an experience is recorded, matched, injected, counted, and persisted", () => {
+  const dirX = mkdtempSync(join(tmpdir(), "memory-core-051-experience-"));
+  writeFileSync(join(dirX, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreX = new MemoryCore({ dataDir: dirX });
+  assert.equal(coreX.experiences.size, 0, "a fresh dir starts empty (no developer seeds)");
+  const src = coreX.record({
+    role: "user",
+    text: "我最喜欢喝酸梅汤，夏天一定要冰的",
+    window: "persona",
+    sessionId: "s1",
+  });
+  const exp = coreX.experiences.record({
+    rule: "测试规矩：问酸梅汤要提冰的",
+    trigger: ["酸梅汤"],
+    source: "demo 测试：一条新规矩",
+    sourceIds: [src.id],
+  });
+  assert.equal(exp.verified, false, "a new rule is a candidate, not a trusted prompt rule");
+  assert.equal(
+    coreX.experiences.match("她最喜欢喝酸梅汤吗").length,
+    0,
+    "an unconfirmed rule is not injected",
+  );
+  coreX.experiences.confirm(exp.id);
+  const matched = coreX.experiences.match("她最喜欢喝酸梅汤吗");
+  assert.ok(matched.some((m) => m.experience.id === exp.id), "match finds the confirmed rule by trigger");
+  const r = coreX.recall("她最喜欢喝酸梅汤吗", { window: "persona", limit: 5, tokenCap: 1500 });
+  assert.ok(r.hits.length >= 1, "the memory itself recalls");
+  assert.ok((r.experiences ?? []).some((e) => e.rule === "测试规矩：问酸梅汤要提冰的"), "recall returns the matched rule");
+  assert.ok(r.text.includes("经验：测试规矩：问酸梅汤要提冰的"), "the injected block carries the rule");
+  assert.equal(coreX.experiences.get(exp.id)?.useCount, 1, "injection counts one use in memory");
+  coreX.flush();
+  const reloaded = new ExperienceStore(dirX);
+  assert.equal(reloaded.get(exp.id)?.useCount, 1, "useCount survives a reload");
+  assert.equal(reloaded.size, 1, "the recorded rule persists");
+  assert.equal(coreX.experiences.remove(exp.id), true, "remove drops it");
+  assert.equal(coreX.experiences.size, 0, "back to the empty store");
+});
+
+check("0.5.1 exp item 5: goals do CRUD, status transitions, and persistence", () => {
+  const dirG = mkdtempSync(join(tmpdir(), "memory-core-051-goals-"));
+  writeFileSync(join(dirG, "MEMORY.md"), fixtureMemory, "utf8");
+  const coreG = new MemoryCore({ dataDir: dirG });
+  const store = coreG.goals;
+  assert.equal(store.all().length, 0, "fresh dir has no goals");
+  const g = store.create({ title: "增肌到 130 斤", dueAt: Date.now() + 90 * DAY_MS, notes: "每周称体重" });
+  assert.equal(g.status, "open", "a goal starts open");
+  assert.equal(store.open().length, 1, "open() lists it");
+  const done = store.setStatus(g.id, "done");
+  assert.equal(done?.status, "done", "done completes it");
+  assert.equal(store.open().length, 0, "done goals leave the open list");
+  const reopened = store.setStatus(g.id, "open");
+  assert.equal(reopened?.status, "open", "done → open reopens it");
+  const updated = store.update(g.id, { title: "增肌到 130 斤，保持低体脂" });
+  assert.equal(updated?.title, "增肌到 130 斤，保持低体脂", "update renames it");
+  assert.throws(() => store.create({ title: "   " }), /non-empty title/, "empty title is refused");
+  assert.throws(() => store.setStatus(g.id, "bogus" as never), /open.*done.*dropped/, "bad status is refused");
+  const reloaded = new GoalStore(dirG);
+  assert.equal(reloaded.all().length, 1, "the goal persists across a reload");
+  assert.equal(reloaded.get(g.id)?.title, "增肌到 130 斤，保持低体脂", "the updated title persists");
+  assert.equal(store.remove(g.id), true, "remove drops it");
+  assert.equal(store.all().length, 0, "list is empty again");
+  // The admin layer sees the same store (model-readable/writable).
+  const admin = new MemoryAdmin(coreG);
+  const viaAdmin = admin.createGoal({ title: "每天跑步" });
+  assert.equal(admin.listGoals("open").length, 1, "admin lists the open goal");
+  assert.equal(admin.setGoalStatus(viaAdmin.id, "dropped")?.status, "dropped", "admin can drop it");
+});
+
+// ---- 0.5.2: P0 regressions -----------------------------------------
+// Each check pins one shipped P0 fix so a later refactor cannot
+// quietly bring the old behaviour back.
+
+check("0.5.3 P1-10: an interrupted delete journal rolls back on the next Core", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-053-journal-"));
+  const c = new MemoryCore({ dataDir: d });
+  const e = c.record({ role: "user", text: "删除事务测试", window: "persona", sessionId: "s1" });
+  const snap = c.snapshot();
+  writeFileSync(
+    join(d, "forget-journal.json"),
+    JSON.stringify({ requestId: "r-test", snapshot: snap, ids: [e.id], status: "committing" }),
+    "utf8",
+  );
+  const reopened = new MemoryCore({ dataDir: d });
+  assert.equal(existsSync(join(d, "forget-journal.json")), false, "journal is cleared");
+  assert.equal(reopened.entriesByIds([e.id]).length, 1, "the pre-delete snapshot is back");
+});
+
+check("0.5.3 P1-13: dry-run reports skill-owned copies, and purge is opt-in", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-053-skill-copy-"));
+  writeFileSync(join(d, "MEMORY.md"), "- 删除事务测试\n", "utf8");
+  const c = new MemoryCore({ dataDir: d });
+  const e = c.record({ role: "user", text: "删除事务测试", window: "persona", sessionId: "s1" });
+  const preview = c.dryRunForget([e.id]);
+  assert.ok(
+    (preview.skillCopies ?? []).includes("MEMORY.md"),
+    "the skill-owned copy is disclosed",
+  );
+  const req = c.requestForget({ mode: "delete", entryIds: [e.id], createdBy: "cli" });
+  c.approveForget(req.id, { channel: "cli", by: "test" });
+  c.executeForget(req.id, { by: "test", purgeSkillFiles: true });
+  assert.equal(readFileSync(join(d, "MEMORY.md"), "utf8").includes("删除事务测试"), false, "opt-in purge removes the line");
+  assert.ok(
+    readdirSync(d).some((f) => f.startsWith("MEMORY.md.bak-purge-")),
+    "a backup was taken before rewriting the skill file",
+  );
+});
+
+check("0.5.4: snapshot covers forgetting, experiences and goals", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-054-snapshot-state-"));
+  const c = new MemoryCore({ dataDir: d });
+  const e = c.record({ role: "user", text: "快照状态测试", window: "persona", sessionId: "s1" });
+  c.recordExperience({
+    rule: "快照里的经验",
+    trigger: ["快照"],
+    source: "test",
+    sourceIds: [e.id],
+  });
+  c.createGoal({ title: "快照里的目标", sourceIds: [e.id] });
+  const req = c.requestForget({ mode: "hide", entryIds: [e.id], createdBy: "cli" });
+  c.approveForget(req.id, { channel: "cli", by: "test" });
+  c.executeForget(req.id, { by: "test" });
+  const snap = c.snapshot();
+  const files = readdirSync(join(d, ".snapshots", snap));
+  for (const f of ["forgotten.json", "forget-requests.json", "experiences.json", "goals.json"]) {
+    assert.ok(files.includes(f), `snapshot contains ${f}`);
+  }
+});
+
+check("0.5.4: an interrupted delete restores the forgetting state too", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-054-journal-forget-"));
+  const c = new MemoryCore({ dataDir: d });
+  const e = c.record({ role: "user", text: "删除前已隐藏", window: "persona", sessionId: "s1" });
+  const req = c.requestForget({ mode: "hide", entryIds: [e.id], createdBy: "cli" });
+  c.approveForget(req.id, { channel: "cli", by: "test" });
+  c.executeForget(req.id, { by: "test" });
+  const snap = c.snapshot();
+  // Simulate the post-delete mutation: the tombstone was removed but
+  // the journal was not committed yet.
+  writeFileSync(join(d, "forgotten.json"), "{}", "utf8");
+  writeFileSync(
+    join(d, "forget-journal.json"),
+    JSON.stringify({ requestId: "r-test", snapshot: snap, ids: [e.id], status: "committing" }),
+    "utf8",
+  );
+  const reopened = new MemoryCore({ dataDir: d });
+  assert.equal(reopened.forget.isForgotten(e.id), true, "the tombstone is restored with the log");
+});
+
+check("0.5.4: stale experience/goal sources are dropped on revalidate", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-054-revalidate-"));
+  const c = new MemoryCore({ dataDir: d });
+  const e = c.record({ role: "user", text: "来源会消失", window: "persona", sessionId: "s1" });
+  const exp = c.recordExperience({
+    rule: "来源没了就不能注入",
+    trigger: ["来源"],
+    source: "test",
+    sourceIds: [e.id],
+  });
+  c.confirmExperience(exp.id, "test");
+  const goal = c.createGoal({ title: "来源目标", sourceIds: [e.id] });
+  c.experiences.revalidate(new Set());
+  c.goals.revalidate(new Set());
+  assert.equal(c.experiences.get(exp.id)?.verified, false, "experience loses confirmation");
+  assert.deepEqual(c.experiences.get(exp.id)?.sourceIds, [], "experience sources are cleared");
+  assert.deepEqual(c.goals.get(goal.id)?.sourceIds, [], "goal sources are cleared");
+});
+
+check("0.5.5: composeInjection enforces one total budget for profile + hits + belief + experience", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-055-budget-"));
+  const c = new MemoryCore({ dataDir: d });
+  const e = c.record({
+    role: "user",
+    text: "这是一条很长很长的记忆正文，用来测试总预算裁剪。".repeat(6),
+    window: "persona",
+    sessionId: "s1",
+  });
+  const hit = c.recall("预算", { window: "persona", limit: 5, tokenCap: 1500 }).hits;
+  assert.ok(hit.length > 0, "setup hit");
+  const text = composeInjection(
+    "画像：" + "很长的画像内容。".repeat(20),
+    hit,
+    "信念：一条很长的信念线，用来占预算。".repeat(4),
+    ["规则一：很长很长的经验规则。".repeat(4), "规则二：另一条经验。".repeat(4)],
+    80,
+  );
+  assert.ok(estimateTokens(text) <= 80, `total block fits 80 tokens, got ${estimateTokens(text)}`);
+});
+
+check("0.5.5: fact chain rejects branch/cycle/multiple-current but keeps time fallback", () => {
+  const mk = (id: string, ts: number, supersedes?: string): MemoryEntry =>
+    ({ id, ts, date: "2026/11/10", time: "10:00", role: "user", window: "persona", sessionId: "s1", importance: "light", text: id, factKey: "k", supersedes } as MemoryEntry);
+  const branch = factChains([mk("a", 1), mk("b", 2, "a"), mk("c", 3, "a")]);
+  assert.equal(branch.get("k")?.valid, false, "two successors = branch");
+  assert.ok((branch.get("k")?.issues ?? []).some((x) => x.includes("多个后继")), "branch reason");
+  const cycle = factChains([mk("a", 1, "b"), mk("b", 2, "a")]);
+  assert.equal(cycle.get("k")?.valid, false, "cycle is invalid");
+  const multi = factChains([mk("a", 1), mk("b", 2, "a"), mk("c", 3)]);
+  assert.equal(multi.get("k")?.valid, false, "multiple roots = multiple current");
+  const good = factChains([mk("a", 1), mk("b", 2, "a"), mk("c", 3, "b")]);
+  assert.equal(good.get("k")?.valid, true, "linear chain is valid");
+  assert.equal(good.get("k")?.current.id, "c", "the only root is current");
+  assert.equal(factVersionFactor(mk("a", 1), branch, false, new Set(["k"]), new Set(["k"])), 1, "invalid chain contributes no factor");
+});
+
+check("0.5.5: experience revoke/expiry/short-trigger governance", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-055-exp-"));
+  const c = new MemoryCore({ dataDir: d });
+  const e = c.record({ role: "user", text: "来源", window: "persona", sessionId: "s1" });
+  const exp = c.recordExperience({
+    rule: "治理测试规则",
+    trigger: ["治理", "治"],
+    source: "test",
+    sourceIds: [e.id],
+  });
+  c.confirmExperience(exp.id, "cli");
+  assert.equal(c.experiences.match("治理测试").length, 1, "confirmed rule matches");
+  c.revokeExperience(exp.id, "cli");
+  assert.equal(c.experiences.match("治理测试").length, 0, "revoked rule is not injected");
+  c.confirmExperience(exp.id, "cli", Date.now() + 10_000);
+  assert.equal(c.experiences.match("治理测试").length, 1, "re-confirmed rule matches");
+  assert.equal(c.experiences.match("治理测试", 2, false, Date.now() + 20_000).length, 0, "expired rule is not injected");
+});
+
+check("0.5.2 P0-02: forgotten.json loads even without forget-requests.json", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-052-forget-load-"));
+  writeFileSync(
+    join(d, "forgotten.json"),
+    JSON.stringify({ "e-1": { mode: "hide", at: 1, requestId: "r-1" } }),
+    "utf8",
+  );
+  const store = new ForgetStore(d);
+  assert.equal(store.hasLoadFailed, false, "no load failure");
+  assert.equal(store.isForgotten("e-1"), true, "the tombstone is loaded without the request file");
+});
+
+check("0.5.2 P0-02: a corrupt forgotten.json fails closed", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-052-forget-corrupt-"));
+  writeFileSync(join(d, "forgotten.json"), "{not json", "utf8");
+  const store = new ForgetStore(d);
+  assert.equal(store.hasLoadFailed, true, "the corruption is reported");
+  assert.equal(store.isForgotten("anything"), true, "every id is hidden until repaired");
+});
+
+check("0.5.2 P0-01: a hidden memory never enters the proactivity prompt", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-052-hide-proact-"));
+  const c = new MemoryCore({ dataDir: d });
+  const now = local(2026, 11, 10, 12, 0);
+  const e = c.record({
+    role: "user",
+    text: "这是一条要隐藏的秘密",
+    window: "persona",
+    sessionId: "s1",
+    ts: now,
+  });
+  const req = c.requestForget({
+    mode: "hide",
+    entryIds: [e.id],
+    reason: "test",
+    createdBy: "cli",
+  });
+  c.approveForget(req.id, { channel: "cli", by: "test" });
+  c.executeForget(req.id, { by: "test" });
+  assert.equal(c.recall("秘密", { window: "persona", limit: 5 }).hits.length, 0, "recall hides it");
+  const prompt = c.proactPrompt(now);
+  assert.ok(
+    !prompt || !prompt.includes("这是一条要隐藏的秘密"),
+    "the proactivity prompt hides it too",
+  );
+});
+
+check("0.5.2 P0-04: restore removes plugin-owned files absent from the snapshot", () => {
+  const d = mkdtempSync(join(tmpdir(), "memory-core-052-restore-extra-"));
+  const c = new MemoryCore({ dataDir: d });
+  c.record({ role: "user", text: "restore baseline", window: "persona", sessionId: "s1" });
+  const snap = c.snapshot();
+  const extra = join(d, "summary-2099-01.jsonl");
+  writeFileSync(extra, "{}\n", "utf8");
+  c.restore(snap);
+  assert.equal(existsSync(extra), false, "a post-snapshot summary file is rolled back");
+});
+
+console.log(`\nALL PASS (0.5.1 expansion: fact chain + forget, embedding, admin, experiences, goals)`);

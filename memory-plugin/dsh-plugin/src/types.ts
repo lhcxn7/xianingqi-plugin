@@ -92,6 +92,40 @@ export interface MemoryPluginConfig {
    *  mid-conversation recall trigger). Default
    *  DEFAULT_MEMORY_CUE_WORDS. */
   memoryCueWords?: string[];
+  /** 0.5.0 step 5: query rewriter — a host-injected async
+   *  function that rewrites / expands the user's question before
+   *  recall (the model call lives with the host: this plugin's
+   *  context exposes no model-call API). Absent = keyword-only,
+   *  exactly as before. The rewritten text is passed to core
+   *  alongside the original query; its tokens union with the
+   *  original's, so a bad rewrite can never lose the original
+   *  recall. Return null / undefined / "" to skip rewriting for
+   *  this turn. */
+  queryRewriter?: (
+    query: string,
+  ) => Promise<string | null | undefined>;
+  /** 0.5.0 step 5: how long to wait for the rewriter per recall
+   *  turn (ms). A timeout falls back to the original query,
+   *  keyword-only — it never blocks the turn. Default 3000. */
+  rewriteTimeoutMs?: number;
+  /** 0.5.1 item 2: local embedding (bge-small-zh-v1.5, ONNX
+   *  int8, CPU). Default OFF — disabled means the model is never
+   *  loaded and recall is exactly keyword-only. When enabled, the
+   *  plugin builds the index once at startup (background) and
+   *  awaits the semantic search per turn with timeoutMs, falling
+   *  back to keyword-only on timeout or any error. modelDir
+   *  defaults to <dataDir>/models/bge-small-zh-v1.5/ — copy the
+   *  shipped models/ directory there first (see MODELS.md). */
+  semanticRecall?: {
+    enabled?: boolean;
+    modelId?: string;
+    modelDir?: string;
+    modelRevision?: string;
+    timeoutMs?: number;
+    maxCandidates?: number;
+    /** Similarity floor for semantic candidates (default 0.5). */
+    minSimilarity?: number;
+  };
 }
 
 export interface MemoryPluginContext {

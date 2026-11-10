@@ -11,13 +11,18 @@ import {
   mkdirSync,
   openSync,
   readdirSync,
+  readFileSync,
   renameSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 export function ensureDir(dir: string): void {
-  mkdirSync(dir, { recursive: true });
+  // 0.5.2: the data dir holds raw chat logs; create it owner-only on
+  // POSIX (mode is ignored on Windows, where ACL inheritance applies).
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 
 /** Windows: renameSync can throw EPERM/EACCES when the target is
@@ -62,14 +67,33 @@ export function atomicWriteText(path: string, text: string): void {
     dir,
     `.tmp-${basename(path)}-${process.pid}-${randomBytes(4).toString("hex")}`,
   );
-  const fd = openSync(tmp, "w");
+  // 0.5.1 (0.4.3 §四): the temp file is a memory-store copy, so it
+  // is created 0o600, not world-readable; and a failed write now
+  // removes its temp instead of leaving it behind.
+  const fd = openSync(tmp, "w", 0o600);
   try {
     writeFileSync(fd, text, "utf8");
     fsyncSync(fd);
+  } catch (err) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // Best effort only — the original error is the one to report.
+    }
+    throw err;
   } finally {
     closeSync(fd);
   }
-  renameWithRetry(tmp, path);
+  try {
+    renameWithRetry(tmp, path);
+  } catch (err) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // Best effort only.
+    }
+    throw err;
+  }
   // Best-effort directory fsync so the rename itself survives a crash.
   try {
     const dfd = openSync(dir, "r");
@@ -88,4 +112,79 @@ export function atomicWriteText(path: string, text: string): void {
 export function listTempLeftovers(dir: string): string[] {
   if (!existsSync(dir)) return [];
   return readdirSync(dir).filter((f) => f.startsWith(".tmp-"));
+}
+
+// 0.5.1 (0.4.3 §四): clear temp leftovers older than
+// `olderThanMs` (default 60 s) from a directory — the age floor is
+// what makes it safe against a concurrent writer: another process
+// still holding its temp file has a fresh mtime, so it is never
+// removed. Returns the removed names. Never throws: a failed
+// cleanup must not take the caller down with it.
+export function cleanTempLeftovers(
+  dir: string,
+  olderThanMs = 60_000,
+): string[] {
+  if (!existsSync(dir)) return [];
+  const removed: string[] = [];
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const cutoff = Date.now() - olderThanMs;
+  for (const name of names) {
+    if (!name.startsWith(".tmp-")) continue;
+    const full = join(dir, name);
+    try {
+      const st = statSync(full);
+      if (st.mtimeMs > cutoff) continue;
+      rmSync(full, { force: true });
+      removed.push(name);
+    } catch {
+      // One leftover that will not go away is not a fatal error.
+    }
+  }
+  return removed;
+}
+
+export interface CorruptBackup {
+  /** Full path of the backup copy. */
+  path: string;
+  /** Size + mtime of the corrupt source file at backup time. */
+  size: number;
+  mtimeMs: number;
+}
+
+/** 0.5.1 (0.4.3 item 10): copy a store file that failed to parse
+ *  to `<file>.corrupt-<ms>-<rand>` before anything overwrites it.
+ *  `last` is the fingerprint of the file already backed up once:
+ *  a second load failure of the same unchanged bytes backs up
+ *  nothing (one backup per distinct corrupt content). Returns null
+ *  when the file is missing/unreadable or already backed up. */
+export function backupCorruptFile(
+  file: string,
+  last: { size: number; mtimeMs: number } | null,
+): CorruptBackup | null {
+  let st: { size: number; mtimeMs: number };
+  try {
+    st = statSync(file);
+  } catch {
+    return null;
+  }
+  if (
+    last !== null &&
+    last.size === st.size &&
+    last.mtimeMs === st.mtimeMs
+  ) {
+    return null;
+  }
+  const backup = `${file}.corrupt-${Date.now()}-${randomBytes(4).toString("hex")}`;
+  try {
+    const data = readFileSync(file);
+    writeFileSync(backup, data, { mode: 0o600 });
+  } catch {
+    return null;
+  }
+  return { path: backup, size: st.size, mtimeMs: st.mtimeMs };
 }

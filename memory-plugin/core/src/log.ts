@@ -13,7 +13,10 @@ import {
   readSync,
   statSync,
 } from "node:fs";
+import { atomicWriteText } from "./atomic.ts";
 import type { MemoryEntry } from "./types.ts";
+
+const WARNED_CORRUPT = new Set<string>();
 
 export class AppendLog {
   private readonly file: string;
@@ -26,7 +29,9 @@ export class AppendLog {
    *  does not lose the tail. (A process crash alone would not lose it;
    *  the fsync is for the power-loss case.) */
   append(entry: MemoryEntry): void {
-    const fd = openSync(this.file, "a");
+    // 0.5.2: the raw chat log is created owner-only on POSIX (umask
+    // 022 used to make it 0644). Existing files are not chmod-ed here.
+    const fd = openSync(this.file, "a", 0o600);
     try {
       // 0.4.6 (0.4.3 audit item 15): a torn last line (crash
       // mid-append) used to swallow the NEXT append too — the new
@@ -79,7 +84,11 @@ export class AppendLog {
       return [];
     }
     const out: MemoryEntry[] = [];
-    for (const line of raw.split("\n")) {
+    const lines = raw.split("\n");
+    let bad = 0;
+    let badMiddle = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
       if (!line.trim()) continue;
       try {
         const e = JSON.parse(line) as MemoryEntry;
@@ -92,15 +101,41 @@ export class AppendLog {
           typeof e.text === "string"
         ) {
           out.push(e);
+        } else {
+          bad += 1;
+          if (i < lines.length - 1) badMiddle += 1;
         }
       } catch {
-        // Torn line from an interrupted append: skip it.
+        // A torn LAST line is the expected crash artifact. A bad
+        // line in the MIDDLE means silent data loss: warn once per
+        // file instead of pretending the log is complete.
+        bad += 1;
+        if (i < lines.length - 1) badMiddle += 1;
       }
+    }
+    if (badMiddle > 0 && !WARNED_CORRUPT.has(this.file)) {
+      WARNED_CORRUPT.add(this.file);
+      console.warn(
+        `[memory-plugin] ${this.file} 有 ${badMiddle} 行中间损坏（共 ${bad} 行坏行），已跳过；请检查磁盘/备份，不要当作正常空行。`,
+      );
     }
     return out;
   }
 
   count(): number {
     return this.readAll().length;
+  }
+
+  /** Rewrite the whole file from an entry list (0.5.1 item 1:
+   *  physical forget-delete). Atomic (write temp + rename) so a
+   *  crash mid-rewrite never leaves a half file — the old file
+   *  stays until the new one is complete. The caller takes a
+   *  snapshot first and holds the write lock; this only writes. */
+  rewrite(entries: MemoryEntry[]): void {
+    atomicWriteText(
+      this.file,
+      entries.map((e) => JSON.stringify(e)).join("\n") +
+        (entries.length > 0 ? "\n" : ""),
+    );
   }
 }

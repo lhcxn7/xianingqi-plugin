@@ -36,6 +36,7 @@ import type {
   FragmentTone,
 } from "./fragments.ts";
 import { fragmentKeyTerms, verifyFragment } from "./fragments.ts";
+import { newProvenance } from "./provenance.ts";
 import {
   RECENT_MAX_CHARS,
   RECENT_MAX_ENTRIES,
@@ -55,6 +56,17 @@ export const REFLECTION_MIN_FLOOR = 5;
 /** A cited quote must be at least this long — a 1-char match
  *  ("他", "了") proves nothing. */
 export const REFLECTION_MIN_QUOTE_CHARS = 2;
+/** 0.5.1 (0.4.3 §四): a saved reflection conclusion is capped at
+ *  1000 characters — a reflection is one short insight, not an
+ *  essay, and an unbounded conclusion bloats every later proact
+ *  prompt that pastes it. At most 200 stored reflections: past
+ *  that, saveReflection refuses and the model must let an old
+ *  one go (there is no delete yet — refusing is honest, silently
+ *  dropping the oldest would lose history without asking). The
+ *  prompt side is already capped (buildReflectionPrompt: 20
+ *  entries / 3000 chars, 0.4.6). */
+export const REFLECTION_MAX_CHARS = 1000;
+export const REFLECTION_MAX_COUNT = 200;
 
 export interface ReflectionGate {
   /** Recent persona entries not yet folded into a reflection. */
@@ -242,6 +254,29 @@ export function saveReflection(
   if (typeof text !== "string" || text.trim().length === 0) {
     return { ok: false, reasons: ["反思结论不能为空。"] };
   }
+  // 0.5.1 (0.4.3 §四): length + count caps (see the constants
+  // above). Checked before verification, so a too-long conclusion
+  // fails fast with a usable reason instead of after the quote
+  // check.
+  if (text.trim().length > REFLECTION_MAX_CHARS) {
+    return {
+      ok: false,
+      reasons: [
+        `反思结论太长（${text.trim().length} 字，上限 ${REFLECTION_MAX_CHARS} 字）：反思是一句短结论，不是长文，缩短再存。`,
+      ],
+    };
+  }
+  const storedReflections = fragments
+    .all()
+    .filter((f) => f.type === "reflection").length;
+  if (storedReflections >= REFLECTION_MAX_COUNT) {
+    return {
+      ok: false,
+      reasons: [
+        `已存反思 ${storedReflections} 条，到了 ${REFLECTION_MAX_COUNT} 条上限：先处理掉旧的反思再存新的。`,
+      ],
+    };
+  }
   if (!Array.isArray(sourceIds) || sourceIds.length === 0) {
     return {
       ok: false,
@@ -282,6 +317,10 @@ export function saveReflection(
     id: `refl-${now}-${randomBytes(3).toString("hex")}`,
     type: "reflection",
     sourceIds: [...sourceIds],
+    // 0.5.0 step 3: a reflection is a model inference from the
+    // sources; its quote check passed at save time, so creation
+    // counts as the first verification.
+    provenance: newProvenance(sourceIds, "model_inference", now),
     text: text.trim(),
     tone: { label: "反思", level: "unknown", intensity: 0.5 },
     quotes: checked.quotes,

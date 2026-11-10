@@ -80,6 +80,13 @@
 //   touches MEMORY.md, log.jsonl or the keyword index, and the
 //   profile only ever rides along with a recall that has hits —
 //   a no-hit turn injects nothing, profile or not.
+//   memory_feedback (0.5.0 step 4, 14th tool) takes the user's
+//   verdict on a recalled memory — correct / wrong / irrelevant.
+//   Wrong invalidates the entry (same path as memory_invalidate,
+//   with an audit line); irrelevant demotes it in later recall;
+//   correct counts as a verification. Tool only, no UI; its
+//   description is deferred (deferLoading) so it costs nothing
+//   on rounds where it is not used.
 //   memory_remember takes an optional emotion ("温暖" or
 //   "温暖:0.7"); memory_fragment creates a fragment on top of the
 //   log (0.3.0, code-verified against its sources);
@@ -162,14 +169,21 @@ import { join } from "node:path";
 import {
   MemoryCore,
   MODEL_REVIEW_CATEGORIES,
+  MODEL_REVIEW_MAX_CHARS,
+  MODEL_REVIEW_MAX_ENTRIES,
+  RECENT_MAX_CHARS,
+  RECENT_MAX_ENTRIES,
+  SOURCE_TYPE_CN,
   atomicWriteText,
   buildModelReviewPrompt,
   deliver,
+  entryProvenance,
+  composeInjection,
   formatLayer1,
   formatProfileBlock,
-  formatRecallBlock,
   parseModelReviewIds,
   parseProactDecision,
+  selectCappedEntries,
 } from "../../core/src/index.ts";
 import type {
   BeliefCandidate,
@@ -230,19 +244,28 @@ export function isPersonaTrigger(
   return triggerWords.some((w) => w.length > 0 && text.includes(w));
 }
 
-/** 0.3.1: substrings that mark a user message as a TASK instruction
- *  rather than a persona chat, even when it also contains the
- *  trigger. Two groups: technical words (almost never spoken in a
- *  persona chat) and task-action words (the verbs of task
- *  instructions). Checked only against USER messages, only for the
- *  persona-marking decision — DSH/assistant output never triggers
- *  marking and is never checked against this list, and once a
- *  session is marked persona it stays persona (one-way latch);
- *  the blocklist never un-marks a session and never filters
- *  individual messages out of the verbatim log (the log stays
- *  complete — a gap would break fragment verification and the
- *  daily review). Substring match, same as the trigger itself. */
-export const TASK_BLOCKLIST: string[] = [
+/** 0.5.0 step 2: the blocklist is split in two — the old single
+ *  list is kept as the union (TASK_BLOCKLIST) so hasTaskBlocklistWord
+ *  and old callers behave exactly as before.
+ *
+ *  - TASK_TECHNICAL_WORDS: almost never spoken in a persona chat
+ *    (GitHub / SKILL.md / 插件 / 代码 …). One of these alone blocks
+ *    marking, as before.
+ *  - TASK_ACTION_WORDS: ordinary verbs that also show up in chat
+ *    (同步 / 更新 / 测试 / 创建 / 版本 …). One of these alone must
+ *    NOT block — "夏柠柒，我想和你同步一下近况" is a greeting,
+ *    not a task. An action word blocks only when the message is
+ *    task-shaped as well: an imperative marker (帮我 / 请 / 把 …)
+ *    or a bare task phrase (nothing chatty left after stripping
+ *    the trigger + the action words, e.g. "夏柠柒，恢复测试").
+ *    Greeting/question words (在吗 / 回来了 / 聊天 …) always save
+ *    the message from the bare-phrase rule.
+ *
+ *  The split fixes the measured 0.4.8 gap: 6 opening lines, 4 not
+ *  marked (同步 / 测试 / 创建 / 更新). The one-way latch and the
+ *  complete log are untouched: the list only gates marking, never
+ *  un-marks a session and never filters a recorded message. */
+export const TASK_TECHNICAL_WORDS: string[] = [
   // Technical words — almost never in a persona chat.
   "GitHub",
   "github",
@@ -264,7 +287,14 @@ export const TASK_BLOCKLIST: string[] = [
   "代码",
   "命令",
   "路径",
-  // Task-action words — the verbs of task instructions.
+  "skill",
+  "插件",
+];
+
+export const TASK_ACTION_WORDS: string[] = [
+  // Task-action words — the verbs of task instructions, but also
+  // ordinary chat words (同步近况 / 更新近况 / 测试一下你在不在
+  // / 创建了新习惯 / 你是什么版本). Only task-shaped use blocks.
   "更新",
   "安装",
   "覆盖",
@@ -278,8 +308,6 @@ export const TASK_BLOCKLIST: string[] = [
   "修改",
   "测试",
   "版本",
-  "skill",
-  "插件",
   "升级",
   "修复",
   "优化",
@@ -294,6 +322,90 @@ export const TASK_BLOCKLIST: string[] = [
   "同步",
 ];
 
+/** 0.5.0 step 2: imperative markers — when one of these stands
+ *  next to a task-action word, the message is an instruction
+ *  ("帮我更新一下你的记忆"), not chat. Checked only together
+ *  with an action word, so "我把饭吃完了" (no action word) is
+ *  unaffected. */
+export const TASK_IMPERATIVE_MARKERS: string[] = [
+  "帮我",
+  "请你",
+  "请",
+  "把",
+  "给",
+  "替我",
+  "替",
+  "让",
+  "需要你",
+  "麻烦",
+  "帮",
+  "你来",
+];
+
+/** 0.5.0 fix: memory objects — an action word next to one of
+ *  these is a task even when the bare-phrase threshold misses it
+ *  ("更新一下记忆" leaves "一下记忆", length 4 > 2). Chatty context
+ *  words save the message ("更新一下记忆，我想你" is still chat). */
+export const TASK_MEMORY_OBJECT_WORDS: string[] = [
+  "记忆",
+  "日志",
+  "聊天记录",
+  "条目",
+  "记忆文件",
+];
+
+/** 0.5.0 fix: chatty context that saves an action-word +
+ *  memory-object message from being treated as a task. */
+export const TASK_MEMORY_CHAT_WORDS: string[] = [
+  "心情",
+  "近况",
+  "习惯",
+  "想你",
+  "在吗",
+  "在么",
+  "在不在",
+  "好吗",
+  "你好",
+];
+
+/** 0.5.0 step 2: greeting / question words that save a message
+ *  from the bare-task-phrase rule — "测试一下，你在吗" is a
+ *  greeting that happens to contain 测试. */
+export const PERSONA_GREETING_WORDS: string[] = [
+  "在吗",
+  "在么",
+  "在不在",
+  "在不",
+  "好吗",
+  "你好",
+  "想你",
+  "回来了",
+  "在干嘛",
+  "干嘛呢",
+  "聊天",
+  "说话",
+];
+
+/** 0.3.1: substrings that mark a user message as a TASK instruction
+ *  rather than a persona chat, even when it also contains the
+ *  trigger. Two groups: technical words (almost never spoken in a
+ *  persona chat) and task-action words (the verbs of task
+ *  instructions). Checked only against USER messages, only for the
+ *  persona-marking decision — DSH/assistant output never triggers
+ *  marking and is never checked against this list, and once a
+ *  session is marked persona it stays persona (one-way latch);
+ *  the blocklist never un-marks a session and never filters
+ *  individual messages out of the verbatim log (the log stays
+ *  complete — a gap would break fragment verification and the
+ *  daily review). Substring match, same as the trigger itself.
+ *  0.5.0: this is the UNION of the two split lists above — the
+ *  raw "contains any blocklist word" check (hasTaskBlocklistWord)
+ *  is unchanged; the marking gate (shouldMarkPersona) refines it. */
+export const TASK_BLOCKLIST: string[] = [
+  ...TASK_TECHNICAL_WORDS,
+  ...TASK_ACTION_WORDS,
+];
+
 /** 0.3.1: true when the text contains any task-blocklist word. */
 export function hasTaskBlocklistWord(
   text: string,
@@ -302,20 +414,129 @@ export function hasTaskBlocklistWord(
   return blocklist.some((w) => w.length > 0 && text.includes(w));
 }
 
+/** 0.5.0 step 2: true when the text contains a technical
+ *  blocklist word (one of these alone blocks marking). */
+export function hasTaskTechnicalWord(
+  text: string,
+  technical: string[] = TASK_TECHNICAL_WORDS,
+): boolean {
+  return technical.some((w) => w.length > 0 && text.includes(w));
+}
+
+/** 0.5.0 step 2: true when the text contains a task-action word
+ *  (one of these alone does NOT block marking — see
+ *  shouldMarkPersona). */
+export function hasTaskActionWord(
+  text: string,
+  actionWords: string[] = TASK_ACTION_WORDS,
+): boolean {
+  return actionWords.some((w) => w.length > 0 && text.includes(w));
+}
+
+/** 0.5.0 step 2: true when the message is (nearly) just the
+ *  trigger + task-action words and nothing chatty — e.g.
+ *  "夏柠柒，恢复测试" or "夏柠柒，更新一下". Strip the trigger
+ *  words, the action words and all punctuation/space; what is
+ *  left must be at most 2 chars, and the message must carry no
+ *  greeting/question word. A longer remainder ("我想和你同步
+ *  一下近况") or a greeting ("测试一下，你在吗") is chat, not a
+ *  bare task phrase. */
+export function isBareTaskPhrase(
+  text: string,
+  triggerWords: string[] = DEFAULT_TRIGGER_WORDS,
+  actionWords: string[] = TASK_ACTION_WORDS,
+): boolean {
+  let stripped = text;
+  for (const w of [...triggerWords, ...actionWords]) {
+    if (w.length > 0) stripped = stripped.split(w).join("");
+  }
+  stripped = stripped.replace(/[\s\p{P}\p{S}]/gu, "");
+  if (stripped.length > 2) return false;
+  return !PERSONA_GREETING_WORDS.some((g) => text.includes(g));
+}
+
 /** 0.3.1: the persona-marking gate — true when the user message
  *  carries the trigger AND no task-blocklist word. A task
  *  instruction that mentions her name ("帮我把夏柠柒的 skill
  *  更新一下") does not mark the session; a plain address
- *  ("夏柠柒，在吗") does. */
+ *  ("夏柠柒，在吗") does.
+ *  0.5.0 step 2: refined — a technical word still blocks on its
+ *  own, but a task-action word blocks only when the message is
+ *  task-shaped (imperative marker, or a bare task phrase).
+ *  Ordinary chat use of an action word ("同步一下近况" /
+ *  "测试一下，你在吗" / "创建了一个新习惯" / "更新一下我的近况")
+ *  now marks. A caller passing a custom blocklist (anything but
+ *  the default union) gets the old rule: any hit blocks. */
 export function shouldMarkPersona(
   text: string,
   triggerWords: string[] = DEFAULT_TRIGGER_WORDS,
   blocklist: string[] = TASK_BLOCKLIST,
+  actionWords: string[] = TASK_ACTION_WORDS,
 ): boolean {
-  return (
-    isPersonaTrigger(text, triggerWords) &&
-    !hasTaskBlocklistWord(text, blocklist)
-  );
+  if (!isPersonaTrigger(text, triggerWords)) return false;
+  if (blocklist !== TASK_BLOCKLIST) {
+    return !hasTaskBlocklistWord(text, blocklist);
+  }
+  if (hasTaskTechnicalWord(text)) return false;
+  if (!hasTaskActionWord(text, actionWords)) return true;
+  // 0.5.0 fix (P0): action word + memory object = task, unless the
+  // message also carries chatty context. This catches
+  // "更新一下记忆 / 删除这条记忆 / 同步一下记忆", which the ≤2-char
+  // bare-phrase rule missed (they leave 4 chars after stripping).
+  if (
+    TASK_MEMORY_OBJECT_WORDS.some((w) => text.includes(w)) &&
+    !TASK_MEMORY_CHAT_WORDS.some((w) => text.includes(w))
+  ) {
+    return false;
+  }
+  // "让" is imperative in "让我更新一下", but narrative in
+  // "你让我更新一下心情" — the narrator is not giving an order.
+  const narrativeLet = /(你|他|她|它)让我/.test(text);
+  if (
+    !narrativeLet &&
+    TASK_IMPERATIVE_MARKERS.some((m) => text.includes(m))
+  ) {
+    return false;
+  }
+  if (isBareTaskPhrase(text, triggerWords, actionWords)) return false;
+  return true;
+}
+
+/** 0.5.0 step 5: run the host-injected query rewriter with a
+ *  timeout. Returns the rewritten query, or null when there is no
+ *  rewriter, it returns nothing usable, it throws, or it times
+ *  out — every failure mode falls back to the original query,
+ *  keyword-only, and never blocks the turn. An unchanged rewrite
+ *  (same text back) is also null: there is nothing to add. The
+ *  losing promise is left to finish on its own (it cannot be
+ *  cancelled); only its result is ignored. */
+export async function rewriteQuery(
+  query: string,
+  rewriter:
+    | ((query: string) => Promise<string | null | undefined>)
+    | undefined,
+  timeoutMs: number = 3000,
+): Promise<string | null> {
+  if (!rewriter) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const raced = await Promise.race([
+      rewriter(query),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+    if (typeof raced !== "string") return null;
+    const trimmed = raced.trim();
+    if (!trimmed || trimmed === query.trim()) return null;
+    return trimmed;
+  } catch {
+    return null;
+  } finally {
+    // 0.5.0 fix: the timeout arm must not keep the event loop alive
+    // for 3 s after a fast rewriter returned.
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** 0.3.0: true when the text explicitly reaches for the past
@@ -574,6 +795,17 @@ interface SessionState {
    *  the backstop for a model that never calls
    *  memory_daily_review. */
   modelReviewRegisteredTurn: number | null;
+  /** 0.5.1 (0.4.3 §四): the ids the live review prompt actually
+   *  showed (yesterday's capped list + candidate sourceIds +
+   *  belief-candidate sourceIds + merged-recent ids +
+   *  invalidation ids, in that order, capped at
+   *  MODEL_REVIEW_MAX_ENTRIES) — the whitelist
+   *  memory_daily_review checks submitted ids against. An id
+   *  outside it lands in `unknown`, never applied. Null when no
+   *  review context is live (a cold call falls back to
+   *  yesterday's ids). Cleared on submit and on auto-release.
+   *  In-memory only. */
+  modelReviewAllowedIds: string[] | null;
 }
 
 // Persona-session ids, persisted in the data dir so a rebuilt session
@@ -617,9 +849,22 @@ export function apply(
   const triggerWords = config?.triggerWords ?? DEFAULT_TRIGGER_WORDS;
   const memoryCueWords =
     config?.memoryCueWords ?? DEFAULT_MEMORY_CUE_WORDS;
+  // 0.5.0 step 5: host-injected query rewriter (model call lives
+  // with the host) + its per-turn timeout. Absent = keyword-only.
+  const queryRewriter = config?.queryRewriter;
+  const rewriteTimeoutMs = config?.rewriteTimeoutMs ?? 3000;
+  // 0.5.1 item 2: local embedding config (default off — see
+  // MemoryPluginConfig.semanticRecall).
+  const semanticRecall = config?.semanticRecall;
 
   // Warn once per distinct problem (not on every event).
   const warned = new Set<string>();
+
+  // 0.5.0 step 4: names of the tools that actually registered, in
+  // order — memory_status reports the count (17 once
+  // memory_forget / memory_goal / memory_experience are in). Read at call time: tools register
+  // async, so an early status call may legitimately see fewer.
+  const registeredToolNames: string[] = [];
   const warnOnce = (key: string, message: string): void => {
     if (warned.has(key)) return;
     warned.add(key);
@@ -633,13 +878,68 @@ export function apply(
   // recording into the wrong folder would split her memory in two.
   let core: MemoryCore;
   try {
-    core = new MemoryCore({ dataDir });
+    core = new MemoryCore({ dataDir, semanticRecall });
   } catch (err) {
     console.warn(
       `[memory-plugin] 记忆插件加载失败：打不开数据目录 ${dataDir}（${err instanceof Error ? err.message : String(err)}）。插件未加载，DSH 本身不受影响；请检查 dataDir 路径、盘符与权限后再重启 DSH。`,
     );
     throw err;
   }
+
+  // 0.5.1 item 2: when semantic recall is enabled, build the
+  // index once in the background — never blocks activation. A
+  // missing model or a failed build just leaves keyword-only
+  // (the per-turn adapter below also degrades silently).
+  if (core.semanticEnabled()) {
+    void core.ensureSemanticIndex().catch((err: unknown) => {
+      warnOnce(
+        "semantic-index-failed",
+        `语义索引构建失败，本轮起只用关键词召回（${err instanceof Error ? err.message : String(err)}）。检查模型目录 ${core.semanticModelDir()} 是否已放入包里的 models/bge-small-zh-v1.5/。`,
+      );
+    });
+  }
+
+  /** 0.5.1 item 2: the sync semantic slot for one recall turn.
+   *  Awaits the (async) semantic search with the core's timeout;
+   *  any failure returns undefined (keyword-only). The candidate
+   *  list is the live persona entries — the same set recall
+   *  searches. */
+  const semanticAdapter = async (
+    query: string,
+  ): Promise<
+    | {
+        kind: "semantic";
+        retrieveIds: (q: string, entries: MemoryEntry[]) => string[];
+        similarityOf: (id: string) => number | undefined;
+      }
+    | undefined
+  > => {
+    if (!core.semanticEnabled()) return undefined;
+    try {
+      const candidates = core
+        .allEntries()
+        .filter(
+          (e) => e.window === "persona" && !core.forget.isForgotten(e.id),
+        );
+      // One search call: the similarities ride along with the ids
+      // so recall can score semantic-only hits by similarity
+      // (0.5.1 item 2), not by recency. Filtered by the core's
+      // configured floor.
+      const hits = await core.semanticSearch(query, candidates);
+      const kept = hits.filter(
+        (h) => h.similarity >= core.semanticMinSimilarity(),
+      );
+      if (kept.length === 0) return undefined;
+      const byId = new Map(kept.map((h) => [h.id, h.similarity]));
+      return {
+        kind: "semantic",
+        retrieveIds: () => kept.map((h) => h.id),
+        similarityOf: (id) => byId.get(id),
+      };
+    } catch {
+      return undefined;
+    }
+  };
 
   const loadPersonaSessions = (): Set<string> => {
     try {
@@ -820,6 +1120,7 @@ export function apply(
         modelReviewRecentKinds: null,
         reviewDisposer: null,
         modelReviewRegisteredTurn: null,
+        modelReviewAllowedIds: null,
       };
       sessions.set(id, s);
     }
@@ -939,7 +1240,12 @@ export function apply(
   // never the global layer: yesterday's messages must not leak
   // into every other window. When agent.ctx is unavailable the
   // review is skipped (one warn), never forced onto the global
-  // layer. No entries yesterday means nothing to review.
+  // layer. 0.5.1 (0.4.5 audit new issue 8): no entries yesterday
+  // means nothing to review ONLY when the code review also left
+  // no proposals — a fragment/belief candidate, a reflection or
+  // proact proposal, an invalidation check, or a merged-recent
+  // section computed from today's messages is still something
+  // to hand over, even on a yesterday-empty day.
   const registerModelReview = (
     sid: string,
     agentCtx?: { systemPrompt?: SystemPromptRegistry },
@@ -954,7 +1260,20 @@ export function apply(
       );
       return;
     }
-    if (entries.length === 0) return;
+    const session = getSession(sid);
+    const hasProposals =
+      (session.modelReviewCandidates?.length ?? 0) > 0 ||
+      (session.modelReviewBeliefCandidates?.length ?? 0) > 0 ||
+      session.modelReviewReflectionPrompt !== null ||
+      session.modelReviewProactPrompt !== null ||
+      (session.modelReviewInvalidationIds?.length ?? 0) > 0 ||
+      (session.modelReviewRecentEntryIds?.length ?? 0) > 0 ||
+      // The kinds object itself is always set by the review (even
+      // as {reflection:false, proact:false}) — only a true kind
+      // is a proposal.
+      session.modelReviewRecentKinds?.reflection === true ||
+      session.modelReviewRecentKinds?.proact === true;
+    if (entries.length === 0 && !hasProposals) return;
     if (!agentCtx?.systemPrompt) {
       warnOnce(
         "model-review-no-agent-ctx",
@@ -962,7 +1281,6 @@ export function apply(
       );
       return;
     }
-    const session = getSession(sid);
     // M-1 (review-12): candidates captured at agent/created travel
     // with the review context; consumed once here, then cleared.
     const candidates = session.modelReviewCandidates ?? [];
@@ -1055,6 +1373,64 @@ export function apply(
         reflectableIds = undefined;
       }
     }
+    // 0.5.1 (0.4.3 §四): the whitelist memory_daily_review will
+    // check submitted ids against — the ids this prompt actually
+    // shows, in prompt order, capped at MODEL_REVIEW_MAX_ENTRIES.
+    // Yesterday's list and the merged-recent list are recomputed
+    // with the same caps the prompt builder uses (shown +
+    // overflow); the invalidation section with its own caps
+    // (10 / 2000); candidate sourceIds are all printed. The cap
+    // is a safety bound, not a mirror: on a day whose union tops
+    // 60, an id that IS in the prompt but past the cap is not
+    // citable — in practice yesterday's list rarely tops 60, and
+    // the review's working set is yesterday's list anyway. A
+    // computation failure leaves the whitelist null, and the
+    // submit path falls back to yesterday's ids (old behaviour),
+    // never blocks the round.
+    try {
+      const allowedIds: string[] = [];
+      const seenAllowed = new Set<string>();
+      const pushAllowed = (id: string): void => {
+        if (allowedIds.length >= MODEL_REVIEW_MAX_ENTRIES) return;
+        if (seenAllowed.has(id)) return;
+        seenAllowed.add(id);
+        allowedIds.push(id);
+      };
+      const sigOf = (e: MemoryEntry): number => core.significanceOf(e);
+      const yesterdaySel = selectCappedEntries(entries, {
+        maxEntries: MODEL_REVIEW_MAX_ENTRIES,
+        maxChars: MODEL_REVIEW_MAX_CHARS,
+        significanceOf: sigOf,
+      });
+      for (const r of yesterdaySel.shown) pushAllowed(r.entry.id);
+      for (const o of yesterdaySel.overflow) pushAllowed(o.id);
+      for (const c of candidates) {
+        for (const id of c.sourceIds) pushAllowed(id);
+      }
+      for (const c of beliefCandidates) {
+        for (const id of c.sourceIds) pushAllowed(id);
+      }
+      const recentSel = selectCappedEntries(recentEntries, {
+        maxEntries: RECENT_MAX_ENTRIES,
+        maxChars: RECENT_MAX_CHARS,
+        significanceOf: sigOf,
+      });
+      for (const r of recentSel.shown) pushAllowed(r.entry.id);
+      for (const o of recentSel.overflow) pushAllowed(o.id);
+      const invSel = selectCappedEntries(invalidationEntries, {
+        maxEntries: 10,
+        maxChars: 2000,
+      });
+      for (const r of invSel.shown) pushAllowed(r.entry.id);
+      for (const o of invSel.overflow) pushAllowed(o.id);
+      session.modelReviewAllowedIds = allowedIds;
+    } catch (err) {
+      warnOnce(
+        "model-review-allowlist-failed",
+        `复盘白名单计算失败，本次提交回退到昨日 id（${err instanceof Error ? err.message : String(err)}）。`,
+      );
+      session.modelReviewAllowedIds = null;
+    }
     try {
       const handle = agentCtx.systemPrompt.context({
         name: "memory-plugin:daily-review",
@@ -1146,6 +1522,7 @@ export function apply(
       modelReviewRecentKinds: null,
       reviewDisposer: null,
       modelReviewRegisteredTurn: null,
+      modelReviewAllowedIds: null,
     });
     // 0.2.0: daily review at session start — ONLY for a session
     // already known to be persona (restored from the persisted
@@ -1298,6 +1675,9 @@ export function apply(
         }
         session.reviewDisposer = null;
         session.modelReviewRegisteredTurn = null;
+        // 0.5.1 (0.4.3 §四): the whitelist dies with the context
+        // — a later cold call falls back to yesterday's ids.
+        session.modelReviewAllowedIds = null;
       }
       // Recall failure degrades to "no injection this turn", never
       // kills the turn (audit M6 — same waterfall mechanics as the
@@ -1344,10 +1724,24 @@ export function apply(
         result = { hits: [], layer1: null, profileText: "", estimatedTokens: 0, text: "" };
       } else {
         try {
+          // 0.5.0 step 5: query rewrite — one model call (the
+          // host-injected rewriter) expands the question before
+          // recall. Timeout / failure / empty all fall back to the
+          // original query, keyword-only; tokenCap 1500 and top 5
+          // are unchanged (the rewrite only changes which tokens
+          // match, never the budget).
+          const rewritten = await rewriteQuery(
+            query,
+            queryRewriter,
+            rewriteTimeoutMs,
+          );
+          const semantic = await semanticAdapter(query);
           result = core.recall(query, {
             tokenCap,
             sessionId: sid,
             recentTexts: session.recentUserTexts,
+            rewrittenQuery: rewritten ?? undefined,
+            semantic,
           });
         } catch (err) {
           warnOnce(
@@ -1365,9 +1759,13 @@ export function apply(
         // is the head of every injection (turn-1 append and the
         // refreshed context alike), never a standalone injection:
         // when there are no hits, nothing is injected at all.
-        const injectedText = result.profileText
-          ? `${result.profileText}\n${result.text}`
-          : result.text;
+        const injectedText = composeInjection(
+          result.profileText,
+          result.hits,
+          core.beliefLine() || undefined,
+          (result.experiences ?? []).map((e) => e.rule),
+          tokenCap,
+        );
         // Turn 1: append directly — a context registered during
         // pre-step would otherwise not reach the first request.
         // Later turns: the refreshed systemPrompt.context carries it.
@@ -1403,9 +1801,13 @@ export function apply(
         refreshRecallContext(
           sid,
           freshHits.length > 0
-            ? result.profileText
-              ? `${result.profileText}\n${formatRecallBlock(freshHits, core.beliefLine() || undefined)}`
-              : formatRecallBlock(freshHits, core.beliefLine() || undefined)
+            ? composeInjection(
+                result.profileText,
+                freshHits,
+                core.beliefLine() || undefined,
+                undefined,
+                tokenCap,
+              )
             : "",
           agentCtx,
         );
@@ -1490,12 +1892,15 @@ export function apply(
       // the trigger (fail closed — audit issue 3).
       if (!attributable) return;
       try {
-        core.record({
+        const entry = core.record({
           role: "user",
           text,
           window: "persona",
           sessionId: sid,
         });
+        // 0.5.1 item 2: append the new vector when semantic is on
+        // — fire-and-forget, never blocks the turn.
+        void core.semanticUpsertEntry(entry);
       } catch (err) {
         // session/event listeners are DSH-wrapped (a throw only
         // warns), but the loss must say WHAT was lost (audit M6).
@@ -1512,12 +1917,13 @@ export function apply(
       const text = eventText(event);
       if (!text) return;
       try {
-        core.record({
+        const entry = core.record({
           role: "assistant",
           text,
           window: "persona",
           sessionId: sid,
         });
+        void core.semanticUpsertEntry(entry);
       } catch (err) {
         warnOnce(
           "record-failed",
@@ -1603,6 +2009,9 @@ export function apply(
             );
           }
         }
+        registeredToolNames.push(
+          String((compiled as { name?: unknown } | null)?.name ?? ""),
+        );
       };
 
       // 0.4.1 item 1: the profile write path (A's memory_profile,
@@ -1625,12 +2034,12 @@ export function apply(
             type: "object",
             properties: {
               ok: { type: "boolean" },
-              profile: { type: "object" },
+              profile: { type: "object", additionalProperties: true },
               profileText: { type: "string" },
               error: { type: "string" },
             },
           },
-          render: (value: unknown) => [{ type: "text", text: JSON.stringify(value, null, 2) }],
+          render: (_args: unknown, value: unknown) => [{ type: "text", text: JSON.stringify(value, null, 2) }],
         },
         execute: async (args: unknown, exec?: unknown) => {
           const { persona } = toolSession(exec);
@@ -1658,7 +2067,7 @@ export function apply(
       registerTool({
         name: "memory_search",
         description:
-          "按关键词搜索本地记忆 (原始对话记录与月度归档细节), 返回相关记忆与当前状态。",
+          "按关键词搜索本地记忆 (原始对话记录与月度归档细节), 返回相关记忆与当前状态。只搜人设窗口的记忆——任务窗口的记录不会出现在这里。",
         parameters: {
           query: {
             type: "string",
@@ -1681,13 +2090,28 @@ export function apply(
               profileText: { type: "string" },
               layer1: { type: "string" },
               hits: { type: "array" },
+              error: { type: "string" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value, null, 2) },
           ],
         },
-        execute: async (args: unknown) => {
+        execute: async (args: unknown, exec?: unknown) => {
+          // 0.5.2: reading persona memory is a persona-window action.
+          // Automatic pre-step injection was already gated; without
+          // this an explicit memory_search from a task window could
+          // still read the private persona log.
+          const { persona } = toolSession(exec);
+          if (exec !== undefined && !persona) {
+            return {
+              profileText: "",
+              layer1: "",
+              hits: [],
+              error:
+                "memory_search 只在人设窗口可用：当前会话不是人设窗口（没有触发夏柠柒/柠柒），不读取人设记忆。",
+            };
+          }
           // Argument validation (audit B2/M2): the local compiler
           // does not validate args the way real defineTool does, so
           // a bad call returns empty instead of throwing or writing
@@ -1697,34 +2121,77 @@ export function apply(
             typeof (args as { query?: unknown }).query === "string"
               ? ((args as { query: string }).query as string)
               : "";
-          const limit =
+          const rawLimit =
             args && typeof (args as { limit?: unknown }).limit === "number"
               ? ((args as { limit: number }).limit as number)
               : 5;
+          const limit = Number.isFinite(rawLimit)
+            ? Math.max(1, Math.min(50, Math.floor(rawLimit)))
+            : 5;
           try {
-            const result = core.recall(q, { window: "all", limit });
+            // 0.5.0 step 5: same rewrite as the pre-step recall —
+            // the rewritten query unions with the original, and a
+            // timeout / failure falls back to keyword-only.
+            const rewritten = await rewriteQuery(
+              q,
+              queryRewriter,
+              rewriteTimeoutMs,
+            );
+            const semantic = await semanticAdapter(q);
+            const result = core.recall(q, {
+              // 0.5.1 (0.4.3 audit item 12): persona only — a
+              // task window's entries must never surface in a
+              // persona search (and vice versa: fragment sources
+              // are persona-checked in the core too).
+              window: "persona",
+              limit,
+              rewrittenQuery: rewritten ?? undefined,
+              semantic,
+            });
             return {
               profileText: result.profileText,
               layer1: result.layer1 ? formatLayer1(result.layer1) : "",
-              hits: result.hits.map((h) => ({
-                // M-1 (review-12): the hit MUST carry the log entry
-                // id — memory_fragment's sourceIds come from these
-                // hits ("见 memory_search 的 hits"), and without an
-                // id the model could never create a fragment from a
-                // searched entry. The id is the log's ts-counter-hash.
-                id: h.entry.id,
-                date: h.entry.date,
-                time: h.entry.time,
-                role: h.entry.role,
-                window: h.entry.window,
-                importance: h.entry.importance,
-                // 0.3.0: a fragment hit shows the fragment text
-                // (with its tone) instead of the full original.
-                text: h.displayText ?? h.entry.text,
-                fragmentId: h.fragmentId ?? "",
-                fragmentTone: h.fragmentTone ?? "",
-                fragmentFallback: h.fragmentFallback === true,
-              })),
+              hits: result.hits.map((h) => {
+                // 0.5.0 step 3: every hit carries its provenance —
+                // the fragment's when fragment-backed, otherwise
+                // the verbatim log line itself. sourceSummary is
+                // one readable line (date + source kind + how many
+                // times it was verified); the model must never
+                // treat a model_inference hit as a quoted fact.
+                const prov = h.provenance ?? entryProvenance(h.entry);
+                const sourceTypeCn =
+                  SOURCE_TYPE_CN[prov.sourceType] ?? prov.sourceType;
+                return {
+                  // M-1 (review-12): the hit MUST carry the log entry
+                  // id — memory_fragment's sourceIds come from these
+                  // hits ("见 memory_search 的 hits"), and without an
+                  // id the model could never create a fragment from a
+                  // searched entry. The id is the log's ts-counter-hash.
+                  id: h.entry.id,
+                  date: h.entry.date,
+                  time: h.entry.time,
+                  role: h.entry.role,
+                  window: h.entry.window,
+                  importance: h.entry.importance,
+                  // 0.3.0: a fragment hit shows the fragment text
+                  // (with its tone) instead of the full original.
+                  text: h.displayText ?? h.entry.text,
+                  fragmentId: h.fragmentId ?? "",
+                  fragmentTone: h.fragmentTone ?? "",
+                  fragmentFallback: h.fragmentFallback === true,
+                  sourceIds: prov.sourceIds,
+                  sourceType: prov.sourceType,
+                  sourceTypeCn,
+                  confidence: prov.confidence,
+                  verifyCount: prov.verifyCount,
+                  lastVerifiedAt: prov.lastVerifiedAt,
+                  sourceSummary:
+                    `${h.entry.date} ${sourceTypeCn}` +
+                    (prov.verifyCount > 0
+                      ? ` · 已验证 ${prov.verifyCount} 次`
+                      : " · 未验证"),
+                };
+              }),
             };
           } catch (err) {
             warnOnce(
@@ -1757,6 +2224,18 @@ export function apply(
             description:
               "可选情绪标签，用你自己的词写就行，不限固定列表：比如 “温暖”“委屈”“傲娇”“忐忑”“宠溺”，想打什么心情就打什么心情；可加 :强度（如 “温暖:0.7”，强度 0–1，默认 0.5）。解析失败时当没传，按关键词词表兜底",
           },
+          factKey: {
+            type: "string",
+            required: false,
+            description:
+              "可选：这条记忆属于哪个事实（比如 “最喜欢的颜色”“喝咖啡”）。同一事实的新版本传同一个 factKey，旧版就成了历史版——问“现在”只答当前版，问“以前”答历史版。不确定就别传，没 factKey 的记忆召回和以前一模一样。",
+          },
+          supersedes: {
+            type: "string",
+            required: false,
+            description:
+              "可选：这条记忆替代的旧条目 id（见 memory_search 的 hits）。和 factKey 一起传，旧条目必须和新条目同一个 factKey。",
+          },
         },
         output: {
           schema: {
@@ -1767,7 +2246,7 @@ export function apply(
               error: { type: "string" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value) },
           ],
         },
@@ -1818,7 +2297,21 @@ export function apply(
                 (args as { emotion?: unknown } | null)?.emotion,
               ),
               sessionId: sid as string,
+              // 0.5.1 item 1: fact version chain — an explicit
+              // identity + supersedes link; core.record validates
+              // the target exists and shares the factKey.
+              ...(typeof (args as { factKey?: unknown }).factKey === "string" &&
+              ((args as { factKey: string }).factKey as string).length > 0
+                ? { factKey: (args as { factKey: string }).factKey as string }
+                : {}),
+              ...(typeof (args as { supersedes?: unknown }).supersedes === "string" &&
+              ((args as { supersedes: string }).supersedes as string).length > 0
+                ? { supersedes: (args as { supersedes: string }).supersedes as string }
+                : {}),
             });
+            // 0.5.1 item 2: append the new vector when semantic is
+            // on — fire-and-forget, never blocks the reply.
+            void core.semanticUpsertEntry(entry);
             return { ok: true, id: entry.id };
           } catch (err) {
             return {
@@ -1841,7 +2334,7 @@ export function apply(
       registerTool({
         name: "memory_daily_review",
         description:
-          "提交昨日记忆复盘的结果：把你认为值得长期记住的记忆的 id 列表交回来，插件会把它们的重要度提到最高（0.9），以后永不压缩。只在人设窗口可用。id 只能用复盘上下文里给的昨日消息列表里的 id，不要编；没有重要的就传空列表。",
+          "提交昨日记忆复盘的结果：把你认为值得长期记住的记忆的 id 列表交回来，插件会把它们的重要度提到最高（0.9），以后永不压缩。只在人设窗口可用。id 只能用复盘上下文里给的昨日消息列表里的 id，不要编；不在复盘上下文里的 id 会进 unknown、不应用；没有重要的就传空列表。",
         parameters: {
           ids: {
             type: "array",
@@ -1860,7 +2353,7 @@ export function apply(
               error: { type: "string" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value) },
           ],
         },
@@ -1890,6 +2383,14 @@ export function apply(
           }
           // Parsed (even empty): the review is done — dispose the
           // context so yesterday's messages leave the prompt.
+          // 0.5.1 (0.4.3 §四): capture the whitelist BEFORE
+          // clearing it — the submit below filters against this
+          // snapshot, and the whitelist is single-use: a submitted
+          // review cannot be re-used to mark more ids later.
+          const allowedSnapshot =
+            sid !== null
+              ? (sessions.get(sid)?.modelReviewAllowedIds ?? null)
+              : null;
           if (sid !== null) {
             const state = sessions.get(sid);
             if (state) {
@@ -1902,14 +2403,44 @@ export function apply(
               // 0.4.5: stop the auto-release clock too — the review
               // is done, there is nothing left to release.
               state.modelReviewRegisteredTurn = null;
+              state.modelReviewAllowedIds = null;
+            }
+          }
+          // 0.5.1 (0.4.3 §四): whitelist — only ids the live
+          // review prompt showed may be marked. Outside the
+          // whitelist an id lands in `unknown`, never applied. No
+          // whitelist (cold call, context released, session
+          // rebuilt) falls back to yesterday's ids — the old
+          // behaviour's scope, so a review submitted without a
+          // live context still cannot mark an arbitrary entry.
+          // applyModelMarks still reports ids it cannot find in
+          // the log as unknown.
+          let submitIds = ids;
+          let outOfScope: string[] = [];
+          const allowed = allowedSnapshot;
+          if (allowed !== null) {
+            const set = new Set(allowed);
+            submitIds = ids.filter((id) => set.has(id));
+            outOfScope = ids.filter((id) => !set.has(id));
+          } else {
+            try {
+              const yesterdayIds = new Set(
+                core.yesterdayEntries().map((e) => e.id),
+              );
+              submitIds = ids.filter((id) => yesterdayIds.has(id));
+              outOfScope = ids.filter((id) => !yesterdayIds.has(id));
+            } catch {
+              // Yesterday unreadable: apply as before;
+              // applyModelMarks still reports ids it cannot find
+              // as unknown.
             }
           }
           try {
-            const res = core.applyModelMarks(ids);
+            const res = core.applyModelMarks(submitIds);
             return {
               ok: true,
               applied: res.applied,
-              unknown: res.unknown,
+              unknown: [...res.unknown, ...outOfScope],
               error: "",
             };
           } catch (err) {
@@ -1961,6 +2492,15 @@ export function apply(
             required: false,
             description: "话题词，如 酸梅汤；不填时从正文里取",
           },
+          // 0.5.0 step 3: 来源类型是你自己的判断（用户原话 /
+          // 模型原话 / 模型总结 / 模型推断），不填默认模型总结；
+          // 可信度那个数不是你填的，是代码按类型和验证次数算的，
+          // 别自己写。
+          sourceType: {
+            type: "string",
+            required: false,
+            description: "来源类型：user_quote（用户原话）/ model_quote（模型原话）/ model_summary（模型总结）/ model_inference（模型推断）；不填默认 model_summary",
+          },
           keywords: {
             type: "array",
             items: { type: "string" },
@@ -1978,7 +2518,7 @@ export function apply(
               reasons: { type: "array" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value) },
           ],
         },
@@ -1998,6 +2538,7 @@ export function apply(
             tone?: unknown;
             quotes?: unknown;
             topic?: unknown;
+            sourceType?: unknown;
             keywords?: unknown;
           };
           const sourceIds = Array.isArray(a.sourceIds)
@@ -2009,6 +2550,8 @@ export function apply(
             ? a.quotes.filter((x): x is string => typeof x === "string")
             : [];
           const topic = typeof a.topic === "string" ? a.topic : undefined;
+          const sourceType =
+            typeof a.sourceType === "string" ? a.sourceType : undefined;
           const keywords = Array.isArray(a.keywords)
             ? a.keywords.filter((x): x is string => typeof x === "string")
             : undefined;
@@ -2019,6 +2562,7 @@ export function apply(
               tone,
               quotes,
               topic,
+              sourceType,
               keywords,
             });
             if (!result.ok || !result.fragment) {
@@ -2042,8 +2586,13 @@ export function apply(
 
       registerTool({
         name: "memory_snapshot",
+        // 0.5.1 (0.4.3 audit item 14): no persona gate on purpose
+        // — a snapshot only copies the plugin's own files into a
+        // snapshot directory, it never changes memory content, so
+        // a task window taking one is harmless. memory_restore is
+        // the gated one: it reverts memory.
         description:
-          "立即对插件自己的记忆文件 (log + 索引) 做一次快照，可用于事后恢复。快照不覆盖 MEMORY.md、月度归档或日记。",
+          "立即对插件自己的记忆文件 (log + 索引) 做一次快照，可用于事后恢复。快照不覆盖 MEMORY.md、月度归档或日记。快照只复制文件、不改记忆内容，所以任务窗口也可以调；恢复（memory_restore）只在人设窗口可用。",
         parameters: {},
         output: {
           schema: {
@@ -2054,7 +2603,7 @@ export function apply(
               error: { type: "string" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value) },
           ],
         },
@@ -2073,7 +2622,7 @@ export function apply(
       registerTool({
         name: "memory_restore",
         description:
-          "把插件自己的记忆文件 (log + 索引) 恢复到指定快照。恢复前先对当前状态做安全快照，可再恢复回来。MEMORY.md、月度归档与日记不受影响。",
+          "把插件自己的记忆文件 (log + 索引) 恢复到指定快照。恢复前先对当前状态做安全快照，可再恢复回来。MEMORY.md、月度归档与日记不受影响。只在人设窗口可用——任务窗口调会被拒绝，且不写任何文件。",
         parameters: {
           name: {
             type: "string",
@@ -2090,11 +2639,22 @@ export function apply(
               error: { type: "string" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value) },
           ],
         },
-        execute: async (args: unknown) => {
+        execute: async (args: unknown, exec?: unknown) => {
+          // 0.5.1 (0.4.3 audit item 14): same persona gate as
+          // the other write tools — a restore reverts memory, so
+          // a task window is refused before anything is written.
+          const { persona } = toolSession(exec);
+          if (!persona) {
+            return {
+              ok: false,
+              error:
+                "memory_restore 只在人设窗口可用：当前会话不是人设窗口，本次不恢复任何文件。",
+            };
+          }
           const snapshotName =
             args && typeof (args as { name?: unknown }).name === "string"
               ? ((args as { name: string }).name as string)
@@ -2139,7 +2699,7 @@ export function apply(
       registerTool({
         name: "memory_status",
         description:
-          "返回本地记忆的统计：总条数、最近 30 天条数、归档月份、索引词数、快照列表、图边数、属性条数、上次复盘时间（0.2.0）、片段数与存疑片段数（0.3.0）、信念数与三维信念值（0.4.0）、待复核的失效提议数（0.4.4：打勾等模型确认的旧记忆，还没作废的）。",
+          "返回本地记忆的统计：总条数、最近 30 天条数、归档月份、索引词数、快照列表、图边数、属性条数、上次复盘时间（0.2.0）、片段数与存疑片段数（0.3.0）、信念数与三维信念值（0.4.0）、待下次复盘确认的失效提议数（0.4.4：打勾等模型确认的旧记忆，还没作废的；这个数是提议数，不是已确认失效数——过期但还没复盘的标记也算在内，等下次复盘时确认或放过）、未完成目标数与已完成目标数（0.5.1）、待处理的遗忘请求数（0.5.1）、语义索引状态（0.5.1）。",
         parameters: {},
         output: {
           schema: {
@@ -2161,22 +2721,48 @@ export function apply(
               // uncertainty / proofCount) — same summary memory_belief
               // get returns, visible here without another call.
               beliefs: { type: "number" },
-              beliefDimensions: { type: "object" },
+              beliefDimensions: { type: "object", additionalProperties: true },
               // 0.4.4 item 2: memories flagged for invalidation
               // review and not yet invalidated ("awaiting model
               // review") — the count the daily review prompt draws
               // its invalidation section from.
               pendingInvalidationChecks: { type: "number" },
+              // 0.5.0 step 4: tools that actually registered (17
+              // once memory_feedback and the 0.5.1 expansion tools
+              // are in) and their names — read at call time, so an
+              // early call may see fewer.
+              tools: { type: "number" },
+              toolNames: { type: "array" },
+              // 0.5.1 item 5: goals with completion status.
+              openGoals: { type: "number" },
+              doneGoals: { type: "number" },
+              // 0.5.1 item 1: forget requests awaiting a decision.
+              pendingForgets: { type: "number" },
+              // 0.5.1 item 2: semantic index state.
+              semantic: { type: "object", additionalProperties: true },
               error: { type: "string" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value, null, 2) },
           ],
         },
         execute: async () => {
           try {
-            return { ok: true, ...core.stats() };
+            const goals = core.goals.all();
+            return {
+              ok: true,
+              ...core.stats(),
+              tools: registeredToolNames.length,
+              toolNames: [...registeredToolNames],
+              openGoals: goals.filter((g) => g.status === "open").length,
+              doneGoals: goals.filter((g) => g.status === "done").length,
+              pendingForgets: core
+                .listForgetRequests()
+                .filter((r) => r.status === "pending" || r.status === "approved")
+                .length,
+              semantic: core.semanticStatus(),
+            };
           } catch (err) {
             return {
               ok: false,
@@ -2210,7 +2796,7 @@ export function apply(
               error: { type: "string" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value, null, 2) },
           ],
         },
@@ -2276,7 +2862,7 @@ export function apply(
               error: { type: "string" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value) },
           ],
         },
@@ -2364,6 +2950,9 @@ export function apply(
       // them either).
       registerTool({
         name: "memory_belief",
+        // 0.5.1 (0.4.3 §四): low-frequency tool — description
+        // loads on demand (same as memory_feedback).
+        deferLoading: true,
         description:
           "查/写关于你们关系的信念（带证据的三维信念：safety 安全感 / trust 信任 / closeness 亲近）。action \"get\"：返回三维当前值（每维 strength / uncertainty / proofCount）和已有信念列表，不返回原文全文。action \"create\"：确认复盘里提议的一组对话、建成一条信念——自己写一句话 statement、选一个 dimension，entryId 用那组里的 id、quote 用复盘提示词里引号中的原话（必须是逐字抄的，不能改写）；delta 可选，是初始 strength（0–1，默认 0.5）。action \"support\"：用一条新证据加强一条信念。action \"contradict\"：用一条冲突证据削弱一条信念。support / contradict 时 delta 必填（这次证据有多强，你自己按证据强度定，0–0.2 之间；超过 0.2 代码会夹到 0.2，不报错；缺了会返回错误让你补给），entryId + quote 必填，quote 必须是那条原文里逐字抄来的话，对不上就拒绝写入。同一条冲突证据只扣一次分，重复提交会被忽略。只在人设窗口可用。",
         parameters: {
@@ -2408,15 +2997,15 @@ export function apply(
             type: "object",
             properties: {
               ok: { type: "boolean" },
-              dimensions: { type: "object" },
+              dimensions: { type: "object", additionalProperties: true },
               beliefs: { type: "array" },
-              belief: { type: "object" },
+              belief: { type: "object", additionalProperties: true },
               duplicate: { type: "boolean" },
               error: { type: "string" },
               reasons: { type: "array" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value) },
           ],
         },
@@ -2600,6 +3189,9 @@ export function apply(
       // task-window call reads and writes nothing.
       registerTool({
         name: "memory_reflect",
+        // 0.5.1 (0.4.3 §四): low-frequency tool — description
+        // loads on demand (same as memory_feedback).
+        deferLoading: true,
         description:
           "反思触发器：先问 24 小时里有没有攒够值得反思的新对话，再由你自己决定要不要反思。两种用法：① 只传 {} 查一下——24 小时内新记忆的重要性总和不到防打扰下限（5 分）时返回 {triggered: false}，这时不要反思；高于下限时返回 {triggered: true, text: 反思提示词}，提示词里是最近 24 小时的原文，你自己判断有没有新发现、要不要反思、反思出什么结论，代码不拦你；② 决定反思后，再调一次 memory_reflect，把结论（text，一句就行）和来源 id（sourceIds）传回来保存：来源必须是提示词里给的那几条原文的 id，拿提示词之外的条目当来源会被拒绝；结论里引用的每一句话都要用「」括起来、从原文逐字抄，不能改写，引不上原文的整条作废、不保存；结论自己的新词不用和原文一字不差，那是你看出来的新东西。保存成功返回 {triggered: true, reflectionId, text}。只在人设窗口可用。",
         parameters: {
@@ -2627,7 +3219,7 @@ export function apply(
               reasons: { type: "array" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value) },
           ],
         },
@@ -2743,6 +3335,9 @@ export function apply(
 
       registerTool({
         name: "memory_proact",
+        // 0.5.1 (0.4.3 §四): low-frequency tool — description
+        // loads on demand (same as memory_feedback).
+        deferLoading: true,
         description:
           "行为回流·会话内主动：她自己决定要不要主动找他说句话。两种用法：① 只传 {} 查一下——今天已经主动过一次时返回 {action: null, reason}，不要再问模型；还没主动过时返回 {action: null, prompt: 主动提示词, promptToken}，提示词里是今天的记忆、信念和反思，你自己掂量该不该打扰、现在说合不合适，不要为了主动而主动，不行动完全可以；② 决定行动后，再调一次 memory_proact，把决定交回来（act: true，judgment 一句话为什么、actionText 你想说的话用你自己的话写、trigger 触发它的记忆或信念 id，只能用提示词里的 id，还要带上 gate 调用返回的 promptToken——没有它或过期了都存不进去；决定不行动就交 act: false，也带上 promptToken，好让这次提示作废）：代码再过一次护栏，通过了就存进 loop.json，返回 {action}，你再在聊天里用自己的话把 actionText 说出来；护栏不过或解析失败返回 {action: null}，不行动。channel 现在只允许 \"session\"，传 \"qq\" 返回错误 qq_not_connected（QQ 还没接）。只在人设窗口可用。",
         parameters: {
@@ -2782,7 +3377,7 @@ export function apply(
             type: "object",
             properties: {
               ok: { type: "boolean" },
-              action: { type: "object" },
+              action: { type: "object", additionalProperties: true },
               prompt: { type: "string" },
               promptToken: { type: "string" },
               text: { type: "string" },
@@ -2790,7 +3385,7 @@ export function apply(
               error: { type: "string" },
             },
           },
-          render: (value: unknown) => [
+          render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value) },
           ],
         },
@@ -2924,6 +3519,601 @@ export function apply(
               ok: false,
               action: null,
               error: `触发判断失败：${err instanceof Error ? err.message : String(err)}`,
+            };
+          }
+        },
+      });
+
+      // 0.5.0 step 4: user feedback on a recalled memory — correct /
+      // wrong / irrelevant. Tool only, no UI. Wrong invalidates the
+      // entry (same path as memory_invalidate, with an audit line);
+      // irrelevant demotes it in later recall (ranking halves, and
+      // significance halves); correct counts as a verification
+      // (a named fragment's provenance verifyCount + 1).
+      // deferLoading: the description loads on demand, not into
+      // every request's system prompt (17 tools now cost ~3–4k
+      // tokens/round). The flag is passed through untouched by both
+      // compilers (define-tool.ts spreads the spec); there is NO
+      // local copy of dsh-tools to verify the flag name against
+      // the host version — that needs a real-DSH check — so the
+      // description below is kept to one short line as the real
+      // mitigation: even if the host ignores the flag, this tool
+      // costs one line. Gated to persona windows like the other
+      // write tools.
+      registerTool({
+        name: "memory_feedback",
+        deferLoading: true,
+        description:
+          "对刚才召回的某条记忆给反馈：correct 对了 / wrong 错了 / irrelevant 不相关。wrong 会让它失效，irrelevant 会降权，correct 记一次验证。",
+        parameters: {
+          entryId: {
+            type: "string",
+            required: true,
+            description: "记忆条目 id（见 memory_search 的 hits）",
+          },
+          feedback: {
+            type: "string",
+            required: true,
+            description: "correct / wrong / irrelevant 之一",
+          },
+          fragmentId: {
+            type: "string",
+            required: false,
+            description: "命中带的 fragmentId（有就传，片段也会跟着改：对了记一次验证，错了标存疑）",
+          },
+          reason: {
+            type: "string",
+            required: false,
+            description: "为什么错 / 为什么不相关，一句话（错了会进审计日志）",
+          },
+        },
+        output: {
+          schema: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              entryId: { type: "string" },
+              feedback: { type: "string" },
+              invalidated: { type: "array" },
+              significance: { type: "number" },
+              counts: { type: "object", additionalProperties: true },
+              error: { type: "string" },
+            },
+          },
+          render: (_args: unknown, value: unknown) => [
+            { type: "text", text: JSON.stringify(value) },
+          ],
+        },
+        execute: async (args: unknown, exec?: unknown) => {
+          const { sid, persona } = toolSession(exec);
+          if (!persona) {
+            return {
+              ok: false,
+              entryId: "",
+              feedback: "",
+              invalidated: [],
+              error:
+                "memory_feedback 只在人设窗口可用：当前会话不是人设窗口（没有触发夏柠柒/柠柒），本次不改记忆。",
+            };
+          }
+          const a = (args ?? {}) as {
+            entryId?: unknown;
+            feedback?: unknown;
+            fragmentId?: unknown;
+            reason?: unknown;
+          };
+          const entryId =
+            typeof a.entryId === "string" ? a.entryId : "";
+          const feedback =
+            typeof a.feedback === "string" ? a.feedback : "";
+          const fragmentId =
+            typeof a.fragmentId === "string" && a.fragmentId.length > 0
+              ? a.fragmentId
+              : undefined;
+          const reason =
+            typeof a.reason === "string" ? a.reason : undefined;
+          if (!entryId) {
+            return {
+              ok: false,
+              entryId: "",
+              feedback,
+              invalidated: [],
+              error: "memory_feedback 需要 entryId（见 memory_search 的 hits）。",
+            };
+          }
+          if (
+            feedback !== "correct" &&
+            feedback !== "wrong" &&
+            feedback !== "irrelevant"
+          ) {
+            return {
+              ok: false,
+              entryId,
+              feedback,
+              invalidated: [],
+              error:
+                "memory_feedback 的 feedback 只能是 correct / wrong / irrelevant 之一。",
+            };
+          }
+          try {
+            const res = core.applyFeedback({
+              entryId,
+              kind: feedback,
+              fragmentId,
+              reason,
+            });
+            if (!res.ok) {
+              return {
+                ok: false,
+                entryId,
+                feedback,
+                invalidated: [],
+                error: res.reason ?? "反馈失败。",
+              };
+            }
+            if (res.invalidated.length > 0) {
+              appendInvalidationAudit({
+                at: Date.now(),
+                sessionId: sid,
+                entryIds: res.invalidated,
+                reason: `memory_feedback wrong${reason ? `：${reason}` : ""}`,
+                invalidated: res.invalidated,
+                unknown: [],
+              });
+            }
+            return {
+              ok: true,
+              entryId,
+              feedback,
+              invalidated: res.invalidated,
+              significance: res.significance,
+              counts: res.feedback,
+            };
+          } catch (err) {
+            return {
+              ok: false,
+              entryId,
+              feedback,
+              invalidated: [],
+              error: `反馈失败：${err instanceof Error ? err.message : String(err)}`,
+            };
+          }
+        },
+      });
+      // 0.5.1 item 1: forgetting — the model may FILE a request
+      // and dry-run it, nothing more. There is deliberately NO
+      // approve / execute action here: forgetting is authorised
+      // only on a non-model channel (the admin CLI `memory-admin
+      // forget approve|execute`, or the local admin API). A chat
+      // "我同意" can never approve a forgetting — the approval
+      // record can only be written by the CLI / API, and
+      // core.approve() refuses any other channel.
+      registerTool({
+        name: "memory_forget",
+        deferLoading: true,
+        description:
+          "申请遗忘某条记忆（hide 藏起来可恢复 / delete 物理删除）：request 提交申请并返回干跑预览，dry-run 只看会动到什么、什么都不改，list 看待处理的申请。注意：提交只是申请，删/藏要等管理中心（命令行或本地接口）批准后才会执行，聊天里说“我同意”不算批准；这个工具没有批准和执行操作。",
+        parameters: {
+          action: {
+            type: "string",
+            required: true,
+            description: "request / dry-run / list 之一",
+          },
+          mode: {
+            type: "string",
+            required: false,
+            description: "hide 或 delete（request 时必填）",
+          },
+          entryIds: {
+            type: "array",
+            items: { type: "string" },
+            required: false,
+            description: "要遗忘的记忆条目 id 列表（见 memory_search 的 hits）",
+          },
+          reason: {
+            type: "string",
+            required: false,
+            description: "为什么遗忘，一句话（进审计日志）",
+          },
+        },
+        output: {
+          schema: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              requestId: { type: "string" },
+              status: { type: "string" },
+              preview: { type: "object", additionalProperties: true },
+              requests: { type: "array" },
+              note: { type: "string" },
+              error: { type: "string" },
+            },
+          },
+          render: (_args: unknown, value: unknown) => [
+            { type: "text", text: JSON.stringify(value) },
+          ],
+        },
+        execute: async (args: unknown, exec?: unknown) => {
+          const { persona } = toolSession(exec);
+          if (!persona) {
+            return {
+              ok: false,
+              error:
+                "memory_forget 只在人设窗口可用：当前会话不是人设窗口（没有触发夏柠柒/柠柒）。",
+            };
+          }
+          const a = (args ?? {}) as {
+            action?: unknown;
+            mode?: unknown;
+            entryIds?: unknown;
+            reason?: unknown;
+          };
+          const action = typeof a.action === "string" ? a.action : "";
+          try {
+            if (action === "list") {
+              return { ok: true, requests: core.listForgetRequests() };
+            }
+            if (action === "dry-run") {
+              const ids = Array.isArray(a.entryIds)
+                ? (a.entryIds as unknown[]).filter(
+                    (x): x is string => typeof x === "string",
+                  )
+                : [];
+              if (ids.length === 0) {
+                return { ok: false, error: "dry-run 需要 entryIds。" };
+              }
+              return { ok: true, preview: core.dryRunForget(ids) };
+            }
+            if (action === "request") {
+              if (a.mode !== "hide" && a.mode !== "delete") {
+                return {
+                  ok: false,
+                  error: 'request 需要 mode 为 hide 或 delete。',
+                };
+              }
+              const ids = Array.isArray(a.entryIds)
+                ? (a.entryIds as unknown[]).filter(
+                    (x): x is string => typeof x === "string",
+                  )
+                : [];
+              if (ids.length === 0) {
+                return { ok: false, error: "request 需要 entryIds。" };
+              }
+              const req = core.requestForget({
+                mode: a.mode,
+                entryIds: ids,
+                reason:
+                  typeof a.reason === "string" ? a.reason : undefined,
+                createdBy: "model",
+              });
+              return {
+                ok: true,
+                requestId: req.id,
+                status: req.status,
+                preview: core.dryRunForget(ids),
+                note: "申请已提交，等待管理中心（命令行 memory-admin forget approve / 本地接口）批准后才会执行；聊天里说“我同意”不算批准。",
+              };
+            }
+            return {
+              ok: false,
+              error: "action 只能是 request / dry-run / list。",
+            };
+          } catch (err) {
+            return {
+              ok: false,
+              error: `遗忘申请失败：${err instanceof Error ? err.message : String(err)}`,
+            };
+          }
+        },
+      });
+
+      // 0.5.1 item 5: goals / todos — the model reads the open
+      // ones, creates them when the user states an aim, and marks
+      // them done / dropped when the user says so. Gated to
+      // persona windows like the other write tools.
+      registerTool({
+        name: "memory_goal",
+        deferLoading: true,
+        description:
+          "目标/待办：create 建目标，list 看目标（带完成状态），complete 完成，reopen 重新打开，drop 放弃，remove 删除，update 改标题/截止/备注。只在人设窗口可用。",
+        parameters: {
+          action: {
+            type: "string",
+            required: true,
+            description:
+              "create / list / get / update / complete / reopen / drop / remove 之一",
+          },
+          goalId: {
+            type: "string",
+            required: false,
+            description: "目标 id（list 以外必填，见 list 的返回）",
+          },
+          title: {
+            type: "string",
+            required: false,
+            description: "目标标题（create 时必填）",
+          },
+          status: {
+            type: "string",
+            required: false,
+            description: "list 时按状态过滤：open / done / dropped",
+          },
+          dueAt: {
+            type: "number",
+            required: false,
+            description: "截止时间，毫秒时间戳（可选）",
+          },
+          notes: {
+            type: "string",
+            required: false,
+            description: "备注（可选）",
+          },
+        },
+        output: {
+          schema: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              goal: { type: "object", additionalProperties: true },
+              goals: { type: "array" },
+              removed: { type: "boolean" },
+              error: { type: "string" },
+            },
+          },
+          render: (_args: unknown, value: unknown) => [
+            { type: "text", text: JSON.stringify(value) },
+          ],
+        },
+        execute: async (args: unknown, exec?: unknown) => {
+          const { persona } = toolSession(exec);
+          if (!persona) {
+            return {
+              ok: false,
+              error:
+                "memory_goal 只在人设窗口可用：当前会话不是人设窗口（没有触发夏柠柒/柠柒）。",
+            };
+          }
+          const a = (args ?? {}) as {
+            action?: unknown;
+            goalId?: unknown;
+            title?: unknown;
+            status?: unknown;
+            dueAt?: unknown;
+            notes?: unknown;
+          };
+          const action = typeof a.action === "string" ? a.action : "";
+          const goalId = typeof a.goalId === "string" ? a.goalId : "";
+          try {
+            if (action === "list") {
+              const status =
+                a.status === "open" || a.status === "done" || a.status === "dropped"
+                  ? a.status
+                  : undefined;
+              const goals = core.goals.all();
+              return {
+                ok: true,
+                goals: status ? goals.filter((g) => g.status === status) : goals,
+              };
+            }
+            if (action === "create") {
+              if (typeof a.title !== "string" || a.title.trim().length === 0) {
+                return { ok: false, error: "create 需要非空 title。" };
+              }
+              return {
+                ok: true,
+                goal: core.createGoal({
+                  title: a.title,
+                  ...(typeof a.dueAt === "number" ? { dueAt: a.dueAt } : {}),
+                  ...(typeof a.notes === "string" ? { notes: a.notes } : {}),
+                }),
+              };
+            }
+            if (!goalId) {
+              return { ok: false, error: "这个操作需要 goalId。" };
+            }
+            if (action === "get") {
+              const g = core.goals.get(goalId);
+              if (!g) return { ok: false, error: `no goal ${goalId}` };
+              return { ok: true, goal: g };
+            }
+            if (action === "complete" || action === "reopen" || action === "drop") {
+              const g = core.setGoalStatus(
+                goalId,
+                action === "complete" ? "done" : action === "reopen" ? "open" : "dropped",
+              );
+              if (!g) return { ok: false, error: `no goal ${goalId}` };
+              return { ok: true, goal: g };
+            }
+            if (action === "update") {
+              const g = core.updateGoal(goalId, {
+                ...(typeof a.title === "string" ? { title: a.title } : {}),
+                ...(typeof a.dueAt === "number" ? { dueAt: a.dueAt } : {}),
+                ...(typeof a.notes === "string" ? { notes: a.notes } : {}),
+              });
+              if (!g) return { ok: false, error: `no goal ${goalId}` };
+              return { ok: true, goal: g };
+            }
+            if (action === "remove") {
+              return { ok: true, removed: core.removeGoal(goalId) };
+            }
+            return {
+              ok: false,
+              error:
+                "action 只能是 create / list / get / update / complete / reopen / drop / remove。",
+            };
+          } catch (err) {
+            return {
+              ok: false,
+              error: `目标操作失败：${err instanceof Error ? err.message : String(err)}`,
+            };
+          }
+        },
+      });
+
+      // 0.5.1 item 4: experience learning — record a rule learned
+      // from a mistake (with its trigger and source), list them,
+      // or match them against a question. Gated to persona
+      // windows like the other write tools.
+      registerTool({
+        name: "memory_experience",
+        deferLoading: true,
+        description:
+          "经验：从做错的事里学规矩。add 把一条教训写成可复用的经验（rule 一两句话 + trigger 触发词 + source 哪错的），list 看全部经验，match 看某句话会触发哪条经验。只在人设窗口可用。",
+        parameters: {
+          action: {
+            type: "string",
+            required: true,
+            description: "add / list / match 之一",
+          },
+          rule: {
+            type: "string",
+            required: false,
+            description: "经验规则，一两句话（add 时必填）",
+          },
+          trigger: {
+            type: "array",
+            items: { type: "string" },
+            required: false,
+            description: "触发词列表（add 时必填）",
+          },
+          source: {
+            type: "string",
+            required: false,
+            description: "哪错的、在哪错的（add 时必填）",
+          },
+          sourceIds: {
+            type: "array",
+            items: { type: "string" },
+            required: false,
+            description: "来源记忆 id（add 时必填，必须是人设窗口、未隐藏的真实条目）",
+          },
+          id: {
+            type: "string",
+            required: false,
+            description: "经验 id（confirm 时必填）",
+          },
+          query: {
+            type: "string",
+            required: false,
+            description: "要匹配的问题（match 时必填）",
+          },
+        },
+        output: {
+          schema: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              experience: { type: "object", additionalProperties: true },
+              experiences: { type: "array" },
+              matched: { type: "array" },
+              error: { type: "string" },
+            },
+          },
+          render: (_args: unknown, value: unknown) => [
+            { type: "text", text: JSON.stringify(value) },
+          ],
+        },
+        execute: async (args: unknown, exec?: unknown) => {
+          const { persona } = toolSession(exec);
+          if (!persona) {
+            return {
+              ok: false,
+              error:
+                "memory_experience 只在人设窗口可用：当前会话不是人设窗口（没有触发夏柠柒/柠柒）。",
+            };
+          }
+          const a = (args ?? {}) as {
+            action?: unknown;
+            rule?: unknown;
+            trigger?: unknown;
+            source?: unknown;
+            sourceIds?: unknown;
+            id?: unknown;
+            query?: unknown;
+          };
+          const action = typeof a.action === "string" ? a.action : "";
+          try {
+            if (action === "list") {
+              return { ok: true, experiences: core.experiences.all() };
+            }
+            if (action === "match") {
+              if (typeof a.query !== "string" || a.query.length === 0) {
+                return { ok: false, error: "match 需要 query。" };
+              }
+              return {
+                ok: true,
+                matched: core.experiences.match(a.query, 5, true).map((m) => ({
+                  id: m.experience.id,
+                  rule: m.experience.rule,
+                  source: m.experience.source,
+                  verified: m.experience.verified,
+                  score: m.score,
+                })),
+              };
+            }
+            if (action === "confirm") {
+              return {
+                ok: false,
+                error:
+                  "confirm 只能由用户通过 admin CLI 或本地管理 API 执行；模型工具不能给自己写的经验盖章。",
+              };
+            }
+            if (action === "add") {
+              if (typeof a.rule !== "string" || a.rule.trim().length === 0) {
+                return { ok: false, error: "add 需要非空 rule。" };
+              }
+              if (typeof a.source !== "string" || a.source.trim().length === 0) {
+                return { ok: false, error: "add 需要 source（哪错的）。" };
+              }
+              const trigger = Array.isArray(a.trigger)
+                ? (a.trigger as unknown[]).filter(
+                    (x): x is string => typeof x === "string",
+                  )
+                : [];
+              if (trigger.length === 0) {
+                return { ok: false, error: "add 需要至少一个 trigger。" };
+              }
+              const sourceIds = Array.isArray(a.sourceIds)
+                ? (a.sourceIds as unknown[]).filter(
+                    (x): x is string => typeof x === "string" && x.length > 0,
+                  )
+                : [];
+              if (sourceIds.length === 0) {
+                return {
+                  ok: false,
+                  error:
+                    "add 需要 sourceIds：先 memory_search 找到那条真实记忆，再把 id 传进来；没有来源的经验不能注入。",
+                };
+              }
+              const found = core.entriesByIds(sourceIds);
+              if (found.length !== sourceIds.length) {
+                return { ok: false, error: "sourceIds 里有不存在的记忆 id。" };
+              }
+              if (
+                found.some(
+                  (e) => e.window !== "persona" || core.forget.isForgotten(e.id),
+                )
+              ) {
+                return {
+                  ok: false,
+                  error: "sourceIds 必须是未隐藏的人设窗口记忆。",
+                };
+              }
+              return {
+                ok: true,
+                experience: core.recordExperience({
+                  rule: a.rule,
+                  trigger,
+                  source: a.source,
+                  sourceIds,
+                }),
+              };
+            }
+            return { ok: false, error: "action 只能是 add / list / match。" };
+          } catch (err) {
+            return {
+              ok: false,
+              error: `经验操作失败：${err instanceof Error ? err.message : String(err)}`,
             };
           }
         },

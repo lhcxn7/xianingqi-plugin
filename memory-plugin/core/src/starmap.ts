@@ -156,6 +156,7 @@
 
 import { COMMON_TOKENS, contentTokens } from "./activation.ts";
 import { emotionPolarity } from "./attributes.ts";
+import { formatDate, formatTime } from "./dates.ts";
 import type { Fragment } from "./fragments.ts";
 import type {
   GraphEdge,
@@ -546,7 +547,19 @@ export function buildStarmapData(
   now: number,
   fragments: Fragment[] = [],
 ): StarmapData {
-  const byId = new Map(entries.map((e) => [e.id, e]));
+  // 0.5.1 (0.4.3 §四): old rows may lack date/time (written
+  // before the fields existed) — localIso's date.replace would
+  // throw on undefined and kill the whole starmap. Normalise
+  // once, up front: missing/empty falls back to the entry's own
+  // timestamp, so every star below can trust e.date/e.time.
+  // Sources follow automatically — they are looked up through
+  // byId, which is built from the normalised rows.
+  const normalized = entries.map((e) => ({
+    ...e,
+    date: e.date || formatDate(e.ts),
+    time: e.time || formatTime(e.ts),
+  }));
+  const byId = new Map(normalized.map((e) => [e.id, e]));
   // 0.3.0: one star per fragment (its sources fold into it) plus
   // one star per log entry with no fragment yet — unfragmented
   // entries are never hidden or deleted. A fragment's edges come
@@ -619,7 +632,7 @@ export function buildStarmapData(
       })),
     });
   }
-  for (const e of entries) {
+  for (const e of normalized) {
     if (fragmentOfEntry.has(e.id)) continue;
     const a = attrs.get(e.id);
     const significance = a?.significance ?? 0.4;
@@ -751,18 +764,31 @@ export function buildStarmapData(
     for (const w of cjkTrigrams(e.text, runs)) pushAll(w);
     return { all, fallback };
   };
+  // 0.5.1 (0.4.3 §四): badgeWords is pure per star (same Item
+  // in, same words out), but the docFreq loop below and the
+  // memories map both called it — twice the tokenising,
+  // trigramming and overlap checks per star. Compute once per
+  // star id and reuse.
+  const badgeCache = new Map<string, BadgeWords>();
+  const badgeWordsOnce = (e: Item): BadgeWords => {
+    const hit = badgeCache.get(e.id);
+    if (hit) return hit;
+    const computed = badgeWords(e);
+    badgeCache.set(e.id, computed);
+    return computed;
+  };
   // Document frequency of each badge word across the picked stars,
   // for the key-suffix rule (review-15 m-2). One count per star.
   const docFreq = new Map<string, number>();
   for (const e of picked) {
-    for (const w of new Set(badgeWords(e).all)) {
+    for (const w of new Set(badgeWordsOnce(e).all)) {
       docFreq.set(w, (docFreq.get(w) ?? 0) + 1);
     }
   }
   const memories: ShiguangMemory[] = picked.map((e) => {
     const keywords = dedupCap(e.keywords);
     const cat = shiguangCat(e.kind, e.emotion);
-    const { all, fallback } = badgeWords(e);
+    const { all, fallback } = badgeWordsOnce(e);
     const suffix = keySuffix(all, docFreq, fallback, CAT_LABEL[cat]);
     // Key / owner (heuristic, see header): fragments and
     // assistant (夏柠柒's own) lines -> "ta.*"; user lines ->
@@ -805,12 +831,18 @@ export function buildStarmapData(
 }
 
 /** JSON.stringify + escape <, > and & so the payload can never
- *  break out of its <script> tag, whatever the memory text says. */
+ *  break out of its <script> tag, whatever the memory text says.
+ *  0.5.1 (0.4.3 §四): U+2028/U+2029 too — they are legal in a
+ *  JSON string but act as line terminators in a <script> block,
+ *  so an unescaped one in a memory would break the starmap's
+ *  inline script. */
 export function safeJsonForHtml(value: unknown): string {
   return JSON.stringify(value)
     .replace(/</g, "\\u003c")
     .replace(/>/g, "\\u003e")
-    .replace(/&/g, "\\u0026");
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 
 // P1 — DATA split point: SHIGUANG_HEAD ends at the DATA line and

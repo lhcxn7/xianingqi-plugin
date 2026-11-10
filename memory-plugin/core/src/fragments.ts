@@ -44,7 +44,18 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteText } from "./atomic.ts";
+import { atomicWriteText, backupCorruptFile } from "./atomic.ts";
+import type { CorruptBackup } from "./atomic.ts";
+import {
+  MODEL_SOURCE_TYPES,
+  confidenceFor,
+  legacyProvenance,
+  newProvenance,
+  normalizeProvenance,
+  validateSourceIds,
+  type Provenance,
+  type SourceType,
+} from "./provenance.ts";
 import { estimateTokens } from "./tokenize.ts";
 import type { MemoryEntry } from "./types.ts";
 
@@ -55,6 +66,13 @@ export const FRAGMENTS_FILE = "fragments.json";
  *  nothing over the verbatim source and is rejected. */
 export const FRAGMENT_MAX_TOKENS = 30;
 export const FRAGMENT_MAX_QUOTES = 2;
+/** 0.5.1 (0.4.3 item 9): a fragment quote must be at least 4
+ *  characters — a 1–2 char quote (\"累\", \"生气\") matches almost
+ *  any line and proves nothing about where the fragment came
+ *  from. Applies to ordinary fragments only: reflections keep
+ *  their own 2-char floor (REFLECTION_MIN_QUOTE_CHARS), because
+ *  a 「」 citation is a short verbatim anchor by design. */
+export const FRAGMENT_MIN_QUOTE_CHARS = 4;
 
 export type ToneLevel =
   | "strong-positive"
@@ -166,13 +184,65 @@ const DEFAULT_TONE_INTENSITY: Record<ToneLevel, number> = {
 
 /** High-frequency grammatical characters — a bigram containing one
  *  carries no topical signal ("汤的", "的味"), so it is never a
- *  required key term. Same set as the tokenizer's stopwords. */
+ *  required key term. Same set as the tokenizer's stopwords.
+ *  0.5.1 (0.4.3 item 9): 不 / 没 are NO LONGER stop chars here —
+ *  a negation bigram (没有, 不生气) is a real word and must be
+ *  kept, or "我没有生气" would verify the same as "我生气了". */
 const STOP_CHARS = new Set([
   "的", "了", "在", "是", "有", "和", "就", "都", "也", "还",
-  "不", "没", "很", "这", "那", "我", "你", "他", "她", "它", "们",
+  "很", "这", "那", "我", "你", "他", "她", "它", "们",
   "个", "一", "上", "下", "来", "去", "吗", "呢", "吧", "啊", "哦",
   "嗯", "呀", "么",
 ]);
+
+/** Negation words for the polarity check below. */
+const NEGATION_CHARS = new Set(["不", "没", "未", "别", "莫", "勿", "非"]);
+
+/** Polarity of a term inside a text: "neg" when every occurrence
+ *  is preceded within 2 characters by a negation word, "pos" when
+ *  none is, "mixed" when both, "absent" when it never occurs. The
+ *  2-char window catches 我没有生气 / 我不生气 without reaching
+ *  across a clause boundary. */
+export function termPolarity(
+  text: string,
+  term: string,
+): "neg" | "pos" | "mixed" | "absent" {
+  let neg = 0;
+  let pos = 0;
+  let idx = 0;
+  for (;;) {
+    const at = text.indexOf(term, idx);
+    if (at === -1) break;
+    const before = text.slice(Math.max(0, at - 2), at);
+    if ([...before].some((ch) => NEGATION_CHARS.has(ch))) neg++;
+    else pos++;
+    idx = at + term.length;
+  }
+  if (neg === 0 && pos === 0) return "absent";
+  if (neg > 0 && pos > 0) return "mixed";
+  return neg > 0 ? "neg" : "pos";
+}
+
+/** True when at least one quote shares a 2-char slice with the
+ *  fragment text — the quote grounds the fragment's own claim,
+ *  not just any verbatim phrase from the sources. Punctuation and
+ *  case are stripped first, so "聊 DSH 的插件" shares 插件 with
+ *  "他还想聊 dsh 插件". */
+function quoteSharesWordWithText(quotes: string[], text: string): boolean {
+  const norm = (s: string): string =>
+    s.toLowerCase().replace(/[\s\p{P}]/gu, "");
+  const t = norm(text);
+  if (t.length < 2) return false;
+  const textBigrams = new Set<string>();
+  for (let i = 0; i + 1 < t.length; i++) textBigrams.add(t.slice(i, i + 2));
+  return quotes.some((q) => {
+    const nq = norm(q);
+    for (let i = 0; i + 1 < nq.length; i++) {
+      if (textBigrams.has(nq.slice(i, i + 2))) return true;
+    }
+    return false;
+  });
+}
 
 /** All tone-marker phrases, longest first, for stripping. */
 const ALL_MARKERS: string[] = Object.values(TONE_MARKERS)
@@ -194,6 +264,11 @@ export interface Fragment {
    *  recall treat every fragment the same. */
   type?: "reflection";
   sourceIds: string[];
+  /** 0.5.0 step 3: provenance — where this fragment came from
+   *  and how much it can be trusted. The model proposes the
+   *  sourceType at creation; the confidence is code-computed.
+   *  Rows written before 0.5.0 load as legacy (unknown). */
+  provenance?: Provenance;
   text: string;
   tone: FragmentTone;
   quotes: string[];
@@ -218,6 +293,12 @@ export interface FragmentInput {
   tone: string;
   quotes: string[];
   topic?: string;
+  /** 0.5.0 step 3: the model's JUDGEMENT of what this fragment
+   *  is — user_quote / model_quote / model_summary /
+   *  model_inference. Absent = model_summary. The confidence is
+   *  NOT an input: the code computes it. An unknown value is
+   *  rejected (the vocabulary is fixed). */
+  sourceType?: string;
   keywords?: string[];
 }
 
@@ -395,17 +476,43 @@ export function verifyFragment(
     return { ok: false, reasons: ["没有找到来源条目（sourceIds 不存在）。"], toneChecked: false };
   }
   const joined = sources.map((s) => s.text).join("\n");
+  // 0.5.1 (0.4.3 item 9): the key-term check is case-insensitive
+  // — a source that says "dsh" must match a fragment that says
+  // "DSH" (DSH / iPhone / GitHub are all lower-case in the log
+  // half the time). Only the term check is lowered; quotes stay
+  // exact, verbatim, case and all.
+  const joinedLower = joined.toLowerCase();
   const quoteOnly = opts?.quoteOnly === true;
   if (!quoteOnly) {
     const terms = fragmentKeyTerms(draft.text);
     if (terms.length === 0) {
       reasons.push("片段正文里没有任何可核对的关键实词（只有语气词/停用词），无法核对来源。");
     } else {
-      const missing = terms.filter((t) => !joined.includes(t));
+      const missing = terms.filter((t) => !joinedLower.includes(t.toLowerCase()));
       if (missing.length > 0) {
         reasons.push(
           `关键实词不在来源里：${missing.slice(0, 5).join("、")}——来源从没提过这些词，可能是编造。`,
         );
+      } else {
+        // 0.5.1 (0.4.3 item 9): negation polarity — a term the
+        // sources negate must not be written as an affirmation,
+        // or the other way round ("我没有生气" -> "我生气了").
+        // A term whose polarity is mixed in the sources is
+        // skipped (the sources themselves disagree), and a term
+        // absent from the sources is already caught above.
+        for (const t of terms) {
+          const fragPol = termPolarity(draft.text, t);
+          const srcPol = termPolarity(joined, t);
+          if (
+            srcPol !== "absent" &&
+            srcPol !== "mixed" &&
+            fragPol !== srcPol
+          ) {
+            reasons.push(
+              `语义反转：来源里「${t}」是${srcPol === "neg" ? "否定" : "肯定"}的，片段里却写成了${fragPol === "neg" ? "否定" : "肯定"}——否定句不能写成肯定句。`,
+            );
+          }
+        }
       }
     }
   }
@@ -415,9 +522,28 @@ export function verifyFragment(
   for (const q of draft.quotes) {
     if (typeof q !== "string" || q.trim().length === 0) {
       reasons.push("有一条引用是空的。");
+    } else if (!quoteOnly && q.trim().length < FRAGMENT_MIN_QUOTE_CHARS) {
+      reasons.push(
+        `引用太短（${JSON.stringify(q)} 只有 ${q.trim().length} 个字，至少 ${FRAGMENT_MIN_QUOTE_CHARS} 个字）：一两个字的引用谁都能对上，证明不了片段的出处。`,
+      );
     } else if (!sources.some((s) => s.text.includes(q))) {
       reasons.push(`引用不在来源原文里：${JSON.stringify(q)}——引用必须是逐字抄的，不能改写。`);
     }
+  }
+  // 0.5.1 (0.4.3 item 9): at least one quote must share a real
+  // word with the fragment text — a quote that is only a tone
+  // phrase ("真好喝") does not ground a claim about a topic
+  // ("酸梅湯"). Skipped in quoteOnly mode (a reflection's insight
+  // words are new by design, only its citations are checked).
+  if (
+    !quoteOnly &&
+    draft.quotes.length > 0 &&
+    draft.quotes.every((q) => typeof q === "string" && q.trim().length > 0) &&
+    !quoteSharesWordWithText(draft.quotes, draft.text)
+  ) {
+    reasons.push(
+      "引用和片段正文没有共享实词：引用只是来源里的一句语气词，和片段说的不是一回事——引用至少要有一句提到片段正文里的词。",
+    );
   }
   // Tone: sources first, then the fragment's own text. Only when
   // BOTH sides are known levels — a free-form tone ("unknown") or
@@ -468,9 +594,42 @@ export function validateFragmentInput(
   if (!Array.isArray(input.sourceIds) || input.sourceIds.length === 0) {
     return { ok: false, reasons: ["sourceIds 不能为空：片段必须注明它是从哪几条原文来的。"] };
   }
-  const missingIds = input.sourceIds.filter((id) => !entriesById.has(id));
-  if (missingIds.length > 0) {
-    reasons.push(`来源条目不存在：${missingIds.slice(0, 5).join("、")}`);
+  // 0.5.0 step 3: core-layer source-existence check — every
+  // sourceId must resolve to a real log entry, or the fragment is
+  // rejected (nothing stored).
+  const sourceCheck = validateSourceIds(input.sourceIds, entriesById);
+  if (!sourceCheck.ok) {
+    reasons.push(
+      `来源条目不存在：${sourceCheck.missing.slice(0, 5).join("、")}`,
+    );
+  }
+  // 0.5.1 (0.4.3 item 12): every source must be a persona-window
+  // entry — a task-window line must never be folded into a
+  // fragment, because fragments are injected into her context.
+  // (Beliefs and reflections already check this; see core.ts
+  // createBelief and reflection.ts saveReflection.)
+  const nonPersona = input.sourceIds.filter((id) => {
+    const e = entriesById.get(id);
+    return e !== undefined && e.window !== "persona";
+  });
+  if (nonPersona.length > 0) {
+    reasons.push(
+      `来源条目不在人设窗口：${nonPersona.slice(0, 5).join("、")}——任务窗口的对话不能做成片段。`,
+    );
+  }
+  // 0.5.0 step 3: the source type is the model's judgement only —
+  // a fixed vocabulary, default model_summary. The confidence is
+  // code-computed at build time below, never an input.
+  let sourceType: SourceType = "model_summary";
+  if (typeof input.sourceType === "string" && input.sourceType.trim()) {
+    const t = input.sourceType.trim();
+    if ((MODEL_SOURCE_TYPES as string[]).includes(t)) {
+      sourceType = t as SourceType;
+    } else {
+      reasons.push(
+        `来源类型只能是 用户原话 / 模型原话 / 模型总结 / 模型推断 之一，传了「${t}」。`,
+      );
+    }
   }
   if (typeof input.text !== "string" || input.text.trim().length === 0) {
     reasons.push("片段正文不能为空。");
@@ -510,6 +669,9 @@ export function validateFragmentInput(
   const fragment: Fragment = {
     id: `frag-${now}-${randomBytes(3).toString("hex")}`,
     sourceIds: [...input.sourceIds],
+    // 0.5.0 step 3: creation passed code verification, so it
+    // counts as the first verification (verifyCount 1, stamped).
+    provenance: newProvenance(input.sourceIds, sourceType, now),
     text: input.text.trim(),
     tone: tone as FragmentTone,
     quotes: [...input.quotes],
@@ -543,6 +705,30 @@ const VALID_TONE_LEVELS: ReadonlySet<string> = new Set([
 export class FragmentStore {
   private list: Fragment[] = [];
   private readonly file: string;
+  // 0.5.1 (0.4.3 item 10): same corrupt-file treatment as
+  // BeliefStore — a failed load backs the bytes up once and marks
+  // the store; save() refuses until the file parses again.
+  private loadFailed = false;
+  private corruptBackup: CorruptBackup | null = null;
+  // 0.5.1 (0.4.3 §四): suspect / verified marks made in memory
+  // between loads. A reload (cross-process refresh) used to wipe
+  // them — now they are recorded here and replayed onto the
+  // reloaded rows, and cleared only after a successful save.
+  private dirty = new Map<
+    string,
+    { suspect?: boolean; suspectReason?: string; provenance?: Provenance }
+  >();
+
+  /** True when the file on disk failed to parse and has not been
+   *  repaired since; while true, save() throws instead of writing. */
+  get hasLoadFailed(): boolean {
+    return this.loadFailed;
+  }
+
+  /** Path of the .corrupt-* backup, if one was taken. */
+  get corruptBackupPath(): string | null {
+    return this.corruptBackup?.path ?? null;
+  }
 
   constructor(dataDir: string) {
     this.file = join(dataDir, FRAGMENTS_FILE);
@@ -570,11 +756,67 @@ export class FragmentStore {
     return this.list.filter((f) => f.sourceIds.includes(entryId));
   }
 
+  /** Ids of fragments whose sources are ALL inside `ids` — they
+   *  would lose every source (dry-run preview for a forget). */
+  idsLosingAllSources(ids: string[]): string[] {
+    const set = new Set(ids);
+    return this.list
+      .filter(
+        (f) =>
+          f.sourceIds.length > 0 &&
+          f.sourceIds.every((s) => set.has(s)),
+      )
+      .map((f) => f.id);
+  }
+
+  /** Remove fragments that lose all their sources (0.5.1 item 1:
+   *  forget-delete). A fragment with a surviving source stays —
+   *  its re-check will judge it against what is left. Returns
+   *  the removed fragment ids. The caller saves. */
+  removeEntries(ids: string[]): string[] {
+    const doomed = new Set(this.idsLosingAllSources(ids));
+    if (doomed.size === 0) return [];
+    this.list = this.list.filter((f) => !doomed.has(f.id));
+    return [...doomed];
+  }
+
+  /** A load failure never clears the in-memory list and never
+   *  overwrites the file: the corrupt bytes are backed up once and
+   *  the failure is marked, so the next save() refuses loudly
+   *  instead of silently writing an empty store over them. A
+   *  missing file is not a failure — it is a fresh store. */
+  private markCorrupt(why: string): void {
+    const backup = backupCorruptFile(this.file, this.corruptBackup);
+    if (backup) this.corruptBackup = backup;
+    this.loadFailed = true;
+    console.warn(
+      `[memory-plugin] fragments.json 损坏（${why}），` +
+        `已备份到 ${this.corruptBackup?.path ?? "（备份失败）"}，` +
+        "拒绝覆盖原文件——请检查后删除损坏文件或从快照恢复。",
+    );
+  }
+
   private load(): void {
+    if (!existsSync(this.file)) {
+      this.list = [];
+      this.loadFailed = false;
+      // No file means no fragments at all — stale in-memory marks
+      // have nothing to replay onto.
+      this.dirty.clear();
+      return;
+    }
+    let data: PersistedFragments;
     try {
-      if (!existsSync(this.file)) return;
-      const data = JSON.parse(readFileSync(this.file, "utf8")) as PersistedFragments;
-      if (data.version !== 1 || !Array.isArray(data.fragments)) return;
+      data = JSON.parse(readFileSync(this.file, "utf8")) as PersistedFragments;
+    } catch {
+      this.markCorrupt("无法解析 JSON");
+      return;
+    }
+    if (data.version !== 1 || !Array.isArray(data.fragments)) {
+      this.markCorrupt("版本号或结构不对");
+      return;
+    }
+    try {
       const clean: Fragment[] = [];
       for (const f of data.fragments) {
         if (
@@ -602,6 +844,13 @@ export class FragmentStore {
           // the field load as ordinary fragments.
           type: f.type === "reflection" ? "reflection" : undefined,
           sourceIds: [...f.sourceIds],
+          // 0.5.0 step 3: rows written before this step have no
+          // provenance — they load as legacy (unknown), never
+          // forged. A stored confidence is recomputed by code.
+          provenance: normalizeProvenance(
+            (f as { provenance?: unknown }).provenance,
+            f.sourceIds,
+          ),
           text: f.text,
           tone: {
             label: f.tone.label,
@@ -621,21 +870,49 @@ export class FragmentStore {
         });
       }
       this.list = clean;
+      this.loadFailed = false;
+      this.replayDirty();
     } catch {
-      this.list = [];
+      this.markCorrupt("行级解析失败");
+    }
+  }
+
+  /** Re-apply the in-memory suspect / verified marks onto the
+   *  freshly loaded rows (0.5.1 §四): a reload must not wipe a
+   *  mark that has not been saved yet. Rows that no longer exist
+   *  drop their dirty entry. */
+  private replayDirty(): void {
+    if (this.dirty.size === 0) return;
+    for (const [id, d] of [...this.dirty.entries()]) {
+      const f = this.get(id);
+      if (!f) {
+        this.dirty.delete(id);
+        continue;
+      }
+      if (d.suspect !== undefined) {
+        f.suspect = d.suspect;
+        if (d.suspectReason !== undefined) f.suspectReason = d.suspectReason;
+      }
+      if (d.provenance !== undefined) f.provenance = d.provenance;
     }
   }
 
   reload(): void {
-    this.list = [];
     this.load();
   }
 
   save(): void {
+    if (this.loadFailed) {
+      throw new Error(
+        `fragments.json 上次加载失败（已损坏，备份在 ${this.corruptBackup?.path ?? "未知"}），` +
+          "拒绝覆盖——请删除损坏文件或从快照恢复后再写。",
+      );
+    }
     atomicWriteText(
       this.file,
       JSON.stringify({ version: 1, fragments: this.list } satisfies PersistedFragments),
     );
+    this.dirty.clear();
   }
 
   /** Create a fragment: validate (shape + code verification
@@ -705,7 +982,43 @@ export class FragmentStore {
     if (!f.suspect) {
       f.suspect = true;
       f.suspectReason = reason;
+      // 0.5.1 (§四): record the mark so a reload before flush
+      // replays it instead of wiping it.
+      this.dirty.set(id, {
+        ...(this.dirty.get(id) ?? {}),
+        suspect: true,
+        suspectReason: reason,
+      });
     }
+    return true;
+  }
+
+  /** 0.5.0 step 3: note a successful retrieval-time re-check —
+   *  verifyCount + 1, lastVerifiedAt stamped, confidence
+   *  recomputed by code (capped). In-memory only, like
+   *  markSuspect: the caller persists at flush(). Returns true
+   *  when found. */
+  markVerified(id: string, now: number = Date.now()): boolean {
+    const f = this.get(id);
+    if (!f) return false;
+    const p = f.provenance ?? legacyProvenance(f.sourceIds);
+    // 0.5.0 fix: a legacy row has no real verification history —
+    // injecting it once must not manufacture a "已验证 1 次" count
+    // while sourceType stays "legacy" and confidence stays null.
+    if (p.sourceType === "legacy") return true;
+    const verifyCount = p.verifyCount + 1;
+    f.provenance = {
+      ...p,
+      verifyCount,
+      lastVerifiedAt: now,
+      confidence: confidenceFor(p.sourceType, verifyCount),
+    };
+    // 0.5.1 (§四): record the new provenance so a reload before
+    // flush replays it instead of wiping it.
+    this.dirty.set(id, {
+      ...(this.dirty.get(id) ?? {}),
+      provenance: f.provenance,
+    });
     return true;
   }
 }

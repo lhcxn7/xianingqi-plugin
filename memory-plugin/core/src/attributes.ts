@@ -19,7 +19,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ageDays } from "./dates.ts";
-import { atomicWriteText } from "./atomic.ts";
+import { atomicWriteText, backupCorruptFile } from "./atomic.ts";
+import type { CorruptBackup } from "./atomic.ts";
 import type {
   EmotionTag,
   Importance,
@@ -192,13 +193,22 @@ export function emotionRetain(
 }
 
 /** Default clarity for an entry with no stored row: fresh is 1.0,
- *  old fades by age. Floor 0.05 — details fade, never erase. */
+ *  old fades by age. Floor 0.05 — details fade, never erase.
+ *  0.5.1 (§四): the old fixed rates (heavy 0.01 / light 0.03)
+ *  drifted from the detail half-life (14 + 30*S days) that
+ *  retrievability and decayClarity already use — a fresh heavy
+ *  entry's default faded at 0.01/day while its detail track faded
+ *  at ln2/41 ≈ 0.0169/day. The default clarity now IS the detail
+ *  track's curve, so the fallback and the stored value agree:
+ *  heavy (S=0.9) halves in ~41 days, light (S=0.4) in ~26. */
 export function defaultClarity(
   entry: MemoryEntry,
   now: number,
 ): number {
-  const lambda = entry.importance === "heavy" ? 0.01 : 0.03;
-  return Math.max(0.05, Math.exp(-lambda * ageDays(entry.ts, now)));
+  return Math.max(
+    0.05,
+    Math.exp(-detailLambda(initialSignificance(entry)) * ageDays(entry.ts, now)),
+  );
 }
 
 /** Retrievability R = time decay x recall boost x emotion
@@ -249,6 +259,24 @@ function clampFinite(v: number, lo: number, hi: number): number {
 export class AttributeStore {
   private map = new Map<string, MemoryAttributes>();
   private readonly file: string;
+  // 0.5.1 (0.4.3 item 10): same corrupt-file treatment as
+  // BeliefStore — a failed load backs the bytes up once and marks
+  // the store; save() refuses until the file parses again. The
+  // in-memory map is kept on a failed reload so a cross-process
+  // hiccup does not blank it.
+  private loadFailed = false;
+  private corruptBackup: CorruptBackup | null = null;
+
+  /** True when the file on disk failed to parse and has not been
+   *  repaired since; while true, save() throws instead of writing. */
+  get hasLoadFailed(): boolean {
+    return this.loadFailed;
+  }
+
+  /** Path of the .corrupt-* backup, if one was taken. */
+  get corruptBackupPath(): string | null {
+    return this.corruptBackup?.path ?? null;
+  }
 
   constructor(dataDir: string) {
     this.file = join(dataDir, ATTRIBUTES_FILE);
@@ -263,17 +291,57 @@ export class AttributeStore {
     return this.map.get(id);
   }
 
+  /** Remove attribute rows for `ids` (0.5.1 item 1:
+   *  forget-delete). Returns how many rows were removed. The
+   *  caller saves. */
+  removeEntries(ids: string[]): number {
+    let n = 0;
+    for (const id of ids) {
+      if (this.map.delete(id)) n += 1;
+    }
+    return n;
+  }
+
   all(): Map<string, MemoryAttributes> {
     return this.map;
   }
 
+  /** A load failure never clears the in-memory map and never
+   *  overwrites the file: the corrupt bytes are backed up once and
+   *  the failure is marked, so the next save() refuses loudly
+   *  instead of silently writing an empty store over them. A
+   *  missing file is not a failure — it is a fresh store. */
+  private markCorrupt(why: string): void {
+    const backup = backupCorruptFile(this.file, this.corruptBackup);
+    if (backup) this.corruptBackup = backup;
+    this.loadFailed = true;
+    console.warn(
+      `[memory-plugin] attributes.json 损坏（${why}），` +
+        `已备份到 ${this.corruptBackup?.path ?? "（备份失败）"}，` +
+        "拒绝覆盖原文件——请检查后删除损坏文件或从快照恢复。",
+    );
+  }
+
   private load(): void {
+    if (!existsSync(this.file)) {
+      this.map.clear();
+      this.loadFailed = false;
+      return;
+    }
+    let data: PersistedAttributes;
     try {
-      if (!existsSync(this.file)) return;
-      const data = JSON.parse(
+      data = JSON.parse(
         readFileSync(this.file, "utf8"),
       ) as PersistedAttributes;
-      if (data.version !== 1 || typeof data.entries !== "object") return;
+    } catch {
+      this.markCorrupt("无法解析 JSON");
+      return;
+    }
+    if (data.version !== 1 || typeof data.entries !== "object") {
+      this.markCorrupt("版本号或结构不对");
+      return;
+    }
+    try {
       for (const [id, attrs] of Object.entries(data.entries)) {
         // Hand-edited/corrupt rows are sanitised, not trusted: the
         // three required numbers must be finite (else the row is
@@ -337,6 +405,22 @@ export class AttributeStore {
         if (typeof attrs.needsInvalidationCheck === "boolean") {
           clean.needsInvalidationCheck = attrs.needsInvalidationCheck;
         }
+        // 0.5.0 step 4: feedback counts (memory_feedback).
+        // Non-negative integers only; corrupt values are dropped,
+        // never trusted. Old rows have none.
+        for (const key of [
+          "feedbackCorrect",
+          "feedbackWrong",
+          "feedbackIrrelevant",
+        ] as const) {
+          const v = (attrs as unknown as Record<string, unknown>)[key];
+          if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
+            clean[key] = Math.floor(v);
+          }
+        }
+        if (Number.isFinite(attrs.lastFeedbackAt)) {
+          clean.lastFeedbackAt = attrs.lastFeedbackAt;
+        }
         // 0.4.0 item 6: two clarity tracks. Old rows have neither:
         // detail defaults to the stored clarity (the old single
         // clarity IS the detail track), emotion defaults to 1.0
@@ -361,8 +445,9 @@ export class AttributeStore {
         }
         this.map.set(id, clean);
       }
+      this.loadFailed = false;
     } catch {
-      this.map.clear();
+      this.markCorrupt("行级解析失败");
     }
   }
 
@@ -371,11 +456,16 @@ export class AttributeStore {
    *  bumps not yet flushed are lost on reload — counters only,
    *  the log entries they describe are untouched. */
   reload(): void {
-    this.map.clear();
     this.load();
   }
 
   save(): void {
+    if (this.loadFailed) {
+      throw new Error(
+        `attributes.json 上次加载失败（已损坏，备份在 ${this.corruptBackup?.path ?? "未知"}），` +
+          "拒绝覆盖——请删除损坏文件或从快照恢复后再写。",
+      );
+    }
     const entries: Record<string, MemoryAttributes> = {};
     for (const [id, attrs] of this.map) entries[id] = attrs;
     atomicWriteText(

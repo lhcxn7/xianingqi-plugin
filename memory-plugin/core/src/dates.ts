@@ -34,7 +34,11 @@ export function parseDateHeading(date: string): number | null {
   ).getTime();
 }
 
-/** Whole days between ts and now. */
+/** Days between ts and now — fractional (a half-day-old entry
+ *  decays half a day's worth, which is what the decay math wants;
+ *  the name is historical, the fraction is deliberate). Never
+ *  negative: a future-dated entry is 0 days old, not a negative
+ *  age that would inflate clarity. */
 export function ageDays(ts: number, now: number): number {
   return Math.max(0, (now - ts) / 86_400_000);
 }

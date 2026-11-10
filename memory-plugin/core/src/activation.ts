@@ -62,6 +62,17 @@ export const COMMON_TOKENS = new Set([
   "明天",
   "昨天",
   "那天",
+  // 0.5.1 (0.4.3 item 6): the remaining relative-time words —
+  // they only anchor a sentence in time, so like the day words
+  // they are never a topic, never a strong recall token, and
+  // never an attention token.
+  "上周",
+  "这周",
+  "下周",
+  "去年",
+  "今年",
+  "上次",
+  "这次",
   "这个",
   "那个",
   "什么",

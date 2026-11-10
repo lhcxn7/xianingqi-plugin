@@ -44,11 +44,15 @@
 
 import { randomBytes } from "node:crypto";
 import {
+  appendFileSync,
+  copyFileSync,
   existsSync,
+  readFileSync,
   readdirSync,
+  rmSync,
 } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteText, ensureDir } from "./atomic.ts";
+import { atomicWriteText, cleanTempLeftovers, ensureDir } from "./atomic.ts";
 import { AttributeStore, initialSignificance } from "./attributes.ts";
 import { BeliefStore } from "./beliefs.ts";
 import type {
@@ -58,6 +62,15 @@ import type {
 } from "./beliefs.ts";
 import { formatDate, formatTime, monthKey } from "./dates.ts";
 import { FragmentStore } from "./fragments.ts";
+import {
+  ForgetStore,
+  buildForgetPreview,
+  type ForgetMode,
+  type ForgetPreview,
+  type ForgetRequest,
+} from "./forget.ts";
+import { ExperienceStore } from "./experiences.ts";
+import { GoalStore } from "./goals.ts";
 import type {
   FragmentCreateResult,
   FragmentInput,
@@ -84,10 +97,12 @@ import {
   KeywordIndex,
   fingerprintLogFiles,
   fingerprintsEqual,
+  type FileFingerprint,
 } from "./keyword-index.ts";
 import { MemoryFile } from "./memory-file.ts";
 import { loadProfile, mergeProfile, saveProfile, type PersonaProfile } from "./profile.ts";
-import { DEFAULT_TOKEN_CAP, formatProfileBlock, recallFromEntries } from "./recall.ts";
+import { DEFAULT_TOKEN_CAP, formatProfileBlock, matchTokensFor, recallFromEntries } from "./recall.ts";
+import type { SemanticRetriever } from "./retrieval.ts";
 import {
   REVIEW_INTERVAL_MS,
   loadReviewState,
@@ -114,6 +129,22 @@ import {
   restoreSnapshot,
   takeSnapshot,
 } from "./snapshot.ts";
+import {
+  SEMANTIC_DEFAULT_MAX_CANDIDATES,
+  SEMANTIC_DEFAULT_MIN_SIMILARITY,
+  SEMANTIC_DEFAULT_TIMEOUT_MS,
+  SEMANTIC_DIMENSIONS,
+  SEMANTIC_MODEL_ID,
+  SEMANTIC_MODEL_REVISION,
+  SEMANTIC_POOLING,
+  SEMANTIC_QUERY_PREFIX,
+  SemanticIndex,
+  SemanticSearcher,
+  TransformersEmbeddingProvider,
+  buildSemanticIndex,
+  findBundledModelDir,
+  type SemanticIndexLoadStatus,
+} from "./semantic.ts";
 import {
   STARMAP_FILE,
   buildStarmapData,
@@ -167,6 +198,32 @@ export interface RecordInput {
   /** 0.2.0: model-supplied emotion tag; the lexicon guesses when
    *  absent. */
   emotion?: EmotionTag;
+  /** 0.5.1 item 1: fact identity (see MemoryEntry.factKey). A
+   *  non-empty string of at most 80 chars; absent = unversioned. */
+  factKey?: string;
+  /** 0.5.1 item 1: id of the previous version this entry
+   *  replaces. Must reference an existing entry with the same
+   *  factKey, else record() throws. */
+  supersedes?: string;
+}
+
+/** 0.5.0 step 4: what the user said about a recalled memory. */
+export type FeedbackKind = "correct" | "wrong" | "irrelevant";
+
+export interface FeedbackResult {
+  ok: boolean;
+  entryId: string;
+  kind: FeedbackKind;
+  /** Entry ids invalidated by this feedback (only "wrong"). */
+  invalidated: string[];
+  fragmentId?: string;
+  /** The entry's feedback counts after this call. */
+  feedback: { correct: number; wrong: number; irrelevant: number };
+  /** The entry's significance after this call ("irrelevant"
+   *  halves it, floored at 0.1). */
+  significance?: number;
+  /** Why not ok (unknown entry id). */
+  reason?: string;
 }
 
 export class MemoryCore {
@@ -186,6 +243,28 @@ export class MemoryCore {
   private readonly beliefs: BeliefStore;
   /** 0.4.0 item 7: behaviour loop (proactive actions, loop.json). */
   private readonly loop: LoopStore;
+  /** 0.5.1 item 1: forgetting governance — requests, approvals,
+   *  tombstones (forgotten.json) and the append-only audit. */
+  readonly forget: ForgetStore;
+  /** 0.5.1 item 4: experience learning — rules from mistakes. */
+  readonly experiences: ExperienceStore;
+  /** 0.5.1 item 5: goals / todos. */
+  readonly goals: GoalStore;
+  /** 0.5.1 item 2: local embedding. Lazy: nothing is loaded
+   *  until semantic is enabled and ensureSemanticIndex() runs. */
+  private semanticProvider: TransformersEmbeddingProvider | null = null;
+  private semanticIndex: SemanticIndex | null = null;
+  private semanticIndexStatus: SemanticIndexLoadStatus | null = null;
+  private readonly semanticConfig: {
+    enabled: boolean;
+    modelId: string;
+    modelDir: string;
+    modelRevision: string;
+    runtimeDir: string;
+    timeoutMs: number;
+    maxCandidates: number;
+    minSimilarity: number;
+  };
   /** 0.2.0: entryId -> compressed one-line summary (review). */
   private summaries: Map<string, string>;
   /** 0.2.0: last entry per session, for session-edge linking. */
@@ -205,22 +284,94 @@ export class MemoryCore {
    *  deadlocking on itself. */
   private lockDepth = 0;
   private lockRelease: (() => void) | null = null;
-  /** Fingerprints of the log files as this instance last saw them.
-   *  refreshIfStale() reloads when another writer changed them. */
-  private lastSeenFingerprints: ReturnType<
-    typeof fingerprintLogFiles
-  > | null = null;
+  /** Fingerprints of the log files AND the store files as this
+   *  instance last saw them. refreshIfStale() reloads when another
+   *  writer changed any of them. 0.5.1 (0.4.3 item 11): the old
+   *  fingerprint covered the log only, so a second process that
+   *  changed beliefs/attributes/loop.json without touching the log
+   *  was invisible — this instance's next flush overwrote its
+   *  changes with stale in-memory state. The store files are the
+   *  same size+mtime fingerprint as the log files. */
+  private lastSeenFingerprints: {
+    log: Record<string, FileFingerprint>;
+    stores: Record<string, FileFingerprint>;
+  } | null = null;
+
+  /** The store files whose changes refreshIfStale must notice:
+   *  beliefs, fragments, attributes, graph, loop. Missing files
+   *  are skipped by fingerprintLogFiles (a file appearing later
+   *  still changes the fingerprint). */
+  private storeFiles(): string[] {
+    return [
+      "beliefs.json",
+      "fragments.json",
+      "attributes.json",
+      "graph.json",
+      "loop.json",
+      // 0.5.1 item 1: a second process that files / approves /
+      // executes a forgetting changes these without touching the
+      // log — this instance must notice.
+      "forget-requests.json",
+      "forgotten.json",
+      // 0.5.1 items 4/5: same for experiences and goals.
+      "experiences.json",
+      "goals.json",
+    ].map((f) => join(this.dataDir, f));
+  }
+
+  private snapshotFingerprints(): {
+    log: Record<string, FileFingerprint>;
+    stores: Record<string, FileFingerprint>;
+  } {
+    return {
+      log: fingerprintLogFiles(this.logFiles()),
+      stores: fingerprintLogFiles(this.storeFiles()),
+    };
+  }
 
   constructor(opts: CoreOptions) {
     this.dataDir = opts.dataDir;
     this.logMaxEntries = opts.logMaxEntries ?? 1000;
     this.snapshotKeep = opts.snapshotKeep ?? 30;
+    const dataModelDir = join(
+      opts.dataDir,
+      "models",
+      "bge-small-zh-v1.5",
+    );
+    const explicitModelDir = opts.semanticRecall?.modelDir;
+    const bundledModelDir = findBundledModelDir();
+    this.semanticConfig = {
+      enabled: opts.semanticRecall?.enabled ?? false,
+      modelId: opts.semanticRecall?.modelId ?? SEMANTIC_MODEL_ID,
+      // 0.5.4: no manual copy. Prefer a model the user placed in the
+      // data dir, otherwise use the copy shipped inside the plugin.
+      modelDir:
+        explicitModelDir ??
+        (existsSync(join(dataModelDir, "config.json"))
+          ? dataModelDir
+          : (bundledModelDir ?? dataModelDir)),
+      modelRevision:
+        opts.semanticRecall?.modelRevision ?? SEMANTIC_MODEL_REVISION,
+      runtimeDir: opts.semanticRecall?.runtimeDir ?? opts.dataDir,
+      timeoutMs:
+        opts.semanticRecall?.timeoutMs ?? SEMANTIC_DEFAULT_TIMEOUT_MS,
+      maxCandidates:
+        opts.semanticRecall?.maxCandidates ??
+        SEMANTIC_DEFAULT_MAX_CANDIDATES,
+      minSimilarity:
+        opts.semanticRecall?.minSimilarity ??
+        SEMANTIC_DEFAULT_MIN_SIMILARITY,
+    };
     ensureDir(this.dataDir);
+    // 0.5.1 (0.4.3 §四): clear temp leftovers older than 60 s
+    // from a previous interrupted write (see atomic.ts — only
+    // stale ones, never a live writer's temp file).
+    cleanTempLeftovers(this.dataDir);
     this.memoryFile = new MemoryFile(this.dataDir);
     this.entries = this.loadAllLogEntries();
     this.counter = this.entries.length;
     this.currentLogCount = this.currentLogEntries().length;
-    this.lastSeenFingerprints = fingerprintLogFiles(this.logFiles());
+    this.lastSeenFingerprints = this.snapshotFingerprints();
     for (const e of this.entries) {
       this.lastBySession.set(e.sessionId, e);
     }
@@ -237,9 +388,7 @@ export class MemoryCore {
           () => {
             this.refreshIfStale();
             this.index.save(this.logFiles());
-            this.lastSeenFingerprints = fingerprintLogFiles(
-              this.logFiles(),
-            );
+            this.lastSeenFingerprints = this.snapshotFingerprints();
           },
           2000,
         );
@@ -257,6 +406,9 @@ export class MemoryCore {
     this.fragments = new FragmentStore(this.dataDir);
     this.beliefs = new BeliefStore(this.dataDir);
     this.loop = new LoopStore(this.dataDir);
+    this.forget = new ForgetStore(this.dataDir);
+    this.experiences = new ExperienceStore(this.dataDir);
+    this.goals = new GoalStore(this.dataDir);
     this.summaries = loadSummaries(this.dataDir);
     if (!this.graph.loadedExisting && this.entries.length > 0) {
       try {
@@ -270,6 +422,11 @@ export class MemoryCore {
         );
       }
     }
+    // 0.5.3: a delete is a multi-file operation. If a previous run
+    // wrote the journal but never reached "committed" (crash / power
+    // loss / kill), roll the whole plugin state back to the safety
+    // snapshot taken just before the delete.
+    this.recoverForgetJournal();
     // Audit m13: a directory with no MEMORY.md and no records at all
     // is usually a misconfigured dataDir (a one-letter env-var typo)
     // — warn loudly instead of silently recording into the wrong
@@ -284,6 +441,105 @@ export class MemoryCore {
         `[memory-plugin] 数据目录 ${this.dataDir} 里没有 MEMORY.md，也没有任何已有记忆记录——如果这不是故意新建的测试目录，请检查 dataDir 是否配错了路径（记录会进错文件夹，她的真记忆在别处）。`,
       );
     }
+  }
+
+  /** 0.5.3: drop compressed-summary rows for deleted entries. */
+  private purgeSummaries(ids: string[]): void {
+    const doomed = new Set(ids);
+    if (doomed.size === 0) return;
+    for (const name of readdirSync(this.dataDir)) {
+      if (!/^summary-\d{4}-\d{2}\.jsonl$/.test(name)) continue;
+      const file = join(this.dataDir, name);
+      let raw: string;
+      try {
+        raw = readFileSync(file, "utf8");
+      } catch {
+        continue;
+      }
+      const kept: string[] = [];
+      for (const line of raw.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const row = JSON.parse(line) as { entryId?: unknown };
+          if (typeof row.entryId === "string" && doomed.has(row.entryId)) continue;
+        } catch {
+          // Keep torn/unknown lines; summary is derived, not source of truth.
+        }
+        kept.push(line);
+      }
+      if (kept.length !== raw.split("\n").filter((l) => l.trim()).length) {
+        atomicWriteText(file, kept.join("\n") + (kept.length > 0 ? "\n" : ""));
+      }
+    }
+  }
+
+  /** 0.5.3: finish/rollback an interrupted forget-delete.
+   *  The journal is written before the first mutation and removed
+   *  after the last one. A journal still present at startup means
+   *  the delete may have stopped halfway; the safety snapshot taken
+   *  immediately before it is the only consistent state we can
+   *  prove, so restore it and force a full store reload. */
+  private recoverForgetJournal(): void {
+    const file = join(this.dataDir, "forget-journal.json");
+    if (!existsSync(file)) return;
+    let resolved = false;
+    try {
+      const j = JSON.parse(readFileSync(file, "utf8")) as {
+        snapshot?: unknown;
+        requestId?: unknown;
+        status?: unknown;
+      };
+      if (j.status === "committed") {
+        resolved = true;
+        return;
+      }
+      if (
+        typeof j.snapshot === "string" &&
+        existsSync(join(this.dataDir, ".snapshots", j.snapshot))
+      ) {
+        restoreSnapshot(this.dataDir, j.snapshot);
+        this.lastSeenFingerprints = null;
+        this.refreshIfStale();
+        this.revalidateReferences();
+        resolved = true;
+        console.warn(
+          `[memory-plugin] 检测到未完成的删除（${String(j.requestId ?? "?")}），已从删除前快照 ${j.snapshot} 回滚到一致状态。`,
+        );
+      } else {
+        // Do NOT delete the journal here: without the snapshot we
+        // cannot prove a consistent state, and the operator needs the
+        // evidence to retry or repair by hand.
+        console.warn(
+          `[memory-plugin] 检测到未完成的删除（${String(j.requestId ?? "?")}），但找不到删除前快照，无法自动回滚；journal 保留，请检查日志/派生文件。`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[memory-plugin] forget-journal.json 无法读取：${err instanceof Error ? err.message : String(err)}；journal 保留，请手工检查。`,
+      );
+    } finally {
+      if (resolved) {
+        try {
+          rmSync(file, { force: true });
+        } catch {
+          // The snapshot restore is idempotent; a leftover committed
+          // journal is harmless and is removed next start.
+        }
+      }
+    }
+  }
+
+  /** 0.5.4: after a restore (or a hide/delete), drop source ids that
+   *  no longer name a live persona entry. An Experience with no valid
+   *  source becomes an unconfirmed candidate (never injected). */
+  private revalidateReferences(): void {
+    const live = new Set(
+      this.entries
+        .filter((e) => e.window === "persona" && !this.forget.isForgotten(e.id))
+        .map((e) => e.id),
+    );
+    this.experiences.revalidate(live);
+    this.goals.revalidate(live);
   }
 
   // ---- log files -------------------------------------------------
@@ -345,19 +601,19 @@ export class MemoryCore {
   }
 
   /** Reload log entries + rebuild the in-memory index when another
-   *  writer changed the log files since this instance last looked.
-   *  Must be called holding the write lock. Returns true when a
-   *  reload happened. Without this, a flush after another process's
-   *  records would save an index built from stale in-memory entries
-   *  but fingerprinted against the NEW log files — a fresh core would
-   *  then accept the index as current and never find the other
-   *  process's entries. */
+   *  writer changed the log files OR any store file since this
+   *  instance last looked. Must be called holding the write lock.
+   *  Returns true when a reload happened. Without this, a flush
+   *  after another process's records would save an index built
+   *  from stale in-memory entries but fingerprinted against the
+   *  NEW log files — a fresh core would then accept the index as
+   *  current and never find the other process's entries. */
   private refreshIfStale(): boolean {
-    const files = this.logFiles();
-    const fp = fingerprintLogFiles(files);
+    const fp = this.snapshotFingerprints();
     if (
       this.lastSeenFingerprints &&
-      fingerprintsEqual(this.lastSeenFingerprints, fp)
+      fingerprintsEqual(this.lastSeenFingerprints.log, fp.log) &&
+      fingerprintsEqual(this.lastSeenFingerprints.stores, fp.stores)
     ) {
       return false;
     }
@@ -376,6 +632,9 @@ export class MemoryCore {
     this.fragments.reload();
     this.beliefs.reload();
     this.loop.reload();
+    this.forget.reload();
+    this.experiences.reload();
+    this.goals.reload();
     this.summaries = loadSummaries(this.dataDir);
     this.lastBySession.clear();
     for (const e of this.entries) {
@@ -402,6 +661,24 @@ export class MemoryCore {
     if (input.role !== "user" && input.role !== "assistant") {
       throw new TypeError('record() needs role "user" or "assistant"');
     }
+    // 0.5.1 item 1: factKey is an explicit identity, never
+    // auto-derived — validate the shape here; the supersedes
+    // target must exist and share the factKey (checked under the
+    // lock below, where the entry list is current).
+    if (input.factKey !== undefined) {
+      if (
+        typeof input.factKey !== "string" ||
+        input.factKey.trim().length === 0 ||
+        input.factKey.length > 80
+      ) {
+        throw new TypeError(
+          "record() factKey must be a non-empty string of at most 80 chars",
+        );
+      }
+    }
+    if (input.supersedes !== undefined && typeof input.supersedes !== "string") {
+      throw new TypeError("record() supersedes must be an entry id string");
+    }
     // The write itself (append + in-memory insert + index add +
     // possible rollover) holds the write lock: two processes must
     // never interleave appends or save over each other's index. A
@@ -417,6 +694,22 @@ export class MemoryCore {
       // stays cheap.
       this.refreshIfStale();
       const ts = input.ts ?? Date.now();
+      // 0.5.1 item 1: a supersedes link must point at a real entry
+      // with the same factKey — a dangling or cross-fact link would
+      // silently corrupt the version chain.
+      if (input.supersedes !== undefined) {
+        const target = this.entries.find((e) => e.id === input.supersedes);
+        if (!target) {
+          throw new Error(
+            `record() supersedes ${input.supersedes}: no such entry`,
+          );
+        }
+        if (input.factKey === undefined || target.factKey !== input.factKey) {
+          throw new Error(
+            "record() supersedes target must share the new entry's factKey",
+          );
+        }
+      }
       const entry: MemoryEntry = {
         id: `${ts}-${this.counter++}-${randomBytes(3).toString("hex")}`,
         ts,
@@ -428,6 +721,10 @@ export class MemoryCore {
         importance: input.importance ?? "light",
         text: input.text,
         source: "log",
+        ...(input.factKey !== undefined ? { factKey: input.factKey } : {}),
+        ...(input.supersedes !== undefined
+          ? { supersedes: input.supersedes }
+          : {}),
       };
       new AppendLog(join(this.dataDir, LOG_FILE)).append(entry);
       // Insert in ts order (binary search) instead of re-sorting the
@@ -464,7 +761,7 @@ export class MemoryCore {
       // The append (and any rollover it triggered) kept in-memory
       // and disk in sync — the refresh above established it, the
       // writes preserved it — so the fingerprints are current again.
-      this.lastSeenFingerprints = fingerprintLogFiles(this.logFiles());
+      this.lastSeenFingerprints = this.snapshotFingerprints();
       return entry;
     });
   }
@@ -484,6 +781,15 @@ export class MemoryCore {
       /** 0.2.0: per-session recall-link tracking + attention factor. */
       sessionId?: string;
       recentTexts?: string[];
+      /** 0.5.0 step 5: the query-rewritten form (model rewrite /
+       *  expansion, dsh-plugin side). Its tokens union with the
+       *  original query's for the index lookup, the archive search
+       *  and the match — the original recall is never lost to a
+       *  bad rewrite. Absent = keyword-only, exactly as before. */
+      rewrittenQuery?: string;
+      /** 0.5.0 step 5: optional semantic provider slot (interface
+       *  only; no embedding ships). */
+      semantic?: SemanticRetriever;
     } = {},
   ): RecallResult {
     // A non-string query (a bad tool call) returns empty, never
@@ -499,7 +805,13 @@ export class MemoryCore {
         text: "",
       };
     }
-    const tokens = tokenize(query);
+    // 0.5.0 step 5: the match tokens are the union of the original
+    // query and the rewritten query (matchTokensFor applies the
+    // single-char noise filter to the union) — the index lookup and
+    // the archive search use the same set recallFromEntries matches
+    // with, so a rewrite can surface entries the original words
+    // never would.
+    const tokens = matchTokensFor(query, opts.rewrittenQuery);
     const archiveHits =
       tokens.length > 0 ? this.memoryFile.searchArchives(tokens) : [];
     // Load layer 1 + layer 2 together: recall needs layer 1 for
@@ -534,7 +846,13 @@ export class MemoryCore {
     // compact belief line at the end (no token-cap budget, no line
     // when there are no beliefs).
     const result = recallFromEntries(
-      [...this.entries, ...archiveHits],
+      // 0.5.1 item 1: hidden (tombstoned) entries never enter
+      // recall — the log text stays on disk, but no query, search
+      // or review ever surfaces them again. Archive hits are
+      // exempt: forgetting covers the live log, not the skill's
+      // monthly archives (an admin delete of an archive row is a
+      // separate, manual step).
+      [...this.entries.filter((e) => !this.forget.isForgotten(e.id)), ...archiveHits.filter((e) => !this.forget.isForgotten(e.id))],
       layer1,
       query,
       {
@@ -546,6 +864,7 @@ export class MemoryCore {
         summaries: this.summaries,
         fragments: this.fragments,
         beliefs: this.beliefs,
+        experiences: this.experiences,
       },
     );
     // 0.2.0: the next record in this session links back to the
@@ -611,6 +930,537 @@ export class MemoryCore {
     return false;
   }
 
+  // ---- forgetting (0.5.1 item 1) ----------------------------------
+  //
+  // Request -> approve -> execute. The model-facing tool only ever
+  // calls requestForget / dryRunForget / listForgetRequests: the
+  // approve and execute calls live on the admin CLI and the local
+  // admin API, and approve() itself refuses any channel that is
+  // not "cli" or "admin" — a chat "我同意" can never authorise a
+  // forgetting, because there is no path from a chat line to an
+  // approval record.
+
+  /** 0.5.2: rebuild the in-memory session chain after hide/delete.
+   *  A tombstoned/deleted entry must not remain the "previous turn"
+   *  for the next record (it would create a dangling graph edge). */
+  private rebuildSessionLinks(): void {
+    this.lastBySession.clear();
+    for (const e of this.entries) {
+      if (e.window === "persona" && !this.forget.isForgotten(e.id)) {
+        this.lastBySession.set(e.sessionId, e);
+      }
+    }
+    for (const [sid, ids] of [...this.pendingRecallLinks]) {
+      const kept = ids.filter((id) => !this.forget.isForgotten(id));
+      if (kept.length > 0) this.pendingRecallLinks.set(sid, kept);
+      else this.pendingRecallLinks.delete(sid);
+    }
+  }
+
+  /** File a forget request. Changes nothing. */
+  requestForget(input: {
+    mode: ForgetMode;
+    entryIds: string[];
+    reason?: string;
+    createdBy: "model" | "cli" | "admin";
+  }): ForgetRequest {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      return this.forget.request(input);
+    });
+  }
+
+  listForgetRequests(): ForgetRequest[] {
+    this.forget.refreshExpiry();
+    return this.forget.all();
+  }
+
+  /** Dry-run preview: what a forget of these ids would touch.
+   *  Changes nothing. */
+  dryRunForget(ids: string[]): ForgetPreview {
+    const byId = new Map(this.entries.map((e) => [e.id, e]));
+    const preview = buildForgetPreview(ids, {
+      entriesById: (id) => byId.get(id),
+      fragmentsFor: (list) => this.fragments.idsLosingAllSources(list),
+      beliefsFor: (list) => this.beliefs.idsLosingAllEvidence(list),
+      graphEdgeCount: (list) => this.graph.edgeCountFor(list),
+      semanticVectorCount: (list) => this.semanticVectorCount(list),
+    });
+    // 0.5.3: disclose skill-owned copies; do not pretend the plugin
+    // can erase files it does not own.
+    preview.skillCopies = this.skillCopiesFor(ids);
+    return preview;
+  }
+
+  /** Files under MEMORY.md / MEMORY-YYYY-MM.md that contain an exact
+   *  copy of one of these entries. Read-only. */
+  private skillCopiesFor(ids: string[]): string[] {
+    const texts = ids
+      .map((id) => this.entries.find((e) => e.id === id)?.text)
+      .filter((t): t is string => typeof t === "string" && t.length > 0);
+    if (texts.length === 0) return [];
+    return readdirSync(this.dataDir)
+      .filter((f) => f === "MEMORY.md" || /^MEMORY-\d{4}-\d{2}\.md$/.test(f))
+      .filter((f) => {
+        try {
+          const text = readFileSync(join(this.dataDir, f), "utf8");
+          return texts.some((t) => text.includes(t));
+        } catch {
+          return false;
+        }
+      });
+  }
+
+  /** Opt-in purge of skill-owned copies (exact text lines only).
+   *  Backs up the file before rewriting it. Never called by default. */
+  private purgeSkillCopies(texts: string[]): void {
+    if (texts.length === 0) return;
+    for (const f of readdirSync(this.dataDir)) {
+      if (f !== "MEMORY.md" && !/^MEMORY-\d{4}-\d{2}\.md$/.test(f)) continue;
+      const file = join(this.dataDir, f);
+      let before: string;
+      try {
+        before = readFileSync(file, "utf8");
+      } catch {
+        continue;
+      }
+      const kept = before
+        .split("\n")
+        .filter((line) => !texts.some((t) => line.includes(t)))
+        .join("\n");
+      if (kept === before) continue;
+      copyFileSync(file, `${file}.bak-purge-${Date.now()}`);
+      atomicWriteText(file, kept);
+    }
+  }
+
+  /** Approve a pending request (CLI / local admin API only). */
+  approveForget(
+    id: string,
+    input: { channel: "cli" | "admin"; by: string },
+  ): ForgetRequest {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      return this.forget.approve(id, input);
+    });
+  }
+
+  /** Execute an approved request. Hide tombstones the ids;
+   *  delete physically removes them (snapshot first). Refuses
+   *  unless the request is approved, unexpired, and approved on
+   *  a non-model channel. */
+  executeForget(
+    id: string,
+    input: { by: string; purgeSkillFiles?: boolean },
+  ): { request: ForgetRequest; removed: string[]; hidden: string[] } {
+    const req = this.forget.get(id);
+    if (!req) throw new Error(`no forget request ${id}`);
+    if (req.status !== "approved") {
+      throw new Error(
+        `forget request ${id} is ${req.status} — only an approved request can execute (approve it from the admin CLI first)`,
+      );
+    }
+    if (
+      req.approvedChannel !== "cli" &&
+      req.approvedChannel !== "admin"
+    ) {
+      throw new Error(
+        `forget request ${id} has no non-model approval — a chat agreement can never authorise forgetting`,
+      );
+    }
+    if (this.forget.isExpired(req)) {
+      throw new Error(`forget request ${id} has expired (7-day TTL)`);
+    }
+    // The audit must be writable BEFORE anything is mutated: a
+    // forgetting with no audit trail is worse than no forgetting.
+    // (The per-step audit lines inside markExecuted are
+    // best-effort; this checked write is the gate.)
+    try {
+      appendFileSync(
+        join(this.dataDir, "forget-audit.jsonl"),
+        JSON.stringify({
+          ts: Date.now(),
+          event: "forget.executing",
+          requestId: id,
+          mode: req.mode,
+          entryIds: req.entryIds,
+          by: input.by,
+        }) + "\n",
+        { encoding: "utf8", mode: 0o600 },
+      );
+    } catch (err) {
+      throw new Error(
+        `forget audit is not writable, refusing to execute: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const byId = new Map(this.entries.map((e) => [e.id, e]));
+    const existing = req.entryIds.filter((eid) => byId.has(eid));
+    if (req.mode === "hide") {
+      return this.withWriteLock(() => {
+        this.refreshIfStale();
+        this.forget.tombstone(existing, "hide", id);
+        this.rebuildSessionLinks();
+        this.revalidateReferences();
+        const done = this.forget.markExecuted(id, input.by);
+        this.lastSeenFingerprints = this.snapshotFingerprints();
+        return { request: done, removed: [], hidden: existing };
+      });
+    }
+    // delete: snapshot first (recoverable), then rewrite the log
+    // without the ids and strip every derived store.
+    const snapshotName = this.snapshot();
+    // 0.5.3: write the delete journal before the first mutation. If
+    // the process dies anywhere below, the next Core constructor
+    // sees this file and restores snapshotName.
+    const journalFile = join(this.dataDir, "forget-journal.json");
+    atomicWriteText(
+      journalFile,
+      JSON.stringify(
+        {
+          requestId: id,
+          snapshot: snapshotName,
+          ids: existing,
+          status: "committing",
+        },
+        null,
+        2,
+      ),
+    );
+    const removed = this.withWriteLock(() => {
+      this.refreshIfStale();
+      const doomed = new Set(existing);
+      for (const file of this.logFiles()) {
+        const kept = new AppendLog(file)
+          .readAll()
+          .filter((e) => !doomed.has(e.id));
+        new AppendLog(file).rewrite(kept);
+      }
+      this.entries = this.entries.filter((e) => !doomed.has(e.id));
+      this.counter = this.entries.length;
+      this.currentLogCount = this.currentLogEntries().length;
+      this.index.build(this.entries);
+      this.index.save(this.logFiles());
+      this.graph.removeEntries(existing);
+      this.graph.save();
+      this.attrs.removeEntries(existing);
+      this.attrs.save();
+      this.fragments.removeEntries(existing);
+      this.fragments.save();
+      this.beliefs.removeEntries(existing);
+      this.beliefs.save();
+      // 0.5.3 (P1-13): compressed summary rows are keyed by entryId;
+      // a deleted entry must not survive in summary-YYYY-MM.jsonl.
+      this.purgeSummaries(existing);
+      this.semanticRemoveIds(existing);
+      // A deleted entry is gone, not hidden — drop its tombstone
+      // if an earlier hide put one there.
+      this.forget.untombstone(existing);
+      this.rebuildSessionLinks();
+      this.revalidateReferences();
+      this.lastSeenFingerprints = this.snapshotFingerprints();
+      return existing;
+    });
+    const done = this.forget.markExecuted(id, input.by);
+    this.forget.auditRaw("forget.deleted.snapshot", {
+      requestId: id,
+      snapshot: snapshotName,
+      entryIds: removed,
+    });
+    // 0.5.3 (opt-in): the plugin cannot own MEMORY.md, so erasing
+    // skill copies is explicit. Each touched file is backed up first.
+    if (input.purgeSkillFiles) {
+      const texts = existing
+        .map((eid) => byId.get(eid)?.text)
+        .filter((t): t is string => typeof t === "string" && t.length > 0);
+      this.purgeSkillCopies(texts);
+    }
+    // The operation is committed: mark the journal so a restart
+    // never rolls a successful delete back, then remove it.
+    try {
+      atomicWriteText(
+        journalFile,
+        JSON.stringify(
+          { requestId: id, snapshot: snapshotName, ids: removed, status: "committed" },
+          null,
+          2,
+        ),
+      );
+      rmSync(journalFile, { force: true });
+    } catch {
+      // A committed journal is a no-op for recovery; leaving it is
+      // safe (it is removed on the next successful startup).
+    }
+    return { request: done, removed, hidden: [] };
+  }
+
+  /** Reverse a hide (admin/CLI only). Deleted entries cannot be
+   *  unhidden — restore the pre-delete snapshot instead. */
+  unforget(ids: string[]): string[] {
+    return this.forget.untombstone(ids);
+  }
+
+  // ---- admin edit (0.5.1 item 3) -----------------------------------
+  //
+  // Direct mutation of a log entry — admin channel only (CLI /
+  // local API), never a model tool. The words change; the learned
+  // significance does NOT (the review re-promotes if the new
+  // importance deserves it). The graph is re-linked for the entry
+  // (its keyword edges follow the new text) and the audit records
+  // the before/after. The semantic vector is refreshed by
+  // semanticUpsertEntry (async, called by the admin layer).
+
+  editEntry(
+    id: string,
+    patch: { text?: string; importance?: Importance },
+    by = "cli",
+  ): MemoryEntry {
+    if (patch.text !== undefined && patch.text.trim().length === 0) {
+      throw new TypeError("editEntry text must be a non-empty string");
+    }
+    if (
+      patch.importance !== undefined &&
+      patch.importance !== "heavy" &&
+      patch.importance !== "light"
+    ) {
+      throw new TypeError('editEntry importance must be "heavy" or "light"');
+    }
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const entry = this.entries.find((e) => e.id === id);
+      if (!entry) throw new Error(`no entry ${id}`);
+      const before = { text: entry.text, importance: entry.importance };
+      if (patch.text !== undefined) entry.text = patch.text;
+      if (patch.importance !== undefined) entry.importance = patch.importance;
+      for (const file of this.logFiles()) {
+        const rows = new AppendLog(file).readAll();
+        if (!rows.some((e) => e.id === id)) continue;
+        new AppendLog(file).rewrite(
+          rows.map((e) => (e.id === id ? entry : e)),
+        );
+      }
+      this.index.build(this.entries);
+      this.index.save(this.logFiles());
+      this.graph.removeEntries([id]);
+      const prev = this.lastBySession.get(entry.sessionId) ?? null;
+      this.graph.linkNewEntry(entry, this.index, prev, Date.now());
+      this.graph.save();
+      this.lastSeenFingerprints = this.snapshotFingerprints();
+      try {
+        appendFileSync(
+          join(this.dataDir, "admin-audit.jsonl"),
+          JSON.stringify({
+            ts: Date.now(),
+            event: "admin.edit",
+            id,
+            by,
+            before,
+            after: { text: entry.text, importance: entry.importance },
+          }) + "\n",
+          { encoding: "utf8", mode: 0o600 },
+        );
+      } catch {
+        // Audit is best-effort here — the edit itself already
+        // landed; a failed audit line is warned, not fatal.
+        console.warn(`[memory-plugin] admin audit 写失败（本次编辑未记审计）。`);
+      }
+      return { ...entry };
+    });
+  }
+
+  /** Re-embed one entry into the semantic index (async, admin /
+   *  plugin layer only). Returns false when semantic is disabled
+   *  or unavailable — the index is rebuilt later, never blocking
+   *  the edit. */
+  async semanticUpsertEntry(entry: MemoryEntry): Promise<boolean> {
+    if (!this.semanticEnabled()) return false;
+    try {
+      await this.ensureSemanticIndex();
+      if (!this.semanticProvider || !this.semanticIndex) return false;
+      const [v] = await this.semanticProvider.embed([entry.text]);
+      this.semanticIndex.upsert(entry.id, v);
+      this.semanticIndex.save();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // ---- local embedding (0.5.1 item 2) ------------------------------
+  //
+  // Disabled by default: nothing below runs unless
+  // semanticRecall.enabled is true. The provider is loaded lazily
+  // (first ensureSemanticIndex), the index is derived from the log
+  // and rebuilt whenever its identity stops matching.
+
+  semanticEnabled(): boolean {
+    return this.semanticConfig.enabled === true;
+  }
+
+  semanticModelDir(): string {
+    return this.semanticConfig.modelDir;
+  }
+
+  semanticStatus(): {
+    enabled: boolean;
+    modelId: string;
+    modelRevision: string;
+    dimensions: number;
+    modelPresent: boolean;
+    indexStatus: SemanticIndexLoadStatus | null;
+    indexSize: number;
+  } {
+    return {
+      enabled: this.semanticEnabled(),
+      modelId: this.semanticConfig.modelId,
+      modelRevision: this.semanticConfig.modelRevision,
+      dimensions: SEMANTIC_DIMENSIONS,
+      modelPresent: existsSync(join(this.semanticConfig.modelDir, "config.json")),
+      indexStatus: this.semanticIndexStatus,
+      indexSize: this.semanticIndex?.size ?? 0,
+    };
+  }
+
+  /** Load the provider + index, rebuilding the index from the log
+   *  when it is missing, discarded, or `rebuild` is set. Throws
+   *  when the model cannot load — the caller (plugin apply, admin
+   *  CLI) reports it and stays keyword-only; recall never calls
+   *  this. */
+  async ensureSemanticIndex(opts: { rebuild?: boolean } = {}): Promise<{
+    status: SemanticIndexLoadStatus;
+    built: number;
+  }> {
+    if (!this.semanticProvider) {
+      this.semanticProvider = new TransformersEmbeddingProvider({
+        modelDir: this.semanticConfig.modelDir,
+        modelId: this.semanticConfig.modelId,
+        modelRevision: this.semanticConfig.modelRevision,
+        runtimeDir: this.semanticConfig.runtimeDir,
+      });
+    }
+    if (!this.semanticIndex) {
+      this.semanticIndex = new SemanticIndex({
+        dataDir: this.dataDir,
+        modelId: this.semanticConfig.modelId,
+        modelRevision: this.semanticConfig.modelRevision,
+        dimensions: SEMANTIC_DIMENSIONS,
+        pooling: SEMANTIC_POOLING,
+        queryPrefix: SEMANTIC_QUERY_PREFIX,
+      });
+    }
+    // 0.5.2: a loaded index is cached for the process lifetime. The
+    // old path re-read and JSON.parse-ed the whole vector file on
+    // every recorded message (O(N) per append, O(N²) overall).
+    if (!opts.rebuild && this.semanticIndexStatus === "loaded") {
+      return { status: "loaded", built: 0 };
+    }
+    const status = this.semanticIndex.load();
+    this.semanticIndexStatus = status;
+    if (opts.rebuild || status === "discarded-mismatch" || status === "discarded-corrupt" || status === "empty") {
+      const live = this.entries.filter((e) => !this.forget.isForgotten(e.id));
+      const built = await buildSemanticIndex(
+        this.semanticProvider,
+        this.semanticIndex,
+        live,
+      );
+      this.semanticIndex.save();
+      this.semanticIndexStatus = "loaded";
+      return { status, built };
+    }
+    return { status, built: 0 };
+  }
+
+  /** Semantic search with similarities (best-first). Same
+   *  timeout/fallback rules as semanticCandidateIds, but returns
+   *  the raw hits — used by the benchmark (to report the score
+   *  spread) and the admin centre (semantic status/debug). Never
+   *  throws; [] when disabled, unbuilt, timed out or failed. */
+  async semanticSearch(
+    query: string,
+    candidates: MemoryEntry[],
+    limit?: number,
+  ): Promise<Array<{ id: string; similarity: number }>> {
+    if (!this.semanticEnabled() || !this.semanticProvider || !this.semanticIndex) {
+      return [];
+    }
+    const searcher = new SemanticSearcher(
+      this.semanticProvider,
+      this.semanticIndex,
+    );
+    try {
+      const run = searcher.search(
+        query,
+        candidates,
+        limit ?? this.semanticConfig.maxCandidates,
+      );
+      const hits = await Promise.race([
+        run,
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), this.semanticConfig.timeoutMs),
+        ),
+      ]);
+      if (hits === null) return [];
+      return hits.map((h) => ({ id: h.entry.id, similarity: h.similarity }));
+    } catch {
+      return [];
+    }
+  }
+
+  /** Semantic candidate ids for a query (best-first). Returns []
+   *  when semantic is disabled, the index was never ensured, the
+   *  model is missing, the search times out, or inference throws
+   *  — keyword-only fallback, never an exception. Only hits at or
+   *  above the configured similarity floor come back (see
+   *  SEMANTIC_DEFAULT_MIN_SIMILARITY). */
+  async semanticCandidateIds(
+    query: string,
+    candidates: MemoryEntry[],
+  ): Promise<string[]> {
+    const hits = await this.semanticSearch(query, candidates);
+    return hits
+      .filter((h) => h.similarity >= this.semanticConfig.minSimilarity)
+      .map((h) => h.id);
+  }
+
+  /** Configured similarity floor for semantic candidates. */
+  semanticMinSimilarity(): number {
+    return this.semanticConfig.minSimilarity;
+  }
+
+  /** How many of `ids` hold a vector in the index (dry-run
+   *  preview for a forget; 0 when the index was never built). */
+  semanticVectorCount(ids: string[]): number {
+    if (!this.semanticIndex) return 0;
+    let n = 0;
+    for (const id of ids) {
+      if (this.semanticIndex.has(id)) n += 1;
+    }
+    return n;
+  }
+
+  /** Drop vectors for `ids` and persist (forget-delete path;
+   *  the caller holds the write lock). */
+  semanticRemoveIds(ids: string[]): number {
+    // 0.5.2: deletion must reach the disk index even when the lazy
+    // index object has not been loaded yet. Load it from disk (no
+    // model needed for a removal), delete, and save.
+    if (!this.semanticIndex) {
+      const idx = new SemanticIndex({
+        dataDir: this.dataDir,
+        modelId: this.semanticConfig.modelId,
+        modelRevision: this.semanticConfig.modelRevision,
+        dimensions: SEMANTIC_DIMENSIONS,
+        pooling: SEMANTIC_POOLING,
+        queryPrefix: SEMANTIC_QUERY_PREFIX,
+      });
+      if (idx.load() !== "loaded") return 0;
+      this.semanticIndex = idx;
+      this.semanticIndexStatus = "loaded";
+    }
+    const n = this.semanticIndex.removeIds(ids);
+    if (n > 0) this.semanticIndex.save();
+    return n;
+  }
+
   // ---- daily model review (0.3.0, new layer 2) --------------------
   //
   // yesterdayEntries(): every persona-window log entry from
@@ -618,9 +1468,19 @@ export class MemoryCore {
   // them — no token limit on reading. Task-window entries are not
   // her memories and are left out.
   yesterdayEntries(now = Date.now()): MemoryEntry[] {
-    const yesterday = formatDate(now - 86_400_000);
+    // 0.5.1 (0.4.3 §四): calendar yesterday, not now minus 24 h —
+    // the old subtraction crossed the wrong date on the day after
+    // a daylight-saving change (a 25-hour day puts now-24h on the
+    // day before yesterday) and on any late-night run it was
+    // only right by luck. setDate handles month/year boundaries.
+    const d = new Date(now);
+    d.setDate(d.getDate() - 1);
+    const yesterday = formatDate(d.getTime());
     return this.entries.filter(
-      (e) => e.window === "persona" && e.date === yesterday,
+      (e) =>
+        e.window === "persona" &&
+        e.date === yesterday &&
+        !this.forget.isForgotten(e.id),
     );
   }
 
@@ -637,16 +1497,28 @@ export class MemoryCore {
   /** Entries by id (for the shell: resolve the review's
    *  invalidation-check ids to their text for the daily-review
    *  prompt — the model needs the words, not just ids). Unknown
-   *  ids are skipped, never created. Read-only. */
+   *  ids are skipped, never created. Read-only, but it takes the
+   *  write lock briefly (0.5.1 §四): refreshIfStale must run
+   *  under the lock — the old code called it outside the lock,
+   *  contradicting the "must be called holding the write lock"
+   *  contract. The lock is uncontended in the normal case (one
+   *  mkdir), and the method is re-entrant, so a caller already
+   *  holding it pays nothing. */
   entriesByIds(ids: string[]): MemoryEntry[] {
-    this.refreshIfStale();
-    const byId = new Map(this.entries.map((e) => [e.id, e]));
-    const out: MemoryEntry[] = [];
-    for (const id of ids) {
-      const entry = byId.get(id);
-      if (entry) out.push(entry);
-    }
-    return out;
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const byId = new Map(this.entries.map((e) => [e.id, e]));
+      const out: MemoryEntry[] = [];
+      for (const id of ids) {
+        // 0.5.1 item 1: a hidden entry never resolves here either
+        // — the daily-review prompt must not be handed text the
+        // user asked to forget.
+        if (this.forget.isForgotten(id)) continue;
+        const entry = byId.get(id);
+        if (entry) out.push(entry);
+      }
+      return out;
+    });
   }
 
   /** Apply the model review's picks: every id that names a real log
@@ -720,6 +1592,97 @@ export class MemoryCore {
     });
   }
 
+  // ---- feedback (0.5.0 step 4, memory_feedback) ----------------
+  //
+  // The user (through the model) says a recalled memory was right,
+  // wrong or irrelevant — and the memory actually changes, not
+  // just its score:
+  // - correct: a verification — feedbackCorrect + 1; a named
+  //   fragment's provenance verifyCount + 1 (its confidence is
+  //   recomputed by code).
+  // - wrong: the entry is invalidated (validTo = now, same path as
+  //   memory_invalidate — recall skips it from now on, the log
+  //   text stays); a named fragment is marked suspect.
+  // - irrelevant: feedbackIrrelevant + 1 and the significance
+  //   halves (floored at 0.1) — recall ranking halves per
+  //   irrelevant count (see recallFromEntries), so the same
+  //   question re-asked surfaces it lower or not at all.
+  // An unknown entry id (or fragment id) is reported, never
+  // created. Runs under the write lock and persists.
+  applyFeedback(input: {
+    entryId: string;
+    kind: FeedbackKind;
+    fragmentId?: string;
+    reason?: string;
+    now?: number;
+  }): FeedbackResult {
+    const now = input.now ?? Date.now();
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const entry = this.entries.find((e) => e.id === input.entryId);
+      if (!entry) {
+        return {
+          ok: false,
+          entryId: input.entryId,
+          kind: input.kind,
+          invalidated: [],
+          fragmentId: input.fragmentId,
+          feedback: { correct: 0, wrong: 0, irrelevant: 0 },
+          reason: "记忆条目不存在。",
+        };
+      }
+      const attrs = this.attrs.ensure(entry, undefined, now);
+      let fragmentTouched = false;
+      let invalidated: string[] = [];
+      if (input.kind === "correct") {
+        attrs.feedbackCorrect = (attrs.feedbackCorrect ?? 0) + 1;
+        attrs.lastFeedbackAt = now;
+        if (input.fragmentId && this.fragments.get(input.fragmentId)) {
+          this.fragments.markVerified(input.fragmentId, now);
+          fragmentTouched = true;
+        }
+      } else if (input.kind === "wrong") {
+        attrs.feedbackWrong = (attrs.feedbackWrong ?? 0) + 1;
+        attrs.lastFeedbackAt = now;
+        // Same path as memory_invalidate (re-entrant under the
+        // lock): validTo is stamped, graph edges die, both files
+        // persist. The log text is never touched.
+        invalidated = this.invalidateEntries([input.entryId], now).invalidated;
+        if (input.fragmentId && this.fragments.get(input.fragmentId)) {
+          this.fragments.markSuspect(
+            input.fragmentId,
+            input.reason ?? "用户反馈：错误",
+          );
+          fragmentTouched = true;
+        }
+      } else {
+        attrs.feedbackIrrelevant = (attrs.feedbackIrrelevant ?? 0) + 1;
+        attrs.lastFeedbackAt = now;
+        // 0.5.0 fix: only the first two "irrelevant" feedbacks halve
+        // significance; the third and later stay put. This matches
+        // the recall ranking factor (Math.pow(0.5, min(n, 2))).
+        if (attrs.feedbackIrrelevant <= 2) {
+          attrs.significance = Math.max(0.1, attrs.significance * 0.5);
+        }
+      }
+      this.attrs.save();
+      if (fragmentTouched) this.fragments.save();
+      return {
+        ok: true,
+        entryId: input.entryId,
+        kind: input.kind,
+        invalidated,
+        fragmentId: input.fragmentId,
+        feedback: {
+          correct: attrs.feedbackCorrect ?? 0,
+          wrong: attrs.feedbackWrong ?? 0,
+          irrelevant: attrs.feedbackIrrelevant ?? 0,
+        },
+        significance: attrs.significance,
+      };
+    });
+  }
+
   // ---- fragments (0.3.0) ---------------------------------------
   //
   // Create a fragment on top of the verbatim log. The model writes
@@ -731,7 +1694,11 @@ export class MemoryCore {
   createFragment(input: FragmentInput): FragmentCreateResult {
     return this.withWriteLock(() => {
       this.refreshIfStale();
-      const entriesById = new Map(this.entries.map((e) => [e.id, e]));
+      const entriesById = new Map(
+        this.entries
+          .filter((e) => !this.forget.isForgotten(e.id))
+          .map((e) => [e.id, e]),
+      );
       return this.fragments.create(input, entriesById);
     });
   }
@@ -756,13 +1723,19 @@ export class MemoryCore {
   createBelief(input: BeliefCreateInput): BeliefCreateResult {
     return this.withWriteLock(() => {
       this.refreshIfStale();
-      const entriesById = new Map(this.entries.map((e) => [e.id, e]));
+      const entriesById = new Map(
+        this.entries
+          .filter((e) => !this.forget.isForgotten(e.id))
+          .map((e) => [e.id, e]),
+      );
       // 0.4.1 (A) core-layer persona-source check: the evidence for a
       // belief must come from a persona-window memory. The tool layer
       // being persona-gated does not stop a task entry id being passed
       // in, so the core checks the source entry itself — a missing or
       // non-persona source throws source_entry_not_found (A's error
       // name), before the store's verbatim-quote / ≥2-char rules run.
+      // 0.5.2: a hidden (tombstoned) source is equally invalid — a
+      // belief must not keep a forgotten memory alive.
       const source = entriesById.get(input.entryId ?? "");
       if (!source || source.window !== "persona") {
         throw new Error("source_entry_not_found");
@@ -783,7 +1756,10 @@ export class MemoryCore {
       // 0.4.1 (A): same persona-source check as createBelief — a
       // task-window entry must not move a belief, even verbatim.
       const source = this.entries.find(
-        (entry) => entry.id === entryId && entry.window === "persona",
+        (entry) =>
+          entry.id === entryId &&
+          entry.window === "persona" &&
+          !this.forget.isForgotten(entry.id),
       );
       if (!source) throw new Error("source_entry_not_found");
       return this.beliefs.support(beliefId, entryId, quote, delta, entriesById);
@@ -802,7 +1778,10 @@ export class MemoryCore {
       // 0.4.1 (A): same persona-source check as createBelief — a
       // task-window entry must not deduct from a belief, even verbatim.
       const source = this.entries.find(
-        (entry) => entry.id === entryId && entry.window === "persona",
+        (entry) =>
+          entry.id === entryId &&
+          entry.window === "persona" &&
+          !this.forget.isForgotten(entry.id),
       );
       if (!source) throw new Error("source_entry_not_found");
       return this.beliefs.contradict(beliefId, entryId, quote, delta, entriesById);
@@ -812,6 +1791,95 @@ export class MemoryCore {
   /** All stored beliefs (for memory_belief get / review / tests). */
   listBeliefs(): Belief[] {
     return this.beliefs.all();
+  }
+
+  // ---- goals / experiences (0.5.4) -------------------------------
+  //
+  // Single write path: every mutation runs under the Core write lock,
+  // reloads a stale view first, and validates that sourceIds name
+  // live persona entries. Tools / CLI / admin API call these methods;
+  // they must not call GoalStore / ExperienceStore.save() directly.
+
+  private assertLivePersonaSources(ids: string[] | undefined): void {
+    if (!ids || ids.length === 0) return;
+    const found = this.entriesByIds(ids);
+    if (found.length !== ids.length) {
+      throw new Error("source_entry_not_found");
+    }
+    if (found.some((e) => e.window !== "persona")) {
+      throw new Error("source_entry_not_found");
+    }
+  }
+
+  createGoal(
+    input: Parameters<GoalStore["create"]>[0],
+  ): ReturnType<GoalStore["create"]> {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      this.assertLivePersonaSources(input.sourceIds);
+      return this.goals.create(input);
+    });
+  }
+
+  updateGoal(
+    id: string,
+    patch: Parameters<GoalStore["update"]>[1],
+  ): ReturnType<GoalStore["update"]> {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      if (patch.sourceIds !== undefined) {
+        this.assertLivePersonaSources(patch.sourceIds);
+      }
+      return this.goals.update(id, patch);
+    });
+  }
+
+  setGoalStatus(
+    id: string,
+    status: Parameters<GoalStore["setStatus"]>[1],
+  ): ReturnType<GoalStore["setStatus"]> {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      return this.goals.setStatus(id, status);
+    });
+  }
+
+  removeGoal(id: string): boolean {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      return this.goals.remove(id);
+    });
+  }
+
+  recordExperience(
+    input: Parameters<ExperienceStore["record"]>[0],
+  ): ReturnType<ExperienceStore["record"]> {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      this.assertLivePersonaSources(input.sourceIds);
+      return this.experiences.record(input);
+    });
+  }
+
+  confirmExperience(id: string, by = "cli", expiresAt?: number): boolean {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      return this.experiences.confirm(id, by, Date.now(), expiresAt);
+    });
+  }
+
+  revokeExperience(id: string, by = "cli"): boolean {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      return this.experiences.revoke(id, by);
+    });
+  }
+
+  removeExperience(id: string): boolean {
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      return this.experiences.remove(id);
+    });
   }
 
   // ---- reflection (0.4.0 item 3, Generative Agents 反思触发器) ----
@@ -862,7 +1930,7 @@ export class MemoryCore {
       }
     }
     const gate = reflectionGate(
-      this.entries,
+      this.entries.filter((e) => !this.forget.isForgotten(e.id)),
       (e) => this.attrs.ensure(e, undefined, now).significance,
       now,
       reflectedIds,
@@ -912,7 +1980,11 @@ export class MemoryCore {
   ): ReflectionSaveResult {
     return this.withWriteLock(() => {
       this.refreshIfStale();
-      const entriesById = new Map(this.entries.map((e) => [e.id, e]));
+      const entriesById = new Map(
+        this.entries
+          .filter((e) => !this.forget.isForgotten(e.id))
+          .map((e) => [e.id, e]),
+      );
       const res = saveReflection(text, sourceIds, entriesById, this.fragments);
       // 0.4.3: a successful save consumes the gate snapshot (one
       // gate, one reflection); a failed save keeps it, so the
@@ -988,6 +2060,7 @@ export class MemoryCore {
     return this.entries.filter(
       (e) =>
         e.window === "persona" &&
+        !this.forget.isForgotten(e.id) &&
         now - e.ts >= 0 &&
         now - e.ts <= 24 * 60 * 60 * 1000,
     );
@@ -1012,10 +2085,18 @@ export class MemoryCore {
    *  is built on an empty day). Read-only. */
   proactPrompt(now: number = Date.now()): string | undefined {
     const memories = this.proactMemories(now);
-    const beliefs = this.beliefs.all();
+    // 0.5.2: hidden memories must not ride back in through a belief
+    // or a reflection whose sources are tombstoned.
+    const beliefs = this.beliefs
+      .all()
+      .filter((b) => b.evidence.some((e) => !this.forget.isForgotten(e.entryId)));
     const reflections = this.fragments
       .all()
-      .filter((f) => f.type === "reflection");
+      .filter(
+        (f) =>
+          f.type === "reflection" &&
+          f.sourceIds.some((id) => !this.forget.isForgotten(id)),
+      );
     if (
       memories.length === 0 &&
       beliefs.length === 0 &&
@@ -1242,7 +2323,7 @@ export class MemoryCore {
       // Segments were written and the log truncated: the fingerprints
       // changed, and the in-memory entries (now living in the
       // segments) still match the disk.
-      this.lastSeenFingerprints = fingerprintLogFiles(this.logFiles());
+      this.lastSeenFingerprints = this.snapshotFingerprints();
       return {
         moved: current.length,
         segments,
@@ -1273,6 +2354,14 @@ export class MemoryCore {
       this.fragments.save();
       this.beliefs.save();
       this.loop.save();
+      // 0.5.1 item 4: experience use-counts are in-memory until
+      // here (markUsed never writes on the recall path).
+      this.experiences.save();
+      this.goals.save();
+      // The saves above moved the store files — the fingerprints
+      // are current again, or the next refreshIfStale would
+      // needlessly reload our own writes.
+      this.lastSeenFingerprints = this.snapshotFingerprints();
     });
   }
 
@@ -1307,6 +2396,17 @@ export class MemoryCore {
       this.counter = this.entries.length;
       this.currentLogCount = this.currentLogEntries().length;
       this.rebuildIndex();
+      // 0.5.2: derived state must not survive a rollback. The semantic
+      // index is dropped (rebuilt lazily from the restored log), any
+      // pending reflection gate is invalid, and the starmap is
+      // regenerated from the restored entries.
+      this.semanticIndex = null;
+      this.semanticIndexStatus = null;
+      this.lastReflectionGateSourceIds = null;
+      // 0.5.4: experiences/goals were restored with the log; drop any
+      // source id that is not live at this restored point in time.
+      this.revalidateReferences();
+      this.generateStarmap();
       // (rebuildIndex -> refreshIfStale already reloads the 0.2.0
       // graph, attributes, summaries and session map, since the
       // restored log files moved the fingerprints.)
@@ -1368,7 +2468,14 @@ export class MemoryCore {
       const profileName = loadProfile(this.dataDir)?.name;
       const r = runReview({
         dataDir: this.dataDir,
-        entries: this.entries,
+        // 0.5.2: hidden memories never get attributes, compression,
+        // graph edges or review prompts. 0.5.3: task-window entries
+        // are not her memories and are excluded from review too — they
+        // used to be decayed/compressed/backfilled alongside persona
+        // entries.
+        entries: this.entries.filter(
+          (e) => e.window === "persona" && !this.forget.isForgotten(e.id),
+        ),
         graph: this.graph,
         attrs: this.attrs,
         index: this.index,
@@ -1395,7 +2502,9 @@ export class MemoryCore {
    *  regenerated on review and on demand (memory_starmap tool). */
   generateStarmap(): StarmapResult {
     const data = buildStarmapData(
-      this.entries,
+      // 0.5.2: the starmap is a persona-facing view; hidden entries
+      // are not drawn unless the admin explicitly asks for them.
+      this.entries.filter((e) => !this.forget.isForgotten(e.id)),
       this.graph.allEdges(),
       this.attrs.all(),
       Date.now(),
@@ -1409,6 +2518,23 @@ export class MemoryCore {
       edges: data.edges.length,
       generatedAt: Date.now(),
     };
+  }
+
+  /** All live log entries, oldest-first (a copy — the admin
+   *  layer lists and filters from this). Hidden (tombstoned)
+   *  entries are included: the admin is allowed to see what the
+   *  user asked to forget, so it can unhide them. */
+  allEntries(): MemoryEntry[] {
+    return [...this.entries];
+  }
+
+  /** Fragment / belief counts (admin stats). */
+  fragmentCount(): number {
+    return this.fragments.size;
+  }
+
+  beliefCount(): number {
+    return this.beliefs.size;
   }
 
   stats(): CoreStats {
@@ -1429,11 +2555,16 @@ export class MemoryCore {
       beliefs: this.beliefs.size,
       beliefDimensions: this.beliefs.summarize(),
       // 0.4.4 item 2: memories flagged needsInvalidationCheck and
-      // not yet invalidated — "awaiting model review". The flag
-      // clears when the model invalidates the entry, when the
-      // opposing statement ages past the 30-day window, or when
-      // the entry drops out of the check's population, so this
-      // number never counts a resolved or stale check.
+      // not yet invalidated — "awaiting model review". 0.5.1
+      // (0.4.5 item 6): the count is "待下次复盘确认", NOT "live
+      // contradictions" — the old comment claimed it never counts
+      // a stale check, which was wrong: a flag whose opposing
+      // statement aged past the 30-day window is still counted
+      // here until the NEXT review runs and clears it (the flag
+      // only clears inside runReview, when the opposition has
+      // lapsed). Between reviews this number can include flags
+      // whose window already passed; that is by design — the
+      // review, not the clock, resolves them.
       pendingInvalidationChecks: this.entries.filter((e) => {
         const attrs = this.attrs.get(e.id);
         return (
