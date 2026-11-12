@@ -10,11 +10,12 @@
   "scripts": {
     "demo": "node test/demo.ts",
     "test": "node test/demo.ts",
+    "eval": "node test/eval-048.ts",
     "typecheck": "tsc --noEmit -p ."
   },
   "type": "module",
   "types": "./src/index.ts",
-  "version": "0.5.5",
+  "version": "1.0.0",
   "devDependencies": {
     "@types/node": "^24.19.2",
     "typescript": "^5.9.3"

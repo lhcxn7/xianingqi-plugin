@@ -3,7 +3,7 @@
 Local semantic recall (see `LOCAL-EMBEDDING.md`) runs one embedding
 model, on CPU, inside the plugin.
 
-- **Full package** (`plugin-0.5.5.zip` and later): the model is inside
+- **Full package** (`plugin-1.0.0.zip` and later): the model is inside
   the package at `dsh-plugin/models/bge-small-zh-v1.5/`. **No download
   and no manual copy** — the plugin finds it automatically.
 - **No-model package** (`*-nomodel.zip`): the model is deliberately

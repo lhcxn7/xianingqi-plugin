@@ -10,7 +10,11 @@
 // monthly archives and the diary are NEVER snapshotted or restored —
 // those belong to the skill / the user, and restoring them would
 // silently revert her memory or diary to snapshot time (audit, 0.1.3).
-// Still excluded: invalidation-audit.jsonl, loop.json
+// Still excluded: invalidation-audit.jsonl. loop.json is included
+// (1.0.0): a restore must rewind pending actions and their 7-day
+// cooldowns together with the log, or the restored tree would be
+// half old and half new. Old snapshots without loop.json keep the
+// live loop state (see restoreSnapshot).
 // (see isPluginOwned). beliefs.json IS covered since 0.5.1 —
 // same reason as fragments.json: beliefs cite log entries as
 // evidence, and a restore that reverts the log but not the
@@ -104,6 +108,10 @@ export function snapshotComplete(dataDir: string, name: string): boolean {
           // counts as complete when it holds it, like any other
           // managed file.
           "profile.json",
+          // 1.0.0: loop state travels with the log (pending +
+          // cooldowns); old snapshots without it still count as
+          // complete through the other managed files.
+          "loop.json",
         ].includes(f) ||
         /^log-\d{4}-\d{2}\.jsonl$/.test(f) ||
         /^summary-\d{4}-\d{2}\.jsonl$/.test(f),
@@ -160,11 +168,12 @@ function isPluginOwned(name: string): boolean {
     // too — beliefs cite log entries as evidence, so a restore
     // must revert them together with the log, or they would point
     // at pre-restore evidence (same reason fragments.json is in).
-    // loop.json stays OUT: it is live behaviour-loop state, not
-    // log-derived — restoring it could re-trigger an already-acted
-    // proact decision. invalidation-audit.jsonl stays OUT too: it
-    // is the record of who invalidated what, never reverted.
+    // 1.0.0: loop.json is in as well — pending actions and their
+    // 7-day cooldowns must rewind with the log, not stay from a
+    // later state. Restore keeps the live loop when an old snapshot
+    // predates loop.json.
     name === "beliefs.json" ||
+    name === "loop.json" ||
     // 0.5.4: delete/restore must move the forgetting state together
     // with the log, or a rollback can resurrect a deleted memory while
     // leaving the request marked executed. These are plugin-owned.
@@ -252,12 +261,18 @@ export function restoreSnapshot(dataDir: string, name: string): string {
   try {
     copyDataFiles(src, staging);
     atomicWriteText(join(staging, ".complete"), `${name}\n`);
+    // 1.0.0: snapshots taken before loop.json joined the managed
+    // set do not contain it. Do not delete the live loop in that
+    // case — the old snapshot has no loop state to restore, and
+    // wiping it would lose the 7-day cooldowns.
+    const loopInSnapshot = existsSync(join(staging, "loop.json"));
     // 0.5.2: a restore is a state rollback, not a merge. Plugin-owned
     // files that exist now but were not in the snapshot (a later
     // monthly log, summary, fragment/attribute store) must go, or the
     // "restored" tree is a mixture of both states.
     for (const f of readdirSync(dataDir)) {
       if (!isPluginOwned(f)) continue;
+      if (f === "loop.json" && !loopInSnapshot) continue;
       if (!existsSync(join(staging, f))) {
         rmSync(join(dataDir, f), { recursive: true, force: true });
       }

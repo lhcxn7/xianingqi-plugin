@@ -46,12 +46,11 @@ import type { MemoryEntry } from "./types.ts";
 
 /** Only memories from the last 24 h can trigger a reflection. */
 export const REFLECTION_WINDOW_MS = 24 * 60 * 60 * 1000;
-/** Anti-disturbance floor, on the sum of the last 24 h of new
- *  memories' significance (heavy 0.9, light 0.4 — see
- *  attributes.ts initialSignificance). Below this, no prompt is
- *  built and no model is called: a near-empty day must not
- *  interrupt her. Above it, the model decides — the code never
- *  blocks a reflection. ~6 heavy memories in a day clears it. */
+/** Legacy anti-disturbance floor. No longer gates anything (终版
+ *  WP5): the gate opens whenever there is at least one new persona
+ *  entry in the last 24 h, and the model decides whether to reflect.
+ *  Kept exported for callers that still read it; do not use it to
+ *  block a prompt. */
 export const REFLECTION_MIN_FLOOR = 5;
 /** A cited quote must be at least this long — a 1-char match
  *  ("他", "了") proves nothing. */
@@ -73,7 +72,10 @@ export interface ReflectionGate {
   entries: MemoryEntry[];
   /** Sum of their significance. */
   significanceSum: number;
-  /** True when the floor is reached (sum >= REFLECTION_MIN_FLOOR). */
+  /** True when there is at least one new persona entry in the last
+   *  24 h. The old 5-point significance floor is gone (终版 WP5):
+   *  the code no longer decides that a day is "too small to think
+   *  about" — the model does. No entries means no prompt at all. */
   reached: boolean;
 }
 
@@ -104,7 +106,7 @@ export function reflectionGate(
   return {
     entries: recent,
     significanceSum: sum,
-    reached: sum >= REFLECTION_MIN_FLOOR,
+    reached: recent.length > 0,
   };
 }
 

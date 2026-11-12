@@ -2,7 +2,8 @@
 
 DSH shell around `@memory-plugin/core`: deterministic memory capture,
 keyword recall injection and snapshots for persona AIs in DeepSeek
-Harness. Local only — no network, no login, no cloud.
+Harness. Local by default — no login, no cloud; the only network step is
+the optional one-time `semantic install --yes` (see the root README).
 
 ## Install (in DSH)
 

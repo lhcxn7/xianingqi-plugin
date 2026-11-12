@@ -22,17 +22,21 @@
 //   forget approve <request-id>
 //   forget execute <request-id>
 //   forget unhide --ids a,b
+//   purge --pattern-file <path> [--yes] [--no-snapshots]
+//   purge --pattern "..." [--yes] [--no-snapshots]
 //   goals add --title "..." [--due YYYY-MM-DD|epoch-ms] [--notes ...]
 //   goals list [--status open|done|dropped]
 //   goals done|reopen|drop|remove <id>
 //   exp add --rule "..." --trigger a,b --source "..." --source-ids a,b
 //   exp list | exp confirm <id> [--expires-days N] | exp revoke <id> | exp remove <id>
-//   semantic status | semantic rebuild
+//   semantic status | semantic install [--yes] [--timeout ms] | semantic rebuild
 //   serve [--port N] [--token T]   (localhost HTTP API, see admin-server.ts)
 
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { MemoryCore } from "./core.ts";
+import { installTransformersRuntime } from "./install-runtime.ts";
 import { MemoryAdmin } from "./admin.ts";
 import { startAdminServer } from "./admin-server.ts";
 
@@ -234,6 +238,34 @@ async function main(argv: string[]): Promise<void> {
       print({ ok: true, cleared: admin.unforget(ids) });
       return;
     }
+    case "purge": {
+      // 终版 WP2: default dry-run; --yes is required to write.
+      // The pattern is never echoed to stdout/audit; prefer
+      // --pattern-file so it does not land in shell history.
+      let pattern = typeof flags.pattern === "string" ? flags.pattern : "";
+      if (pattern.length === 0 && typeof flags["pattern-file"] === "string") {
+        try {
+          pattern = readFileSync(flags["pattern-file"], "utf8").trim();
+        } catch (err) {
+          fail(
+            `读不了 --pattern-file：${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+      if (pattern.trim().length < 4) {
+        fail("purge 需要 --pattern 或 --pattern-file（至少 4 个字符）");
+      }
+      const dryRun = flags.yes !== true;
+      const includeSnapshots = flags["no-snapshots"] !== true;
+      print(
+        core.purgeByPattern(pattern, {
+          dryRun,
+          by: "cli",
+          includeSnapshots,
+        }),
+      );
+      return;
+    }
     case "goals add": {
       if (typeof flags.title !== "string") fail("goals add 需要 --title");
       print({
@@ -330,6 +362,22 @@ async function main(argv: string[]): Promise<void> {
       print(admin.semanticStatus());
       return;
     }
+    case "semantic install": {
+      // 终版 WP9: the only network command. Default is a dry-run:
+      // it prints the npm command and exits; --yes actually installs.
+      const out = installTransformersRuntime(dataDir, {
+        yes: flags.yes === true,
+        dryRun: flags.yes !== true,
+        ...(typeof flags.timeout === "string"
+          ? { timeoutMs: Number(flags.timeout) }
+          : {}),
+      });
+      print(out);
+      if (!out.ok && !out.needsConfirmation) {
+        process.exit(1);
+      }
+      return;
+    }
     case "semantic rebuild": {
       print({ ok: true, ...(await admin.rebuildSemanticIndex()) });
       return;
@@ -339,7 +387,7 @@ async function main(argv: string[]): Promise<void> {
         "用法: node core/src/admin-cli.ts --dataDir <dir> <command>\n" +
           "  stats | entries list|show|edit|correct|delete | forget request|dry-run|list|approve|execute|unhide\n" +
           "  goals add|list|done|reopen|drop|remove | exp add|list|confirm|revoke|remove\n" +
-          "  semantic status|rebuild | serve [--port N] [--token T]",
+          "  semantic status|install|rebuild | serve [--port N] [--token T]",
       );
       process.exit(1);
     }

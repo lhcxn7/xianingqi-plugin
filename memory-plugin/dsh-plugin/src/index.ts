@@ -163,14 +163,15 @@
 // still retain them, the verbatim log does not).
 
 import { randomBytes, randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, fsyncSync, openSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   MemoryCore,
   MODEL_REVIEW_CATEGORIES,
   MODEL_REVIEW_MAX_CHARS,
   MODEL_REVIEW_MAX_ENTRIES,
+  PROFILE_CATEGORIES,
   RECENT_MAX_CHARS,
   RECENT_MAX_ENTRIES,
   SOURCE_TYPE_CN,
@@ -189,10 +190,23 @@ import type {
   BeliefCandidate,
   FragmentCandidate,
   MemoryEntry,
+  PersonaProfile,
+  ProfileCategory,
+  ProfileItem,
+  RecallHit,
   RecallResult,
   ReviewResult,
 } from "../../core/src/index.ts";
 import { isObjectSchema, loadDefineTool } from "./define-tool.ts";
+import {
+  DEFAULT_DECLARATION_PHRASES,
+  classifyAssistantReply,
+  classifyContent,
+  matchDeclaration,
+  parsePersonaSessions,
+  serializePersonaSessions,
+} from "./window.ts";
+import type { EntryKind, SessionMode } from "./window.ts";
 import type {
   MemoryPluginConfig,
   MemoryPluginContext,
@@ -567,6 +581,21 @@ export function parseEmotion(
   return { type, intensity: Math.min(1, Math.max(0, n)) };
 }
 
+/** 终版 WP4: accept epoch-ms or an ISO date string for validFrom /
+ *  observedAt. An unparseable value means "not passed". */
+function parseTimeArg(raw: unknown): number | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  if (typeof raw !== "string") return undefined;
+  const s = raw.trim();
+  if (!s) return undefined;
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? undefined : t;
+}
+
 function resolveDataDir(config?: MemoryPluginConfig): string {
   const fromConfig = config?.dataDir;
   if (fromConfig) return fromConfig;
@@ -715,6 +744,16 @@ function eventSourceKind(ev: SessionEvent): string {
 
 interface SessionState {
   persona: boolean;
+  /** 终版 WP1: the session's current mode. persona = memory tools and
+   *  injection allowed; task = nothing is recorded or injected. */
+  mode: SessionMode;
+  /** True when the mode came from an explicit declaration. A declared
+   *  task session is NOT flipped back to persona by a later trigger
+   *  word — only another declaration changes it. */
+  modeLocked: boolean;
+  /** 终版 WP1: the kind of the current turn's user message. The
+   *  assistant reply follows it (see classifyAssistantReply). */
+  lastKind: EntryKind | null;
   turns: number;
   /** Disposer for this session's dynamic recall context (per-session,
    *  so interleaved sessions never release each other's context). */
@@ -813,6 +852,11 @@ interface SessionState {
 // (audit M7). Plugin-owned file, covered by snapshots.
 const PERSONA_FILE = "persona-sessions.json";
 
+// 终版 WP1: append-only audit of explicit mode switches (who declared
+// what, when, and which session). Never snapshot-owned: a restore must
+// not rewind the record of a declaration.
+const WINDOW_AUDIT_FILE = "window-audit.jsonl";
+
 // Turn-1 appended entry ids, per session, persisted in the data dir
 // (0.1.4 minor 1). The turn-1 append is committed to session history
 // and stays there across a rebuild, so the appended ids must survive
@@ -846,7 +890,12 @@ export function apply(
 ): void {
   const dataDir = resolveDataDir(config);
   const tokenCap = config?.tokenCap ?? DEFAULT_TOKEN_CAP;
+  // 终版 WP5: soft-guidance candidate count (clamped in the core).
+  const valveTop = config?.valveTop ?? 8;
   const triggerWords = config?.triggerWords ?? DEFAULT_TRIGGER_WORDS;
+  const declarationPhrases =
+    config?.declarationPhrases ?? DEFAULT_DECLARATION_PHRASES;
+  const assistantPersonaMaxChars = config?.assistantPersonaMaxChars ?? 800;
   const memoryCueWords =
     config?.memoryCueWords ?? DEFAULT_MEMORY_CUE_WORDS;
   // 0.5.0 step 5: host-injected query rewriter (model call lives
@@ -856,6 +905,65 @@ export function apply(
   // 0.5.1 item 2: local embedding config (default off — see
   // MemoryPluginConfig.semanticRecall).
   const semanticRecall = config?.semanticRecall;
+
+  // 终版 WP0: one dataDir, one source of truth. Two explicit sources
+  // (config + env) that disagree is a configuration error, not a
+  // preference: enter read-only mode rather than write half the
+  // memory into one folder and half into another. A stray MEMORY.md
+  // in another candidate is a warning (first installs legitimately
+  // have no MEMORY.md in the new dataDir yet).
+  const defaultDataDir = join(homedir(), ".dsh", "xia-ningqi-data");
+  const configuredDir =
+    typeof config?.dataDir === "string" && config.dataDir.trim().length > 0
+      ? config.dataDir
+      : null;
+  const envDir = process.env.MEMORY_PLUGIN_DATA_DIR?.trim() || null;
+  const samePath = (a: string, b: string): boolean =>
+    resolve(a) === resolve(b);
+  const explicitConflict =
+    configuredDir !== null &&
+    envDir !== null &&
+    !samePath(configuredDir, envDir);
+  const memoryFilePresent = existsSync(join(dataDir, "MEMORY.md"));
+  const secondMemoryFiles = [configuredDir, envDir, defaultDataDir]
+    .filter((p): p is string => typeof p === "string" && p.length > 0)
+    .filter(
+      (p, i, arr) =>
+        arr.findIndex((x) => samePath(x, p)) === i && !samePath(p, dataDir),
+    )
+    .filter((p) => existsSync(join(p, "MEMORY.md")));
+  const dataDirWarning = explicitConflict
+    ? `数据目录来源冲突：config.dataDir=${configuredDir ?? ""}，MEMORY_PLUGIN_DATA_DIR=${envDir ?? ""}；已进入只读模式（聊天不受影响，写入全部拒绝）。`
+    : secondMemoryFiles.length > 0
+      ? `发现另一份 MEMORY.md：${secondMemoryFiles.join("、")}；当前 dataDir=${dataDir}${memoryFilePresent ? "" : "（这里没有 MEMORY.md）"}。可能分家了。`
+      : "";
+  const writeBlocked = explicitConflict;
+  const writeBlockedMessage = dataDirWarning
+    ? `记忆写入已被拒绝：${dataDirWarning}`
+    : "记忆写入已被拒绝：数据目录未对齐。";
+  // 终版 WP0: every model-facing write tool is refused in read-only
+  // mode. Reads (memory_search / memory_status) keep working, so the
+  // problem is visible instead of silent.
+  const WRITE_TOOLS = new Set<string>([
+    "memory_profile",
+    "memory_remember",
+    "memory_daily_review",
+    "memory_fragment",
+    "memory_snapshot",
+    "memory_restore",
+    "memory_starmap",
+    "memory_invalidate",
+    "memory_belief",
+    "memory_reflect",
+    "memory_proact",
+    "memory_feedback",
+    "memory_forget",
+    "memory_goal",
+    "memory_experience",
+  ]);
+  if (dataDirWarning) {
+    console.warn(`[memory-plugin] ${dataDirWarning}`);
+  }
 
   // Warn once per distinct problem (not on every event).
   const warned = new Set<string>();
@@ -869,6 +977,32 @@ export function apply(
     if (warned.has(key)) return;
     warned.add(key);
     console.warn(`[memory-plugin] ${message}`);
+  };
+
+  /** 终版 WP5: when the token cap trims candidates, leave a trace the
+   *  model/user can inspect. Ids and a query prefix only — never the
+   *  dropped text. */
+  const logRecallDropped = (
+    sid: string,
+    query: string,
+    dropped: RecallHit[],
+  ): void => {
+    if (dropped.length === 0) return;
+    try {
+      appendFileSync(
+        join(dataDir, "recall-dropped.jsonl"),
+        `${JSON.stringify({
+          ts: Date.now(),
+          sessionId: sid,
+          query: query.slice(0, 80),
+          ids: dropped.map((h) => h.entry.id),
+          reasons: dropped.map((h) => (h.viaGraph ? "graph" : "keyword")),
+        })}\n`,
+        { encoding: "utf8" },
+      );
+    } catch {
+      // A logging failure must never break the turn.
+    }
   };
 
   // Audit M3: a failing core must fail LOUDLY, naming the dataDir and
@@ -891,12 +1025,15 @@ export function apply(
   // missing model or a failed build just leaves keyword-only
   // (the per-turn adapter below also degrades silently).
   if (core.semanticEnabled()) {
-    void core.ensureSemanticIndex().catch((err: unknown) => {
-      warnOnce(
-        "semantic-index-failed",
-        `语义索引构建失败，本轮起只用关键词召回（${err instanceof Error ? err.message : String(err)}）。检查模型目录 ${core.semanticModelDir()} 是否已放入包里的 models/bge-small-zh-v1.5/。`,
-      );
-    });
+    void core
+      .ensureSemanticIndex()
+      .then(() => core.warmSemantic())
+      .catch((err: unknown) => {
+        warnOnce(
+          "semantic-index-failed",
+          `语义索引构建失败，本轮起只用关键词召回（${err instanceof Error ? err.message : String(err)}）。检查模型目录 ${core.semanticModelDir()} 是否已放入包里的 models/bge-small-zh-v1.5/。`,
+        );
+      });
   }
 
   /** 0.5.1 item 2: the sync semantic slot for one recall turn.
@@ -919,16 +1056,26 @@ export function apply(
       const candidates = core
         .allEntries()
         .filter(
-          (e) => e.window === "persona" && !core.forget.isForgotten(e.id),
+          (e) =>
+            e.window === "persona" &&
+            (e.kind ?? "persona") === "persona" &&
+            !core.forget.isForgotten(e.id),
         );
       // One search call: the similarities ride along with the ids
       // so recall can score semantic-only hits by similarity
       // (0.5.1 item 2), not by recency. Filtered by the core's
       // configured floor.
       const hits = await core.semanticSearch(query, candidates);
-      const kept = hits.filter(
-        (h) => h.similarity >= core.semanticMinSimilarity(),
-      );
+      // 终版 WP5: per-type floor — fact-like entries (factKey set)
+      // keep the measured 0.5 floor; episodic entries may use 0.45.
+      // The 0.4 tie-break tier stays OFF until the 48-case eval
+      // proves it does not raise false positives.
+      const candidateById = new Map(candidates.map((e) => [e.id, e]));
+      const kept = hits.filter((h) => {
+        const entry = candidateById.get(h.id);
+        const floor = entry?.factKey ? 0.5 : 0.45;
+        return h.similarity >= floor;
+      });
       if (kept.length === 0) return undefined;
       const byId = new Map(kept.map((h) => [h.id, h.similarity]));
       return {
@@ -941,28 +1088,23 @@ export function apply(
     }
   };
 
-  const loadPersonaSessions = (): Set<string> => {
+  const loadPersonaSessions = (): Map<string, SessionMode> => {
     try {
       const raw = readFileSync(join(dataDir, PERSONA_FILE), "utf8");
-      const arr = JSON.parse(raw) as unknown;
-      if (Array.isArray(arr)) {
-        return new Set(
-          arr.filter((x): x is string => typeof x === "string"),
-        );
-      }
+      return parsePersonaSessions(raw);
     } catch {
       // Missing or corrupt: start empty; the file is rebuilt on the
       // next persona transition.
+      return new Map<string, SessionMode>();
     }
-    return new Set<string>();
   };
 
-  const savePersonaSessions = (set: Set<string>): void => {
+  const savePersonaSessions = (map: Map<string, SessionMode>): void => {
     try {
-      // Keep the newest 500; stale ids are harmless but the file
-      // must not grow forever.
-      const arr = [...set].slice(-500);
-      atomicWriteText(join(dataDir, PERSONA_FILE), `${JSON.stringify(arr)}\n`);
+      atomicWriteText(
+        join(dataDir, PERSONA_FILE),
+        serializePersonaSessions(map),
+      );
     } catch (err) {
       warnOnce(
         "persona-save-failed",
@@ -1057,12 +1199,15 @@ export function apply(
   const reloadPersonaState = (): void => {
     const restored = loadPersonaSessions();
     personaSessions.clear();
-    for (const id of restored) personaSessions.add(id);
+    for (const [id, mode] of restored) personaSessions.set(id, mode);
     const restoredAppended = loadAppendedIds();
     appendedIdsMap.clear();
     for (const [id, ids] of restoredAppended) appendedIdsMap.set(id, ids);
     for (const [sid, state] of sessions) {
-      state.persona = personaSessions.has(sid);
+      const mode = personaSessions.get(sid);
+      state.mode = mode ?? "task";
+      state.persona = mode === "persona";
+      state.modeLocked = mode === "task";
       state.appendedIds = appendedIdsMap.get(sid) ?? new Set<string>();
     }
   };
@@ -1105,6 +1250,9 @@ export function apply(
     if (!s) {
       s = {
         persona: false,
+        mode: "task",
+        modeLocked: false,
+        lastKind: null,
         turns: 0,
         disposer: null,
         appendedIds: new Set(),
@@ -1129,10 +1277,49 @@ export function apply(
 
   const markPersona = (sid: string): void => {
     const session = getSession(sid);
-    if (session.persona) return;
+    // 终版 WP1: a declared task session is not re-marked by a later
+    // trigger word — only "人设窗口" switches it back.
+    if (session.modeLocked && session.mode === "task") return;
+    if (session.persona && session.mode === "persona") return;
     session.persona = true;
-    personaSessions.add(sid);
+    session.mode = "persona";
+    personaSessions.set(sid, "persona");
     savePersonaSessions(personaSessions);
+  };
+
+  /** 终版 WP1: an explicit "任务窗口" / "人设窗口" declaration. The
+   *  mode is persisted (so it survives a DSH restart) and audited. */
+  const declareMode = (
+    sid: string,
+    mode: SessionMode,
+    rawText: string,
+  ): void => {
+    const session = getSession(sid);
+    const from = session.mode;
+    session.mode = mode;
+    session.persona = mode === "persona";
+    session.modeLocked = true;
+    personaSessions.set(sid, mode);
+    savePersonaSessions(personaSessions);
+    if (from === mode) return;
+    try {
+      appendFileSync(
+        join(dataDir, WINDOW_AUDIT_FILE),
+        `${JSON.stringify({
+          ts: Date.now(),
+          sessionId: sid,
+          from,
+          to: mode,
+          text: rawText.slice(0, 40),
+        })}\n`,
+        { encoding: "utf8" },
+      );
+    } catch (err) {
+      warnOnce(
+        "window-audit-failed",
+        `窗口切换审计写入失败（${err instanceof Error ? err.message : String(err)}），切换本身已生效。`,
+      );
+    }
   };
 
   /** Session id of the most recent pre-step that carried a user
@@ -1175,6 +1362,30 @@ export function apply(
     console.warn(
       `[memory-plugin] 静态 directives section 注册失败（可能是插件在同一进程里被加载了两次：${err instanceof Error ? err.message : String(err)}），插件继续运行，记忆注入不受影响。`,
     );
+  }
+
+  // 终版 WP9: a one-time setup hint when semantic is wanted but the
+  // optional runtime is missing. The plugin does not install by
+  // itself; it names the command that installs (network once).
+  try {
+    const sem = core.semanticStatus();
+    const wantsSemantic = config?.semanticRecall?.enabled !== false;
+    if (
+      wantsSemantic &&
+      sem.dependency.modelPresent &&
+      !sem.dependency.runtimePresent
+    ) {
+      ctx.systemPrompt.section({
+        name: "memory-plugin:semantic-install",
+        order: 710,
+        text:
+          "语义召回还没启用：本地运行库 @huggingface/transformers 还没装。要启用，运行 " +
+          `\`${sem.dependency.installCommand}\` ` +
+          "（会联网一次；装不上继续关键词召回，不影响聊天）。不需要语义可以忽略这条。",
+      });
+    }
+  } catch {
+    // A missing status must never break activation.
   }
 
   // Dynamic recall context, refreshed every turn (dispose-then-register),
@@ -1493,7 +1704,8 @@ export function apply(
         // Disposer failures must not break session tracking.
       }
     }
-    const restored = personaSessions.has(id);
+    const restoredMode = personaSessions.get(id);
+    const restored = restoredMode !== undefined;
     // 0.1.4 minor 1: restore the turn-1 appended ids too — the
     // append already lives in the rehydrated history, and without
     // these the next turn would re-register the same hits as context
@@ -1506,7 +1718,10 @@ export function apply(
       appendedIds = new Set<string>();
     }
     sessions.set(id, {
-      persona: restored,
+      persona: restoredMode === "persona",
+      mode: restoredMode ?? "task",
+      modeLocked: restoredMode === "task",
+      lastKind: null,
       turns: restored ? 1 : 0,
       disposer: null,
       appendedIds,
@@ -1545,7 +1760,7 @@ export function apply(
     // pre-step, which hands yesterday's messages to the model (as
     // Xia) for her own importance judgment. Same trigger, same
     // timing, no new schedule.
-    if (restored) {
+    if (restored && restoredMode === "persona" && !writeBlocked) {
       let reviewResult: ReviewResult | null = null;
       try {
         reviewResult = core.review();
@@ -1637,6 +1852,17 @@ export function apply(
       const session = getSession(sid);
       currentTurnSessionId = sid;
       session.turns += 1;
+      // 终版 WP1: an explicit mode declaration wins over the trigger
+      // guess; then the trigger marks the session (unless the session
+      // was explicitly declared task).
+      for (const text of userTexts) {
+        const declared = matchDeclaration(
+          text,
+          triggerWords,
+          declarationPhrases,
+        );
+        if (declared !== null) declareMode(sid, declared, text);
+      }
       if (userTexts.some((t) => shouldMarkPersona(t, triggerWords))) {
         markPersona(sid);
       }
@@ -1738,6 +1964,7 @@ export function apply(
           const semantic = await semanticAdapter(query);
           result = core.recall(query, {
             tokenCap,
+            valveTop,
             sessionId: sid,
             recentTexts: session.recentUserTexts,
             rewrittenQuery: rewritten ?? undefined,
@@ -1765,6 +1992,7 @@ export function apply(
           core.beliefLine() || undefined,
           (result.experiences ?? []).map((e) => e.rule),
           tokenCap,
+          (dropped) => logRecallDropped(sid, query, dropped),
         );
         // Turn 1: append directly — a context registered during
         // pre-step would otherwise not reach the first request.
@@ -1807,6 +2035,7 @@ export function apply(
                 core.beliefLine() || undefined,
                 undefined,
                 tokenCap,
+                (dropped) => logRecallDropped(sid, query, dropped),
               )
             : "",
           agentCtx,
@@ -1841,6 +2070,7 @@ export function apply(
     const session = getSession(sid);
 
     if (type === "compaction/start") {
+      if (writeBlocked) return;
       // Last chance before history is shadowed: persist the index
       // AND take a snapshot (audit M5). A snapshot that never runs
       // is no protection at all.
@@ -1884,18 +2114,40 @@ export function apply(
       // trigger message. Detect the trigger here too, so turn 1 is
       // recorded. (Same rule as pre-step: the skill's own trigger,
       // gated by the 0.3.1 task blocklist.)
+      // 终版 WP1: declaration first, then the trigger latch, then the
+      // content kind. "夏柠柒" alone records as greeting (not memory);
+      // work inside a persona session records as task.
+      const declared = matchDeclaration(
+        text,
+        triggerWords,
+        declarationPhrases,
+      );
+      if (declared !== null) declareMode(sid, declared, text);
       if (shouldMarkPersona(text, triggerWords)) {
         markPersona(sid);
       }
       if (!session.persona) return;
+      const contentKind = classifyContent(
+        text,
+        session.mode,
+        triggerWords,
+        declarationPhrases,
+      );
+      if (contentKind === "skip") return;
       // Unattributable events are never recorded, even if they carry
       // the trigger (fail closed — audit issue 3).
       if (!attributable) return;
+      session.lastKind = contentKind;
+      if (writeBlocked) {
+        warnOnce("write-blocked-record", writeBlockedMessage);
+        return;
+      }
       try {
         const entry = core.record({
           role: "user",
           text,
           window: "persona",
+          kind: contentKind,
           sessionId: sid,
         });
         // 0.5.1 item 2: append the new vector when semantic is on
@@ -1916,11 +2168,24 @@ export function apply(
       if (!attributable) return;
       const text = eventText(event);
       if (!text) return;
+      // 终版 WP1: her reply follows the turn. A short conversational
+      // answer stays persona even after a task request; a code block,
+      // table, 5+ item list or >800 chars is work output.
+      const kind = classifyAssistantReply(
+        session.lastKind ?? "persona",
+        text,
+        assistantPersonaMaxChars,
+      );
+      if (writeBlocked) {
+        warnOnce("write-blocked-record", writeBlockedMessage);
+        return;
+      }
       try {
         const entry = core.record({
           role: "assistant",
           text,
           window: "persona",
+          kind,
           sessionId: sid,
         });
         void core.semanticUpsertEntry(entry);
@@ -1937,6 +2202,7 @@ export function apply(
   // Turn boundary: persist the index. A flush failure must not fail
   // the turn — her reply is already generated (audit M6).
   ctx.on("agent/turn-stopping", () => {
+    if (writeBlocked) return;
     try {
       core.flush();
     } catch (err) {
@@ -1952,6 +2218,7 @@ export function apply(
   // but nothing ever called it, so the snapshot protection never ran.
   ctx.effect(() => {
     return () => {
+      if (writeBlocked) return;
       try {
         core.endSession();
       } catch (err) {
@@ -1972,6 +2239,17 @@ export function apply(
   void loadDefineTool()
     .then((defineTool) => {
       const registerTool = (spec: unknown): void => {
+        const specName = (spec as { name?: unknown } | null)?.name;
+        if (
+          writeBlocked &&
+          typeof specName === "string" &&
+          WRITE_TOOLS.has(specName)
+        ) {
+          spec = {
+            ...(spec as Record<string, unknown>),
+            execute: async () => ({ ok: false, error: writeBlockedMessage }),
+          };
+        }
         let compiled: unknown;
         try {
           compiled = defineTool(spec);
@@ -2023,11 +2301,42 @@ export function apply(
       registerTool({
         name: "memory_profile",
         description:
-          "更新或读取人设画像常驻块（姓名、阶段、关系阶段）。画像独立保存在 profile.json，不修改 MEMORY.md、log.jsonl 或关键词索引。只允许在人设窗口调用；至少提供一个字段才会更新。",
+          "更新或读取人设画像常驻块（名字、阶段、关系阶段），以及 8 类结构化画像（爱好习惯、理想、偏好、底线、身体健康、害怕担心、秘密、家人朋友）。画像独立保存在 profile.json，不修改 MEMORY.md、log.jsonl 或关键词索引。只允许在人设窗口调用；至少提供一个字段才会更新。8 类画像不做敏感分级，但每条都必须带 sourceIds（真实人设记忆的 id），没有来源的画像条目会被拒绝。",
         parameters: {
           name: { type: "string", required: false, description: "人设名称" },
           stage: { type: "string", required: false, description: "人设当前阶段" },
           relationshipStage: { type: "string", required: false, description: "当前关系阶段" },
+          category: {
+            type: "string",
+            required: false,
+            description:
+              "可选：8 类之一（爱好习惯 / 理想 / 偏好 / 底线 / 身体健康 / 害怕担心 / 秘密 / 家人朋友）。只传 category 不传 items/removeTexts/clearCategory 时只读这一类。",
+          },
+          items: {
+            type: "array",
+            required: false,
+            description:
+              "可选：替换这一类的内容。每项必须带 text 和 sourceIds（真实人设记忆的 id）。",
+            items: {
+              type: "object",
+              properties: {
+                text: { type: "string" },
+                sourceIds: { type: "array", items: { type: "string" } },
+              },
+              required: ["text", "sourceIds"],
+            },
+          },
+          removeTexts: {
+            type: "array",
+            required: false,
+            description: "可选：按 text 精确删除这一类里的几条。",
+            items: { type: "string" },
+          },
+          clearCategory: {
+            type: "boolean",
+            required: false,
+            description: "可选：清空这一类。",
+          },
         },
         output: {
           schema: {
@@ -2045,19 +2354,93 @@ export function apply(
           const { persona } = toolSession(exec);
           if (!persona) return { ok: false, error: "memory_profile 只允许在人设窗口调用；任务窗口已拒绝。" };
           const a = (args ?? {}) as Record<string, unknown>;
-          const patch: { name?: string; stage?: string; relationshipStage?: string } = {};
+          const patch: Partial<PersonaProfile> = {};
           if (typeof a.name === "string") patch.name = a.name;
           if (typeof a.stage === "string") patch.stage = a.stage;
           if (typeof a.relationshipStage === "string") patch.relationshipStage = a.relationshipStage;
           try {
+            // 终版 WP6: 8-category structured profile. Every item
+            // must cite real persona entries; no sensitivity tier.
+            const rawCategory = typeof a.category === "string" ? a.category : undefined;
+            if (rawCategory !== undefined) {
+              const category = rawCategory as ProfileCategory;
+              if (!PROFILE_CATEGORIES.includes(category)) {
+                throw new Error(
+                  `category 必须是这 8 类之一：${PROFILE_CATEGORIES.join(" / ")}`,
+                );
+              }
+              const existing = core.readLayer1().profile?.categories?.[category] ?? [];
+              let nextItems: ProfileItem[] | undefined;
+              if (a.clearCategory === true) {
+                nextItems = [];
+              } else if (a.items !== undefined) {
+                if (!Array.isArray(a.items)) throw new Error("items 必须是数组");
+                const byId = new Map(core.allEntries().map((e) => [e.id, e]));
+                const now = Date.now();
+                nextItems = [];
+                for (const raw of a.items) {
+                  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+                    throw new Error("items 里每一项必须是 { text, sourceIds }");
+                  }
+                  const item = raw as Record<string, unknown>;
+                  const text = typeof item.text === "string" ? item.text.trim() : "";
+                  if (!text) throw new Error("items 里的 text 不能为空");
+                  const sourceIds = Array.isArray(item.sourceIds)
+                    ? [...new Set(item.sourceIds.filter((x): x is string => typeof x === "string" && x.length > 0))]
+                    : [];
+                  if (sourceIds.length === 0) {
+                    throw new Error(`画像条目「${text}」没有 sourceIds，拒绝写入`);
+                  }
+                  for (const id of sourceIds) {
+                    const entry = byId.get(id);
+                    if (!entry) throw new Error(`sourceId ${id} 不在日志里`);
+                    if (entry.window !== "persona" || (entry.kind ?? "persona") !== "persona") {
+                      throw new Error(`sourceId ${id} 不是人设聊天条目（task/greeting 不能当画像来源）`);
+                    }
+                    if (core.forget.isForgotten(id)) {
+                      throw new Error(`sourceId ${id} 已被隐藏，不能当画像来源`);
+                    }
+                  }
+                  nextItems.push({ text, sourceIds, updatedAt: now });
+                }
+              } else if (a.removeTexts !== undefined) {
+                if (!Array.isArray(a.removeTexts)) throw new Error("removeTexts 必须是数组");
+                const doomed = new Set(
+                  a.removeTexts.filter((x): x is string => typeof x === "string"),
+                );
+                nextItems = existing.filter((item) => !doomed.has(item.text));
+              }
+              if (nextItems !== undefined) {
+                patch.categories = { [category]: nextItems };
+              }
+            }
             if (Object.keys(patch).length > 0) {
               core.updateProfile(patch);
-            } else if (a.name !== undefined || a.stage !== undefined || a.relationshipStage !== undefined) {
-              throw new Error("profile_fields_must_be_strings");
+            } else if (
+              a.name !== undefined ||
+              a.stage !== undefined ||
+              a.relationshipStage !== undefined ||
+              a.category !== undefined
+            ) {
+              // Read-only category query is allowed; a non-string
+              // name/stage/relationshipStage is still an error.
+              if (
+                a.name !== undefined &&
+                typeof a.name !== "string"
+              ) {
+                throw new Error("profile_fields_must_be_strings");
+              }
             }
             const layer1 = core.readLayer1();
             const profile = layer1.profile ?? {};
-            return { ok: true, profile, profileText: formatProfileBlock(layer1) };
+            const cleanProfile = Object.fromEntries(
+              Object.entries(profile).filter(([, v]) => v !== undefined),
+            );
+            return {
+              ok: true,
+              profile: cleanProfile,
+              profileText: formatProfileBlock(layer1) ?? "",
+            };
           } catch (err) {
             return { ok: false, error: `画像更新失败：${err instanceof Error ? err.message : String(err)}` };
           }
@@ -2078,6 +2461,18 @@ export function apply(
             type: "number",
             required: false,
             description: "最多返回几条, 默认 5",
+          },
+          includeWork: {
+            type: "boolean",
+            required: false,
+            description:
+              "可选：把干活轮次（kind=task）的条目也搜进来，默认不搜。只在人设窗口可用；用于找回\"上次让你改的那段\"。",
+          },
+          includeCandidates: {
+            type: "boolean",
+            required: false,
+            description:
+              "可选：把证据不足的候选事实（candidate=true）也搜进来，默认不搜；候选不是既定事实，别当成确认过的记忆用。",
           },
         },
         output: {
@@ -2128,6 +2523,12 @@ export function apply(
           const limit = Number.isFinite(rawLimit)
             ? Math.max(1, Math.min(50, Math.floor(rawLimit)))
             : 5;
+          const includeWork =
+            (args as { includeWork?: unknown } | undefined)?.includeWork ===
+            true;
+          const includeCandidates =
+            (args as { includeCandidates?: unknown } | undefined)
+              ?.includeCandidates === true;
           try {
             // 0.5.0 step 5: same rewrite as the pre-step recall —
             // the rewritten query unions with the original, and a
@@ -2144,6 +2545,8 @@ export function apply(
               // persona search (and vice versa: fragment sources
               // are persona-checked in the core too).
               window: "persona",
+              includeWork,
+              includeCandidates,
               limit,
               rewrittenQuery: rewritten ?? undefined,
               semantic,
@@ -2172,6 +2575,10 @@ export function apply(
                   time: h.entry.time,
                   role: h.entry.role,
                   window: h.entry.window,
+                  kind: h.entry.kind ?? "persona",
+                  candidate: h.entry.candidate === true,
+                  validFrom: h.entry.validFrom ?? null,
+                  observedAt: h.entry.observedAt ?? null,
                   importance: h.entry.importance,
                   // 0.3.0: a fragment hit shows the fragment text
                   // (with its tone) instead of the full original.
@@ -2236,6 +2643,24 @@ export function apply(
             description:
               "可选：这条记忆替代的旧条目 id（见 memory_search 的 hits）。和 factKey 一起传，旧条目必须和新条目同一个 factKey。",
           },
+          validFrom: {
+            type: "string",
+            required: false,
+            description:
+              "可选：这条事实从什么时候开始成立（ISO 日期如 2024-01-01，或 epoch 毫秒）。不传按写入时间算；补记旧事时传它，别让旧事变成“现在”。",
+          },
+          observedAt: {
+            type: "string",
+            required: false,
+            description:
+              "可选：你是什么时候知道这件事的（ISO 日期或 epoch 毫秒）。和 validFrom 分开：事情何时成立、系统何时知道，不是一回事。",
+          },
+          candidate: {
+            type: "boolean",
+            required: false,
+            description:
+              "可选：证据不足、还不确定的事实时传 true。候选会留在原文里，但默认不注入、不当成既定事实；显式搜索才能看到。",
+          },
         },
         output: {
           schema: {
@@ -2243,6 +2668,7 @@ export function apply(
             properties: {
               ok: { type: "boolean" },
               id: { type: "string" },
+              warning: { type: "string" },
               error: { type: "string" },
             },
           },
@@ -2282,6 +2708,37 @@ export function apply(
             };
           }
           try {
+            const factKey =
+              typeof (args as { factKey?: unknown })?.factKey === "string" &&
+              ((args as { factKey: string }).factKey as string).length > 0
+                ? (args as { factKey: string }).factKey
+                : undefined;
+            const supersedes =
+              typeof (args as { supersedes?: unknown })?.supersedes ===
+                "string" &&
+              ((args as { supersedes: string }).supersedes as string).length > 0
+                ? (args as { supersedes: string }).supersedes
+                : undefined;
+            const validFrom = parseTimeArg(
+              (args as { validFrom?: unknown } | undefined)?.validFrom,
+            );
+            const observedAt = parseTimeArg(
+              (args as { observedAt?: unknown } | undefined)?.observedAt,
+            );
+            const candidate =
+              (args as { candidate?: unknown } | undefined)?.candidate ===
+              true;
+            // 终版 WP4: a nudge, not a verdict — the model decides
+            // what is a fact. A missing factKey is recorded, but the
+            // reply says the old and new statements may both recall.
+            const looksLikeFact =
+              factKey === undefined &&
+              /我(住|住在|是|在|喜欢|爱|已经|搬|养|叫|的[^，。]{0,12}是)/.test(
+                text,
+              );
+            const warning = looksLikeFact
+              ? "这条像事实，但没带 factKey：以后新旧说法可能同时被召回、互相矛盾。事实类记忆请带 factKey（同一件事用同一个）。"
+              : undefined;
             const entry = core.record({
               role: "user",
               text,
@@ -2300,19 +2757,17 @@ export function apply(
               // 0.5.1 item 1: fact version chain — an explicit
               // identity + supersedes link; core.record validates
               // the target exists and shares the factKey.
-              ...(typeof (args as { factKey?: unknown }).factKey === "string" &&
-              ((args as { factKey: string }).factKey as string).length > 0
-                ? { factKey: (args as { factKey: string }).factKey as string }
-                : {}),
-              ...(typeof (args as { supersedes?: unknown }).supersedes === "string" &&
-              ((args as { supersedes: string }).supersedes as string).length > 0
-                ? { supersedes: (args as { supersedes: string }).supersedes as string }
-                : {}),
+              ...(factKey !== undefined ? { factKey } : {}),
+              ...(supersedes !== undefined ? { supersedes } : {}),
+              // 终版 WP4: two clocks + candidate flag.
+              ...(validFrom !== undefined ? { validFrom } : {}),
+              ...(observedAt !== undefined ? { observedAt } : {}),
+              ...(candidate ? { candidate: true } : {}),
             });
             // 0.5.1 item 2: append the new vector when semantic is
             // on — fire-and-forget, never blocks the reply.
             void core.semanticUpsertEntry(entry);
-            return { ok: true, id: entry.id };
+            return { ok: true, id: entry.id, ...(warning ? { warning } : {}) };
           } catch (err) {
             return {
               ok: false,
@@ -2740,6 +3195,14 @@ export function apply(
               pendingForgets: { type: "number" },
               // 0.5.1 item 2: semantic index state.
               semantic: { type: "object", additionalProperties: true },
+              // 终版 WP0: where memory actually lives, whether
+              // MEMORY.md is there, and any split-brain warning.
+              dataDir: { type: "string" },
+              memoryFilePresent: { type: "boolean" },
+              writeBlocked: { type: "boolean" },
+              warning: { type: "string" },
+              // 终版 WP1: persona / task / greeting entry counts.
+              kinds: { type: "object", additionalProperties: true },
               error: { type: "string" },
             },
           },
@@ -2762,6 +3225,10 @@ export function apply(
                 .filter((r) => r.status === "pending" || r.status === "approved")
                 .length,
               semantic: core.semanticStatus(),
+              dataDir,
+              memoryFilePresent: existsSync(join(dataDir, "MEMORY.md")),
+              writeBlocked,
+              warning: dataDirWarning,
             };
           } catch (err) {
             return {
@@ -3193,7 +3660,7 @@ export function apply(
         // loads on demand (same as memory_feedback).
         deferLoading: true,
         description:
-          "反思触发器：先问 24 小时里有没有攒够值得反思的新对话，再由你自己决定要不要反思。两种用法：① 只传 {} 查一下——24 小时内新记忆的重要性总和不到防打扰下限（5 分）时返回 {triggered: false}，这时不要反思；高于下限时返回 {triggered: true, text: 反思提示词}，提示词里是最近 24 小时的原文，你自己判断有没有新发现、要不要反思、反思出什么结论，代码不拦你；② 决定反思后，再调一次 memory_reflect，把结论（text，一句就行）和来源 id（sourceIds）传回来保存：来源必须是提示词里给的那几条原文的 id，拿提示词之外的条目当来源会被拒绝；结论里引用的每一句话都要用「」括起来、从原文逐字抄，不能改写，引不上原文的整条作废、不保存；结论自己的新词不用和原文一字不差，那是你看出来的新东西。保存成功返回 {triggered: true, reflectionId, text}。只在人设窗口可用。",
+          "反思触发器：先问 24 小时里有没有新的 persona 记忆，再由你自己决定要不要反思。两种用法：① 只传 {} 查一下——24 小时内没有新的 persona 记忆时返回 {triggered: false}，这时不用反思；有则返回 {triggered: true, text: 反思提示词}，提示词里是最近 24 小时的原文，你自己判断有没有新发现、要不要反思、反思出什么结论，代码不拦你；② 决定反思后，再调一次 memory_reflect，把结论（text，一句就行）和来源 id（sourceIds）传回来保存：来源必须是提示词里给的那几条原文的 id，拿提示词之外的条目当来源会被拒绝；结论里引用的每一句话都要用「」括起来、从原文逐字抄，不能改写，引不上原文的整条作废、不保存；结论自己的新词不用和原文一字不差，那是你看出来的新东西。保存成功返回 {triggered: true, reflectionId, text}。只在人设窗口可用。",
         parameters: {
           text: {
             type: "string",
@@ -3263,7 +3730,7 @@ export function apply(
                   ok: false,
                   triggered: false,
                   error:
-                    "24 小时内新记忆还不够（没到防打扰下限），这次不反思、不保存。",
+                    "24 小时内没有新的 persona 记忆，这次不反思、不保存。",
                 };
               }
               allowed = new Set(check.sourceIds ?? []);
@@ -3374,16 +3841,11 @@ export function apply(
         },
         output: {
           schema: {
+            // 0.5.5-real-dsh fix: gate replies carry action: null,
+            // so a closed object property would reject them. The
+            // whole output is a free object on purpose.
             type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              action: { type: "object", additionalProperties: true },
-              prompt: { type: "string" },
-              promptToken: { type: "string" },
-              text: { type: "string" },
-              reason: { type: "string" },
-              error: { type: "string" },
-            },
+            additionalProperties: true,
           },
           render: (_args: unknown, value: unknown) => [
             { type: "text", text: JSON.stringify(value) },

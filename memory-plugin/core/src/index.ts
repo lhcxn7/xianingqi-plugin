@@ -146,12 +146,14 @@ export type { AdminServerHandle, AdminServerOptions } from "./admin-server.ts";
 // person; formatProfileBlock additionally prefers profile.*
 // field by field when both are present.
 export {
+  PROFILE_CATEGORIES,
   PROFILE_FILE,
   loadProfile,
   mergeProfile,
   saveProfile,
 } from "./profile.ts";
 export type { PersonaProfile } from "./profile.ts";
+export type { ProfileCategory, ProfileItem } from "./types.ts";
 export { estimateTokens, tokenize } from "./tokenize.ts";
 export {
   ageDays,

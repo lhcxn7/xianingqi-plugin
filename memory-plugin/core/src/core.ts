@@ -54,6 +54,8 @@ import {
 import { join } from "node:path";
 import { atomicWriteText, cleanTempLeftovers, ensureDir } from "./atomic.ts";
 import { AttributeStore, initialSignificance } from "./attributes.ts";
+import { appendForgetLedger, deletedIdsFromLedger } from "./forget-ledger.ts";
+import { scanPattern, type PurgeResult } from "./purge.ts";
 import { BeliefStore } from "./beliefs.ts";
 import type {
   BeliefAdjustResult,
@@ -131,6 +133,7 @@ import {
 } from "./snapshot.ts";
 import {
   SEMANTIC_DEFAULT_MAX_CANDIDATES,
+  SEMANTIC_DEFAULT_MAX_ENTRIES,
   SEMANTIC_DEFAULT_MIN_SIMILARITY,
   SEMANTIC_DEFAULT_TIMEOUT_MS,
   SEMANTIC_DIMENSIONS,
@@ -143,6 +146,8 @@ import {
   TransformersEmbeddingProvider,
   buildSemanticIndex,
   findBundledModelDir,
+  hasTransformersRuntime,
+  selectSemanticEntriesForIndex,
   type SemanticIndexLoadStatus,
 } from "./semantic.ts";
 import {
@@ -191,6 +196,8 @@ export interface RecordInput {
   role: Role;
   text: string;
   window?: WindowKind;
+  /** 终版 WP1: content kind (see MemoryEntry.kind). Absent = persona. */
+  kind?: "persona" | "task" | "greeting";
   importance?: Importance;
   sessionId?: string;
   /** Epoch ms. Defaults to now. Tests pass explicit old timestamps. */
@@ -205,6 +212,12 @@ export interface RecordInput {
    *  replaces. Must reference an existing entry with the same
    *  factKey, else record() throws. */
   supersedes?: string;
+  /** 终版 WP4: epoch ms when the fact became true (absent = ts). */
+  validFrom?: number;
+  /** 终版 WP4: epoch ms when it was learned (absent = ts). */
+  observedAt?: number;
+  /** 终版 WP4: insufficient evidence; not injected by default. */
+  candidate?: boolean;
 }
 
 /** 0.5.0 step 4: what the user said about a recalled memory. */
@@ -263,6 +276,7 @@ export class MemoryCore {
     runtimeDir: string;
     timeoutMs: number;
     maxCandidates: number;
+    maxEntries: number;
     minSimilarity: number;
   };
   /** 0.2.0: entryId -> compressed one-line summary (review). */
@@ -340,24 +354,38 @@ export class MemoryCore {
     );
     const explicitModelDir = opts.semanticRecall?.modelDir;
     const bundledModelDir = findBundledModelDir();
+    // 0.5.4: no manual copy. Prefer a model the user placed in the
+    // data dir, otherwise use the copy shipped inside the plugin.
+    const modelDir =
+      explicitModelDir ??
+      (existsSync(join(dataModelDir, "config.json"))
+        ? dataModelDir
+        : (bundledModelDir ?? dataModelDir));
+    const runtimeDir = opts.semanticRecall?.runtimeDir ?? opts.dataDir;
+    // 终版 WP9: auto-enable semantic when the runtime AND the model
+    // are both present. An explicit semanticRecall.enabled always
+    // wins; autoEnable:false restores the old default-off behaviour.
+    const explicitEnabled = opts.semanticRecall?.enabled;
+    const autoEnable = opts.semanticRecall?.autoEnable !== false;
+    const runtimePresent = hasTransformersRuntime(runtimeDir);
+    const modelPresent = existsSync(join(modelDir, "config.json"));
+    const enabled =
+      explicitEnabled ??
+      (autoEnable && runtimePresent && modelPresent);
     this.semanticConfig = {
-      enabled: opts.semanticRecall?.enabled ?? false,
+      enabled,
       modelId: opts.semanticRecall?.modelId ?? SEMANTIC_MODEL_ID,
-      // 0.5.4: no manual copy. Prefer a model the user placed in the
-      // data dir, otherwise use the copy shipped inside the plugin.
-      modelDir:
-        explicitModelDir ??
-        (existsSync(join(dataModelDir, "config.json"))
-          ? dataModelDir
-          : (bundledModelDir ?? dataModelDir)),
+      modelDir,
       modelRevision:
         opts.semanticRecall?.modelRevision ?? SEMANTIC_MODEL_REVISION,
-      runtimeDir: opts.semanticRecall?.runtimeDir ?? opts.dataDir,
+      runtimeDir,
       timeoutMs:
         opts.semanticRecall?.timeoutMs ?? SEMANTIC_DEFAULT_TIMEOUT_MS,
       maxCandidates:
         opts.semanticRecall?.maxCandidates ??
         SEMANTIC_DEFAULT_MAX_CANDIDATES,
+      maxEntries:
+        opts.semanticRecall?.maxEntries ?? SEMANTIC_DEFAULT_MAX_ENTRIES,
       minSimilarity:
         opts.semanticRecall?.minSimilarity ??
         SEMANTIC_DEFAULT_MIN_SIMILARITY,
@@ -426,6 +454,8 @@ export class MemoryCore {
     // wrote the journal but never reached "committed" (crash / power
     // loss / kill), roll the whole plugin state back to the safety
     // snapshot taken just before the delete.
+    // 终版 WP3: a restore is the same shape — recover it first.
+    this.recoverRestoreJournal();
     this.recoverForgetJournal();
     // Audit m13: a directory with no MEMORY.md and no records at all
     // is usually a misconfigured dataDir (a one-letter env-var typo)
@@ -473,6 +503,47 @@ export class MemoryCore {
     }
   }
 
+  /** 终版 WP3: finish/rollback an interrupted restore. The journal is
+   *  written after the safety snapshot exists and before the first
+   *  rebuild; a crash anywhere after that is rolled back to safety on
+   *  the next start. A "rolled-back"/"committed" journal is evidence
+   *  only and is removed. */
+  private recoverRestoreJournal(): void {
+    const file = join(this.dataDir, "restore-journal.json");
+    if (!existsSync(file)) return;
+    try {
+      const j = JSON.parse(readFileSync(file, "utf8")) as {
+        status?: unknown;
+        safety?: unknown;
+        error?: unknown;
+      };
+      if (j.status === "committed" || j.status === "rolled-back") {
+        rmSync(file, { force: true });
+        return;
+      }
+      if (
+        typeof j.safety === "string" &&
+        existsSync(join(this.dataDir, ".snapshots", j.safety))
+      ) {
+        restoreSnapshot(this.dataDir, j.safety);
+        this.lastSeenFingerprints = null;
+        this.refreshIfStale();
+        console.warn(
+          `[memory-plugin] 检测到未完成的恢复，已从安全快照 ${j.safety} 回滚到一致状态。`,
+        );
+        rmSync(file, { force: true });
+      } else {
+        console.warn(
+          "[memory-plugin] 检测到未完成的恢复，但找不到安全快照，journal 保留，请手工检查。",
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[memory-plugin] restore-journal.json 无法读取：${err instanceof Error ? err.message : String(err)}；journal 保留，请手工检查。`,
+      );
+    }
+  }
+
   /** 0.5.3: finish/rollback an interrupted forget-delete.
    *  The journal is written before the first mutation and removed
    *  after the last one. A journal still present at startup means
@@ -488,7 +559,11 @@ export class MemoryCore {
         snapshot?: unknown;
         requestId?: unknown;
         status?: unknown;
+        ids?: unknown;
       };
+      const journalIds = Array.isArray(j.ids)
+        ? j.ids.filter((x): x is string => typeof x === "string")
+        : [];
       if (j.status === "committed") {
         resolved = true;
         return;
@@ -501,6 +576,22 @@ export class MemoryCore {
         this.lastSeenFingerprints = null;
         this.refreshIfStale();
         this.revalidateReferences();
+        // 终版 WP2: the delete is being undone. Cancel its ledger
+        // entry so a later restore does not re-delete the entries
+        // the rollback just brought back.
+        if (journalIds.length > 0) {
+          try {
+            appendForgetLedger(this.dataDir, {
+              event: "rollback",
+              ids: journalIds,
+              requestId: String(j.requestId ?? ""),
+            });
+          } catch (err) {
+            console.warn(
+              `[memory-plugin] 删除回滚成功，但删除账本的取消记录写入失败（${err instanceof Error ? err.message : String(err)}）；下次恢复旧快照时可能再次删除这几条。`,
+            );
+          }
+        }
         resolved = true;
         console.warn(
           `[memory-plugin] 检测到未完成的删除（${String(j.requestId ?? "?")}），已从删除前快照 ${j.snapshot} 回滚到一致状态。`,
@@ -679,6 +770,25 @@ export class MemoryCore {
     if (input.supersedes !== undefined && typeof input.supersedes !== "string") {
       throw new TypeError("record() supersedes must be an entry id string");
     }
+    if (
+      input.kind !== undefined &&
+      input.kind !== "persona" &&
+      input.kind !== "task" &&
+      input.kind !== "greeting"
+    ) {
+      throw new TypeError(
+        'record() kind must be "persona", "task" or "greeting"',
+      );
+    }
+    for (const field of ["validFrom", "observedAt"] as const) {
+      const value = input[field];
+      if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
+        throw new TypeError(`record() ${field} must be a finite epoch-ms number`);
+      }
+    }
+    if (input.candidate !== undefined && typeof input.candidate !== "boolean") {
+      throw new TypeError("record() candidate must be a boolean");
+    }
     // The write itself (append + in-memory insert + index add +
     // possible rollover) holds the write lock: two processes must
     // never interleave appends or save over each other's index. A
@@ -717,6 +827,7 @@ export class MemoryCore {
         time: formatTime(ts),
         role: input.role,
         window: input.window ?? "persona",
+        ...(input.kind !== undefined ? { kind: input.kind } : {}),
         sessionId: input.sessionId ?? "",
         importance: input.importance ?? "light",
         text: input.text,
@@ -725,6 +836,13 @@ export class MemoryCore {
         ...(input.supersedes !== undefined
           ? { supersedes: input.supersedes }
           : {}),
+        ...(input.validFrom !== undefined
+          ? { validFrom: input.validFrom }
+          : {}),
+        ...(input.observedAt !== undefined
+          ? { observedAt: input.observedAt }
+          : {}),
+        ...(input.candidate === true ? { candidate: true } : {}),
       };
       new AppendLog(join(this.dataDir, LOG_FILE)).append(entry);
       // Insert in ts order (binary search) instead of re-sorting the
@@ -790,6 +908,14 @@ export class MemoryCore {
       /** 0.5.0 step 5: optional semantic provider slot (interface
        *  only; no embedding ships). */
       semantic?: SemanticRetriever;
+      /** 终版 WP1: explicit search may include task-window entries.
+       *  Default false; greeting is still never recalled. */
+      includeWork?: boolean;
+      /** 终版 WP4: explicit search may include unverified candidates.
+       *  Default false; auto-injection never does. */
+      includeCandidates?: boolean;
+      /** 终版 WP5: how many hits the valve keeps (1..10, default 8). */
+      valveTop?: number;
     } = {},
   ): RecallResult {
     // A non-string query (a bad tool call) returns empty, never
@@ -1045,6 +1171,132 @@ export class MemoryCore {
     });
   }
 
+  /** 终版 WP2: physically remove entries from every derived store.
+   *  Shared by forget-delete, ledger replay and purge. The caller
+   *  holds the write lock and has refreshed the in-memory state. */
+  private removeEntriesEverywhere(ids: string[]): string[] {
+    const existing = [...new Set(ids)].filter((id) =>
+      this.entries.some((e) => e.id === id),
+    );
+    if (existing.length === 0) return [];
+    const doomed = new Set(existing);
+    for (const file of this.logFiles()) {
+      const kept = new AppendLog(file)
+        .readAll()
+        .filter((e) => !doomed.has(e.id));
+      new AppendLog(file).rewrite(kept);
+    }
+    this.entries = this.entries.filter((e) => !doomed.has(e.id));
+    this.counter = this.entries.length;
+    this.currentLogCount = this.currentLogEntries().length;
+    this.index.build(this.entries);
+    this.index.save(this.logFiles());
+    this.graph.removeEntries(existing);
+    this.graph.save();
+    this.attrs.removeEntries(existing);
+    this.attrs.save();
+    this.fragments.removeEntries(existing);
+    this.fragments.save();
+    this.beliefs.removeEntries(existing);
+    this.beliefs.save();
+    // 0.5.3 (P1-13): compressed summary rows are keyed by entryId;
+    // a deleted entry must not survive in summary-YYYY-MM.jsonl.
+    this.purgeSummaries(existing);
+    this.semanticRemoveIds(existing);
+    // A deleted entry is gone, not hidden — drop its tombstone
+    // if an earlier hide put one there.
+    this.forget.untombstone(existing);
+    this.rebuildSessionLinks();
+    this.revalidateReferences();
+    this.lastSeenFingerprints = this.snapshotFingerprints();
+    return existing;
+  }
+
+  /** 终版 WP2: remove a literal fragment from every plugin-owned
+   *  copy. Dry-run unless the caller sets dryRun:false. Snapshots
+   *  that contain the fragment are deleted whole; a skill-owned
+   *  MEMORY.md/archive is only reported, never rewritten. */
+  purgeByPattern(
+    pattern: string,
+    opts: { dryRun?: boolean; by?: string; includeSnapshots?: boolean } = {},
+  ): PurgeResult {
+    const needle = typeof pattern === "string" ? pattern : "";
+    if (needle.trim().length < 4) {
+      throw new TypeError("purge pattern must be at least 4 characters");
+    }
+    const dryRun = opts.dryRun !== false;
+    const includeSnapshots = opts.includeSnapshots !== false;
+    if (dryRun) {
+      const scan = scanPattern(
+        this.dataDir,
+        this.entries,
+        needle,
+        includeSnapshots,
+      );
+      return {
+        ok: true,
+        dryRun: true,
+        patternLength: needle.length,
+        matches: scan.matches,
+        snapshots: scan.snapshots,
+        snapshotsRemoved: [],
+        externalFiles: scan.externalFiles,
+        removed: 0,
+      };
+    }
+    return this.withWriteLock(() => {
+      this.refreshIfStale();
+      const scan = scanPattern(
+        this.dataDir,
+        this.entries,
+        needle,
+        includeSnapshots,
+      );
+      const ids = [...new Set(scan.matches.map((m) => m.id))];
+      if (ids.length > 0) {
+        appendForgetLedger(this.dataDir, {
+          event: "delete",
+          ids,
+          by: `purge:${opts.by ?? "cli"}`,
+        });
+      }
+      const removed = this.removeEntriesEverywhere(ids);
+      const snapshotsRemoved: string[] = [];
+      for (const name of scan.snapshots) {
+        try {
+          rmSync(join(this.dataDir, ".snapshots", name), {
+            recursive: true,
+            force: true,
+          });
+          snapshotsRemoved.push(name);
+        } catch {
+          // A snapshot that cannot be removed is still a residue;
+          // leave it in the result so the operator sees it.
+        }
+      }
+      // Derived view from the old text must be regenerated, never
+      // left as a copy of the purged words.
+      this.generateStarmap();
+      this.forget.auditRaw("purge", {
+        by: opts.by ?? "cli",
+        patternLength: needle.length,
+        matches: removed.length,
+        snapshotsRemoved,
+        externalFiles: scan.externalFiles,
+      });
+      return {
+        ok: true,
+        dryRun: false,
+        patternLength: needle.length,
+        matches: scan.matches,
+        snapshots: scan.snapshots,
+        snapshotsRemoved,
+        externalFiles: scan.externalFiles,
+        removed: removed.length,
+      };
+    });
+  }
+
   /** Execute an approved request. Hide tombstones the ids;
    *  delete physically removes them (snapshot first). Refuses
    *  unless the request is approved, unexpired, and approved on
@@ -1099,6 +1351,8 @@ export class MemoryCore {
       return this.withWriteLock(() => {
         this.refreshIfStale();
         this.forget.tombstone(existing, "hide", id);
+        // 终版 WP8: a hidden memory must not stay in the vector index.
+        this.semanticRemoveIds(existing);
         this.rebuildSessionLinks();
         this.revalidateReferences();
         const done = this.forget.markExecuted(id, input.by);
@@ -1128,37 +1382,16 @@ export class MemoryCore {
     );
     const removed = this.withWriteLock(() => {
       this.refreshIfStale();
-      const doomed = new Set(existing);
-      for (const file of this.logFiles()) {
-        const kept = new AppendLog(file)
-          .readAll()
-          .filter((e) => !doomed.has(e.id));
-        new AppendLog(file).rewrite(kept);
-      }
-      this.entries = this.entries.filter((e) => !doomed.has(e.id));
-      this.counter = this.entries.length;
-      this.currentLogCount = this.currentLogEntries().length;
-      this.index.build(this.entries);
-      this.index.save(this.logFiles());
-      this.graph.removeEntries(existing);
-      this.graph.save();
-      this.attrs.removeEntries(existing);
-      this.attrs.save();
-      this.fragments.removeEntries(existing);
-      this.fragments.save();
-      this.beliefs.removeEntries(existing);
-      this.beliefs.save();
-      // 0.5.3 (P1-13): compressed summary rows are keyed by entryId;
-      // a deleted entry must not survive in summary-YYYY-MM.jsonl.
-      this.purgeSummaries(existing);
-      this.semanticRemoveIds(existing);
-      // A deleted entry is gone, not hidden — drop its tombstone
-      // if an earlier hide put one there.
-      this.forget.untombstone(existing);
-      this.rebuildSessionLinks();
-      this.revalidateReferences();
-      this.lastSeenFingerprints = this.snapshotFingerprints();
-      return existing;
+      // 终版 WP2: record the delete before mutating, so a later
+      // restore of a pre-delete snapshot replays it. A failed append
+      // aborts the delete (journal stays committing → rolled back).
+      appendForgetLedger(this.dataDir, {
+        event: "delete",
+        ids: existing,
+        requestId: id,
+        by: input.by,
+      });
+      return this.removeEntriesEverywhere(existing);
     });
     const done = this.forget.markExecuted(id, input.by);
     this.forget.auditRaw("forget.deleted.snapshot", {
@@ -1273,9 +1506,24 @@ export class MemoryCore {
    *  the edit. */
   async semanticUpsertEntry(entry: MemoryEntry): Promise<boolean> {
     if (!this.semanticEnabled()) return false;
+    // 终版 WP8: only persona chat entries become vectors.
+    if (
+      !entry ||
+      entry.window !== "persona" ||
+      (entry.kind ?? "persona") !== "persona" ||
+      entry.candidate === true ||
+      this.forget.isForgotten(entry.id)
+    ) {
+      return false;
+    }
     try {
       await this.ensureSemanticIndex();
       if (!this.semanticProvider || !this.semanticIndex) return false;
+      // Over the cap: skip the append; the next rebuild keeps the
+      // top importance × recency and drops the rest.
+      if (this.semanticIndex.size >= this.semanticConfig.maxEntries) {
+        return false;
+      }
       const [v] = await this.semanticProvider.embed([entry.text]);
       this.semanticIndex.upsert(entry.id, v);
       this.semanticIndex.save();
@@ -1300,6 +1548,20 @@ export class MemoryCore {
     return this.semanticConfig.modelDir;
   }
 
+  /** 终版 WP5: load the embedding model now (cold-start prewarm).
+   *  Never throws — a missing model just leaves keyword-only. */
+  async warmSemantic(): Promise<void> {
+    if (!this.semanticEnabled()) return;
+    try {
+      await this.ensureSemanticIndex();
+      if (this.semanticProvider) {
+        await this.semanticProvider.embed(["预热"]);
+      }
+    } catch {
+      // Degrade silently; the per-turn adapter already falls back.
+    }
+  }
+
   semanticStatus(): {
     enabled: boolean;
     modelId: string;
@@ -1308,15 +1570,39 @@ export class MemoryCore {
     modelPresent: boolean;
     indexStatus: SemanticIndexLoadStatus | null;
     indexSize: number;
+    maxEntries: number;
+    dependency: {
+      runtimePresent: boolean;
+      modelPresent: boolean;
+      runtimeDir: string;
+      modelDir: string;
+      installCommand: string;
+      manualHint: string;
+    };
   } {
+    const runtimePresent = hasTransformersRuntime(
+      this.semanticConfig.runtimeDir,
+    );
+    const modelPresent = existsSync(
+      join(this.semanticConfig.modelDir, "config.json"),
+    );
     return {
       enabled: this.semanticEnabled(),
       modelId: this.semanticConfig.modelId,
       modelRevision: this.semanticConfig.modelRevision,
       dimensions: SEMANTIC_DIMENSIONS,
-      modelPresent: existsSync(join(this.semanticConfig.modelDir, "config.json")),
+      modelPresent,
       indexStatus: this.semanticIndexStatus,
       indexSize: this.semanticIndex?.size ?? 0,
+      maxEntries: this.semanticConfig.maxEntries,
+      dependency: {
+        runtimePresent,
+        modelPresent,
+        runtimeDir: this.semanticConfig.runtimeDir,
+        modelDir: this.semanticConfig.modelDir,
+        installCommand: `node core/src/admin-cli.ts --dataDir "${this.dataDir}" semantic install --yes`,
+        manualHint: `离线时手动把 @huggingface/transformers 拷到 "${this.semanticConfig.runtimeDir}/node_modules/@huggingface/transformers"，或运行 npm install --prefix "${this.semanticConfig.runtimeDir}" --no-save --no-audit --no-fund @huggingface/transformers@3.8.1`,
+      },
     };
   }
 
@@ -1356,7 +1642,17 @@ export class MemoryCore {
     const status = this.semanticIndex.load();
     this.semanticIndexStatus = status;
     if (opts.rebuild || status === "discarded-mismatch" || status === "discarded-corrupt" || status === "empty") {
-      const live = this.entries.filter((e) => !this.forget.isForgotten(e.id));
+      // 终版 WP8: only persona chat entries, capped by
+      // importance × recency; task/greeting/candidate/hidden never
+      // become vectors.
+      const live = selectSemanticEntriesForIndex(this.entries, {
+        significanceOf: (e) =>
+          this.attrs.get(e.id)?.significance ??
+          (e.importance === "heavy" ? 0.9 : 0.4),
+        maxEntries: this.semanticConfig.maxEntries,
+        now: Date.now(),
+        isForgotten: (id) => this.forget.isForgotten(id),
+      });
       const built = await buildSemanticIndex(
         this.semanticProvider,
         this.semanticIndex,
@@ -1585,6 +1881,9 @@ export class MemoryCore {
       }
       const res = this.attrs.invalidate(invalidated, at);
       this.attrs.save();
+      // 终版 WP8: an invalidated memory must not stay in the vector
+      // index (it no longer recalls, so it must not be a semantic hit).
+      this.semanticRemoveIds(res.invalidated);
       if (this.graph.invalidate(res.invalidated, at) > 0) {
         this.graph.save();
       }
@@ -2268,7 +2567,19 @@ export class MemoryCore {
     return this.withWriteLock(() => {
       this.refreshIfStale();
       const previous = loadProfile(this.dataDir) ?? {};
-      const next: PersonaProfile = { ...previous, ...profile, updatedAt: at };
+      const next: PersonaProfile = {
+        ...previous,
+        ...profile,
+        ...(profile.categories !== undefined
+          ? {
+              categories: {
+                ...(previous.categories ?? {}),
+                ...profile.categories,
+              },
+            }
+          : {}),
+        updatedAt: at,
+      };
       saveProfile(this.dataDir, next);
       return next;
     });
@@ -2392,25 +2703,90 @@ export class MemoryCore {
     // would be lost without a trace.
     return this.withWriteLock(() => {
       const safety = restoreSnapshot(this.dataDir, name);
-      this.entries = this.loadAllLogEntries();
-      this.counter = this.entries.length;
-      this.currentLogCount = this.currentLogEntries().length;
-      this.rebuildIndex();
-      // 0.5.2: derived state must not survive a rollback. The semantic
-      // index is dropped (rebuilt lazily from the restored log), any
-      // pending reflection gate is invalid, and the starmap is
-      // regenerated from the restored entries.
-      this.semanticIndex = null;
-      this.semanticIndexStatus = null;
-      this.lastReflectionGateSourceIds = null;
-      // 0.5.4: experiences/goals were restored with the log; drop any
-      // source id that is not live at this restored point in time.
-      this.revalidateReferences();
-      this.generateStarmap();
-      // (rebuildIndex -> refreshIfStale already reloads the 0.2.0
-      // graph, attributes, summaries and session map, since the
-      // restored log files moved the fingerprints.)
-      return safety;
+      // 终版 WP3: journal the restore. A crash after the snapshot
+      // was copied but before verification leaves this file; the
+      // next constructor rolls back to `safety`.
+      const journalFile = join(this.dataDir, "restore-journal.json");
+      atomicWriteText(
+        journalFile,
+        JSON.stringify(
+          { snapshot: name, safety, status: "committing" },
+          null,
+          2,
+        ),
+      );
+      try {
+        this.lastSeenFingerprints = null;
+        this.entries = this.loadAllLogEntries();
+        this.counter = this.entries.length;
+        this.currentLogCount = this.currentLogEntries().length;
+        // Reload the stores that were just copied, then rebuild the
+        // derived ones from the log.
+        this.refreshIfStale();
+        this.rebuildDerivedFromLog();
+        // 终版 WP2: a snapshot may predate a physical delete. Replay
+        // the delete ledger so restoring an old restore point can
+        // never resurrect words the user already removed.
+        const ledgerDeleted = deletedIdsFromLedger(this.dataDir);
+        if (ledgerDeleted.size > 0) {
+          this.removeEntriesEverywhere([...ledgerDeleted]);
+        }
+        const issues = this.verifyRestoredState();
+        if (issues.length > 0) {
+          throw new Error(`恢复校验失败：${issues.slice(0, 5).join("；")}`);
+        }
+        // 0.5.2: derived state must not survive a rollback. The
+        // semantic index is dropped (rebuilt lazily from the restored
+        // log), any pending reflection gate is invalid, and the
+        // starmap is regenerated from the restored entries.
+        this.semanticIndex = null;
+        this.semanticIndexStatus = null;
+        this.lastReflectionGateSourceIds = null;
+        // 0.5.4: experiences/goals were restored with the log; drop
+        // any source id that is not live at this restored point.
+        this.revalidateReferences();
+        this.generateStarmap();
+        atomicWriteText(
+          journalFile,
+          JSON.stringify({ snapshot: name, safety, status: "committed" }),
+        );
+        rmSync(journalFile, { force: true });
+        return safety;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Roll back to the safety snapshot so a failed restore never
+        // leaves a half-rebuilt state. Keep the journal as evidence.
+        try {
+          restoreSnapshot(this.dataDir, safety);
+          this.lastSeenFingerprints = null;
+          this.refreshIfStale();
+        } catch (rollbackErr) {
+          console.warn(
+            `[memory-plugin] 恢复失败后回滚安全快照也失败（${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}）。`,
+          );
+        }
+        try {
+          atomicWriteText(
+            journalFile,
+            JSON.stringify(
+              {
+                snapshot: name,
+                safety,
+                status: "rolled-back",
+                error: message.slice(0, 300),
+              },
+              null,
+              2,
+            ),
+          );
+        } catch {
+          // The rollback already happened; a missing journal is not
+          // worse than the original failure.
+        }
+        throw new Error(
+          `恢复失败，已回滚到安全快照 ${safety}：${message}`,
+        );
+      }
     });
   }
 
@@ -2420,6 +2796,99 @@ export class MemoryCore {
       this.index.build(this.entries);
       this.index.save(this.logFiles());
     });
+  }
+
+  /** 终版 WP3: rebuild every derived store from the loaded log and
+   *  drop refs to entries that are no longer live. Fragments are
+   *  dropped when ANY source is gone (a partially-cited fragment can
+   *  no longer prove its quotes); beliefs strip dead evidence. */
+  private rebuildDerivedFromLog(): void {
+    const ids = new Set(this.entries.map((e) => e.id));
+    // Graph: an edge endpoint without a live entry is a ghost.
+    const deadGraph = new Set<string>();
+    for (const edge of this.graph.allEdges()) {
+      if (!ids.has(edge.from)) deadGraph.add(edge.from);
+      if (!ids.has(edge.to)) deadGraph.add(edge.to);
+    }
+    if (deadGraph.size > 0) {
+      this.graph.removeEntries([...deadGraph]);
+      this.graph.save();
+    }
+    // Attributes: keep rows for live entries, ensure the rest exist.
+    const deadAttrs = [...this.attrs.all().keys()].filter(
+      (id) => !ids.has(id),
+    );
+    if (deadAttrs.length > 0) this.attrs.removeEntries(deadAttrs);
+    const now = Date.now();
+    for (const entry of this.entries) {
+      this.attrs.ensure(entry, undefined, now);
+    }
+    this.attrs.save();
+    // Fragments: any dead source invalidates the whole fragment.
+    if (this.fragments.pruneTo(ids).length > 0) this.fragments.save();
+    // Beliefs: strip evidence that points at a dead entry.
+    const deadEvidence = new Set<string>();
+    for (const belief of this.beliefs.all()) {
+      for (const item of belief.evidence) {
+        if (!ids.has(item.entryId)) deadEvidence.add(item.entryId);
+      }
+    }
+    if (deadEvidence.size > 0) {
+      this.beliefs.removeEntries([...deadEvidence]);
+      this.beliefs.save();
+    }
+    // Summaries: drop rows for dead entries, then reload the cache.
+    const deadSummaries = [...this.summaries.keys()].filter(
+      (id) => !ids.has(id),
+    );
+    this.purgeSummaries(deadSummaries);
+    this.summaries = loadSummaries(this.dataDir);
+    // Keyword index: rebuilt from the live entries only.
+    this.index.build(this.entries);
+    this.index.save(this.logFiles());
+  }
+
+  /** 终版 WP3: prove the restored state is internally consistent.
+   *  Returns human-readable issues; empty = good. */
+  private verifyRestoredState(): string[] {
+    const issues: string[] = [];
+    const ids = new Set(this.entries.map((e) => e.id));
+    for (const edge of this.graph.allEdges()) {
+      if (!ids.has(edge.from)) issues.push(`图边起点 ${edge.from} 不在日志里`);
+      if (!ids.has(edge.to)) issues.push(`图边终点 ${edge.to} 不在日志里`);
+    }
+    for (const id of this.attrs.all().keys()) {
+      if (!ids.has(id)) issues.push(`属性行 ${id} 不在日志里`);
+    }
+    for (const fragment of this.fragments.all()) {
+      for (const sourceId of fragment.sourceIds) {
+        if (!ids.has(sourceId)) {
+          issues.push(`片段 ${fragment.id} 的来源 ${sourceId} 不在日志里`);
+        }
+      }
+    }
+    for (const belief of this.beliefs.all()) {
+      for (const item of belief.evidence) {
+        if (!ids.has(item.entryId)) {
+          issues.push(`信念 ${belief.id} 的证据 ${item.entryId} 不在日志里`);
+        }
+      }
+    }
+    for (const id of this.summaries.keys()) {
+      if (!ids.has(id)) issues.push(`摘要 ${id} 不在日志里`);
+    }
+    // Torn/duplicate log lines are the other inconsistency: the
+    // loader dedupes and skips, so compare raw row count.
+    let rawRows = 0;
+    for (const file of this.logFiles()) {
+      rawRows += new AppendLog(file).readAll().length;
+    }
+    if (rawRows !== this.entries.length) {
+      issues.push(
+        `日志原始行 ${rawRows} 条，去重后 ${this.entries.length} 条（有重复或残缺行）`,
+      );
+    }
+    return issues;
   }
 
   /** Session end: snapshot, then roll the log over if it is past the
@@ -2474,7 +2943,10 @@ export class MemoryCore {
         // used to be decayed/compressed/backfilled alongside persona
         // entries.
         entries: this.entries.filter(
-          (e) => e.window === "persona" && !this.forget.isForgotten(e.id),
+          (e) =>
+            e.window === "persona" &&
+            (e.kind ?? "persona") === "persona" &&
+            !this.forget.isForgotten(e.id),
         ),
         graph: this.graph,
         attrs: this.attrs,
@@ -2504,7 +2976,12 @@ export class MemoryCore {
     const data = buildStarmapData(
       // 0.5.2: the starmap is a persona-facing view; hidden entries
       // are not drawn unless the admin explicitly asks for them.
-      this.entries.filter((e) => !this.forget.isForgotten(e.id)),
+      // 终版 WP1: work-turn and greeting entries never become stars.
+      this.entries.filter(
+        (e) =>
+          !this.forget.isForgotten(e.id) &&
+          (e.kind ?? "persona") === "persona",
+      ),
       this.graph.allEdges(),
       this.attrs.all(),
       Date.now(),
@@ -2572,6 +3049,15 @@ export class MemoryCore {
           !(attrs.validTo != null && attrs.validTo <= Date.now())
         );
       }).length,
+      // 终版 WP1: the kind split, so memory_status shows at a glance
+      // whether work content leaked into the persona log.
+      kinds: this.entries.reduce(
+        (acc, e) => {
+          acc[e.kind ?? "persona"] += 1;
+          return acc;
+        },
+        { persona: 0, task: 0, greeting: 0 },
+      ),
     };
   }
 }

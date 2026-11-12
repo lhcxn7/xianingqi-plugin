@@ -10,9 +10,15 @@ recall of older history back into the conversation — so the persona
 remembers things from months ago, mid-conversation, without anyone
 asking her to go look.
 
-- **Local only.** No network calls, no login, no cloud. All memory lives
-  in local files the user can open and read. Verify it in the code:
-  there is no `fetch`, no socket, no credential anywhere in `src/`.
+- **Local by default.** Day-to-day recall, recording, review, purge and
+  the starmap make no network calls, need no login and use no cloud;
+  all memory lives in local files the user can open and read. The one
+  exception is the optional semantic runtime: installing
+  `@huggingface/transformers` needs the network **once**, after the
+  user confirms it. A failed install falls back to keyword-only.
+  Verify the normal path in the code: there is no `fetch`, no socket,
+  no credential in `src/`; the only download is the explicit
+  `semantic install --yes` command (see `core/src/install-runtime.ts`).
 - **Skill stays untouched.** The plugin never writes `MEMORY.md`
   (the model keeps writing the three-layer summaries per the skill)
   and never touches the persona, the tone or the stage. Stage still
@@ -37,7 +43,7 @@ install the `dsh-plugin/` folder alone.
 ### Option A — one line (DSH plugin command)
 
 ```sh
-dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v0.5.1&path:/memory-plugin/dsh-plugin"
+dsh plugin --profile <name> add "github:lhcxn7/xianingqi-plugin#v1.0.0&path:/memory-plugin/dsh-plugin"
 ```
 
 Replace `<name>` with your DSH profile name (often `web` or
@@ -60,13 +66,35 @@ Paste this into your own DSH agent and let it do the work. It installs
 the plugin; you restart DSH by hand afterwards.
 
 > 帮我装一个 DSH 记忆插件：从 GitHub 把 lhcxn7/xianingqi-plugin
-> 这个仓库的 v0.5.1 版装进来（我的 profile 是 <你的 profile 名>）。
+> 这个仓库的 v1.0.0 版装进来（我的 profile 是 <你的 profile 名>）。
 > 插件在仓库的 memory-plugin/dsh-plugin 子目录，core 在 memory-plugin/core 目录，两个目录
 > 必须在一起，装的时候别只拷 dsh-plugin 一个目录。装完告诉我
 > 结果，报错原文发我；装好后我自己重启 DSH。我的记忆数据文件夹
 > 在 <你的记忆数据文件夹路径>，帮我把插件的 dataDir 指到它
 > （插件配置或环境变量 MEMORY_PLUGIN_DATA_DIR），不要用默认路
 > 径，也不要新建空文件夹。
+
+## Semantic runtime (optional, one-time network)
+
+Semantic recall needs `@huggingface/transformers` in the data directory. The
+plugin **never installs it silently**:
+
+```sh
+# 1) see the exact command (no network)
+node core/src/admin-cli.ts --dataDir "<dataDir>" semantic install
+
+# 2) after you confirm, install once (network)
+node core/src/admin-cli.ts --dataDir "<dataDir>" semantic install --yes
+```
+
+- The model files are bundled with the plugin; only the JS runtime is installed.
+- If the runtime and model are present, **semantic auto-enables** on the next
+  start (`semanticRecall.autoEnable`, default true). Set
+  `semanticRecall.enabled: false` to keep it off.
+- Install failure changes nothing: recall stays keyword-only, no retry loop.
+- Offline: copy `@huggingface/transformers` into
+  `<dataDir>/node_modules/@huggingface/transformers`, or run the npm command
+  printed by the dry-run on a machine that has network.
 
 ## Config
 
@@ -84,6 +112,17 @@ config arrives as the **second parameter of `apply(ctx, config)`**.
   persona, set your own trigger words.
 
 ## Verify it works
+
+The 48-case regression eval runs on a temp data dir (no real memory touched):
+
+```sh
+node core/test/eval-048.ts          # human summary
+node core/test/eval-048.ts --json   # machine-readable
+```
+
+It covers extraction 10, cross-session 8, time 8, conflict 8, refusal 6,
+delete residual 4 and task leakage 4; a non-zero exit means at least one
+case failed or one safety rate is above zero.
 
 1. Restart DSH, open a persona window, and make the first message
    contain a trigger word (e.g. 夏柠柒). Chat a few lines.
@@ -121,6 +160,7 @@ memory-plugin/
 
 ## Status
 
+- [x] **1.0.0 (2026-11-11) — 封板版.** WP0 数据目录防分家、WP1 窗口边界（persona/task/greeting + 命令词 + 800 字助手回复规则）、WP2 删除账本 + `purge`、WP3 恢复 journal + 全量重建 + 校验回滚、WP4 `validFrom`/`observedAt`/candidate、WP5 软引导（8 条候选、裁剪留痕、3s 超时、反思去算术门）、WP6 画像 8 类（无敏感分级）、WP7 星图（星海外观不变、面板“她/我”徽标、graph 线、按权重画）、WP8 语义索引 10000 上限 + 删除/隐藏/失效同步、WP9 自动开语义 + `semantic install --yes`、WP10 48 条评测。封板后只修四类 bug。
 - [x] 0.5.5 (2026-11-10) — the three local-only fixes:
       (1) `composeInjection` enforces ONE total token budget across
       profile + hits + belief + experience, trimming experience →

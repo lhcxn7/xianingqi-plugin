@@ -1,9 +1,12 @@
 # @memory-plugin/core
 
-Shared local-file memory engine. Zero runtime dependencies, no network
-calls, no login, no cloud. Runs on Node `^22.19.0 || >=24.0.0` — the
-TypeScript sources use only erasable syntax, so Node runs them directly
-(type stripping); no build step is needed.
+Shared local-file memory engine. Zero runtime dependencies for the core
+engine; day-to-day operations make no network calls, no login, no cloud.
+The optional semantic runtime is installed by an explicit one-time
+`semantic install --yes` (see the root README), never silently. Runs on
+Node `^22.19.0 || >=24.0.0` — the TypeScript sources use only erasable
+syntax, so Node runs them directly (type stripping); no build step is
+needed.
 
 ## Division of labour with the skill (anti-conflict rules, v1)
 

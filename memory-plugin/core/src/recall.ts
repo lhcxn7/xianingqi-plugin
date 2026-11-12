@@ -121,6 +121,19 @@ export interface RecallOptions {
    *  bad rewrite — and the single-char noise filter runs on the
    *  union. Absent = keyword-only, exactly as before. */
   rewrittenQuery?: string;
+  /** 终版 WP1: include work-turn entries (kind "task") in the
+   *  candidate set. Default false — only "persona" content is
+   *  recallable/injectable; an explicit memory_search may opt in.
+   *  "greeting" entries are never recallable. */
+  includeWork?: boolean;
+  /** 终版 WP5: soft-guidance budget — how many candidates the valve
+   *  keeps (default 8, clamped 1..10). The model decides how many to
+   *  actually use; this is not a "top 5" rule. */
+  valveTop?: number;
+  /** 终版 WP4: include unverified candidates. Default false — a
+   *  candidate is not an established fact and must not be injected;
+   *  an explicit memory_search may opt in to see it. */
+  includeCandidates?: boolean;
   /** 0.5.0 step 5: optional semantic provider slot (real
    *  embedding is a separate item; when absent, pure keyword). */
   semantic?: SemanticRetriever;
@@ -356,9 +369,13 @@ export function recallFromEntries(
   const recentTexts = opts.recentTexts ?? [];
   const valveOn = opts.valve ?? opts.limit === undefined;
 
-  const scoped = entries.filter(
-    (e) => window === "all" || e.window === window,
-  );
+  const scoped = entries.filter((e) => {
+    if (window !== "all" && e.window !== window) return false;
+    const kind = e.kind ?? "persona";
+    if (kind === "greeting") return false;
+    if (e.candidate === true && opts.includeCandidates !== true) return false;
+    return opts.includeWork === true || kind === "persona";
+  });
   // 0.4.0 item 1: expired memories never enter the candidate set —
   // they are skipped before scoring, not deleted: the log text
   // stays on disk and stays searchable by hand. Only a stored row
@@ -629,6 +646,7 @@ export function recallFromEntries(
           activation,
           topic: topicOf(matchedTokens, docFreq),
           superseded: isSuperseded(entry, chains) || undefined,
+          candidate: entry.candidate === true || undefined,
           // 0.4.0 item 5: a direct hit walked no edge, so its
           // spotlight sort factor is 1.
           edgeWeight: 1,
@@ -749,6 +767,7 @@ export function recallFromEntries(
           viaGraph: true,
           topic: seed.topic,
           superseded: isSuperseded(other, chains) || undefined,
+        candidate: other.candidate === true || undefined,
           // 0.4.0 item 5: the edge this hit arrived through — the
           // spotlight sort key (activation × edge weight) needs it,
           // and activation alone already folded this weight into
@@ -894,7 +913,7 @@ export function recallFromEntries(
   // estimatedTokens matches what is actually injected.
   let finalHits = hits;
   if (valveOn) {
-    finalHits = applyValveTop(hits);
+    finalHits = applyValveTop(hits, opts.valveTop);
     used = 0;
     for (const h of finalHits) {
       used += estimateTokens(h.displayText ?? h.entry.text) + 8;
@@ -1063,7 +1082,9 @@ export function formatRecallBlock(
   experienceRules?: string[],
 ): string {
   if (hits.length === 0) return "";
-  const parts: string[] = ["相关记忆:"];
+  const parts: string[] = [
+    `相关记忆（以下 ${hits.length} 条是候选，不是必须全用；你自己判断用哪几条、用几条，不必凑满 5 条）：`,
+  ];
   for (const hit of hits) {
     const label =
       hit.entry.source === "archive" ? "归档" : hit.entry.role;
@@ -1132,12 +1153,14 @@ export function composeInjection(
   beliefLine: string | undefined,
   experienceRules: string[] | undefined,
   tokenCap: number,
+  onDrop?: (dropped: RecallHit[]) => void,
 ): string {
   const cap = Math.max(1, Math.floor(tokenCap));
   let profile = profileText ?? "";
   let belief = beliefLine;
   let rules = [...(experienceRules ?? [])];
   let hs = [...hits];
+  const dropped: RecallHit[] = [];
   const make = (): string => {
     const block = hs.length > 0 ? formatRecallBlock(hs, belief, rules) : "";
     return [profile, block].filter((s) => s.length > 0).join("\n");
@@ -1152,6 +1175,7 @@ export function composeInjection(
     text = make();
   }
   while (estimateTokens(text) > cap && hs.length > 0) {
+    dropped.push(hs[hs.length - 1]);
     hs = hs.slice(0, -1);
     text = make();
   }
@@ -1159,6 +1183,7 @@ export function composeInjection(
     profile = "";
     text = make();
   }
+  onDrop?.(dropped);
   if (estimateTokens(text) <= cap || text.length === 0) return text;
   // Binary-search the longest prefix that fits. The last resort
   // only runs when a single profile line alone is over budget.

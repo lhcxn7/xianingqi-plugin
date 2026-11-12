@@ -5,7 +5,10 @@
 // + onnxruntime-node. No Python, no GPU, no resident service, no
 // network at runtime — the model is loaded from a local directory
 // only (env.allowRemoteModels = false), and a missing / corrupt
-// model is "model unavailable", never a silent download.
+// model is "model unavailable", never a silent download. The one
+// network step is installing the optional @huggingface/transformers
+// runtime, and that is an explicit `semantic install --yes` (WP9),
+// never part of a normal turn.
 //
 // Pinned identity (the index is only valid for exactly this):
 //   model repo   Xenova/bge-small-zh-v1.5 (ONNX export of BAAI's)
@@ -29,7 +32,7 @@
 // Default is OFF (semanticRecall.enabled=false): disabled means
 // the model is never loaded, the index is never read, and recall
 // behaves exactly as 0.5.0. When enabled, the plugin awaits the
-// semantic search with a strict timeout (default 2000 ms) and
+// semantic search with a strict timeout (default 3000 ms) and
 // falls back to keyword-only on timeout or any error — recall
 // never breaks on the semantic path.
 
@@ -77,8 +80,61 @@ export const SEMANTIC_INDEX_FILE = "semantic-index.json";
 export const SEMANTIC_INDEX_VERSION = 1;
 /** v3 dtype for the shipped file (see header: no "quantized"). */
 export const SEMANTIC_DTYPE = "int8" as const;
-export const SEMANTIC_DEFAULT_TIMEOUT_MS = 2000;
+export const SEMANTIC_DEFAULT_TIMEOUT_MS = 3000;
 export const SEMANTIC_DEFAULT_MAX_CANDIDATES = 50;
+export const SEMANTIC_DEFAULT_MAX_ENTRIES = 10000;
+
+/** 终版 WP9: is the optional transformers runtime installed? Checks
+ *  `<runtimeDir>/node_modules` first, then the normal import path.
+ *  Never loads the module (no model, no network). */
+export function hasTransformersRuntime(runtimeDir: string | null): boolean {
+  if (runtimeDir) {
+    try {
+      createRequire(join(runtimeDir, "package.json")).resolve(
+        "@huggingface/transformers",
+      );
+      return true;
+    } catch {
+      // Fall through to the package's own resolution.
+    }
+  }
+  try {
+    createRequire(import.meta.url).resolve("@huggingface/transformers");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 终版 WP8: pick which entries get a vector when the index is built.
+ *  Only persona chat entries (never task/greeting/candidate/hidden),
+ *  capped at maxEntries; over the cap, keep the highest
+ *  significance × recency. Pure — the caller supplies significance. */
+export function selectSemanticEntriesForIndex(
+  entries: MemoryEntry[],
+  opts: {
+    significanceOf: (entry: MemoryEntry) => number;
+    maxEntries?: number;
+    now?: number;
+    isForgotten?: (id: string) => boolean;
+  },
+): MemoryEntry[] {
+  const max = Math.max(1, Math.floor(opts.maxEntries ?? SEMANTIC_DEFAULT_MAX_ENTRIES));
+  const now = opts.now ?? Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  const scored: Array<{ entry: MemoryEntry; score: number }> = [];
+  for (const entry of entries) {
+    if (entry.window !== "persona") continue;
+    if ((entry.kind ?? "persona") !== "persona") continue;
+    if (entry.candidate === true) continue;
+    if (opts.isForgotten?.(entry.id) === true) continue;
+    const significance = opts.significanceOf(entry);
+    const recency = Math.exp(-Math.max(0, now - entry.ts) / (30 * day));
+    scored.push({ entry, score: significance * recency });
+  }
+  scored.sort((a, b) => b.score - a.score || b.entry.ts - a.entry.ts);
+  return scored.slice(0, max).map((x) => x.entry);
+}
 /** Similarity floor for semantic candidates (0.5.1 item 2).
  *  Measured on core/test/semantic-benchmark.json (24 queries,
  *  real model): true answers score 0.436–0.802, but the top
@@ -217,10 +273,19 @@ export class TransformersEmbeddingProvider implements EmbeddingProvider {  reado
           );
         }
         const mod = await loadTransformersModule(this.runtimeDir);
+        // createRequire().resolve follows the "require" export
+        // condition, which points at the CJS bundle; import() wraps
+        // it, so env/pipeline sit on `.default`. Use the namespace
+        // when it already exposes env (ESM), else the CJS default.
+        const tf = (
+          (mod as { env?: unknown }).env
+            ? mod
+            : ((mod as { default?: unknown }).default ?? mod)
+        ) as typeof import("@huggingface/transformers");
         // Local only: never silently download a model at runtime.
-        mod.env.allowLocalModels = true;
-        mod.env.allowRemoteModels = false;
-        const ex = (await mod.pipeline("feature-extraction", this.modelDir, {
+        tf.env.allowLocalModels = true;
+        tf.env.allowRemoteModels = false;
+        const ex = (await tf.pipeline("feature-extraction", this.modelDir, {
           dtype: SEMANTIC_DTYPE,
           revision: this.modelRevision,
         })) as unknown as FeatureExtractionPipeline & {

@@ -773,6 +773,19 @@ export class FragmentStore {
    *  forget-delete). A fragment with a surviving source stays —
    *  its re-check will judge it against what is left. Returns
    *  the removed fragment ids. The caller saves. */
+  /** 终版 WP3: drop fragments whose source list is no longer fully
+   *  live. A fragment with one dead source can no longer prove its
+   *  verbatim quotes, so it is removed rather than partially kept. */
+  pruneTo(liveIds: Set<string>): string[] {
+    const doomed = this.list
+      .filter((f) => !f.sourceIds.every((id) => liveIds.has(id)))
+      .map((f) => f.id);
+    if (doomed.length === 0) return [];
+    const set = new Set(doomed);
+    this.list = this.list.filter((f) => !set.has(f.id));
+    return doomed;
+  }
+
   removeEntries(ids: string[]): string[] {
     const doomed = new Set(this.idsLosingAllSources(ids));
     if (doomed.size === 0) return [];

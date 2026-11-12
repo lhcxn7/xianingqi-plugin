@@ -39,7 +39,7 @@ import type {
 } from "./types.ts";
 
 export const ACTIVATION_THRESHOLD = 0.02;
-export const VALVE_TOP = 5;
+export const VALVE_TOP = 8;
 export const VALVE_PER_TOPIC = 2;
 /** Second graph hop halves the inherited content. */
 export const GRAPH_HOP_DECAY = 0.5;
@@ -298,14 +298,20 @@ export interface ValveHit {
 // after it), only the demo did. The real valve path is tested
 // through recallFromEntries / MemoryCore.recall, not through a
 // helper nothing ships. See demo "0.2.0 valve" checks.
-/** 心光 valve, stage 2 only: per-topic cap + top 5, no threshold.
+/** 心光 valve, stage 2 only: per-topic cap + top N, no threshold.
+ *  N defaults to 8 (soft guidance: the model sees a handful of
+ *  candidates and decides how many to use); callers may pass 1..10.
  *  Runs AFTER the token cap: an over-cap entry must not eat a
  *  topic slot (audit m3 — the giant entry is skipped by the cap and
  *  the smaller fitting ones behind it are still collected; a
  *  pre-cap per-topic cut would drop them instead). The threshold
  *  is stage 1 and runs before the cap (a below-threshold hit never
  *  deserves cap budget). */
-export function applyValveTop<T extends ValveHit>(hits: T[]): T[] {
+export function applyValveTop<T extends ValveHit>(
+  hits: T[],
+  top: number = VALVE_TOP,
+): T[] {
+  const limit = Math.max(1, Math.min(10, Math.floor(top)));
   const out: T[] = [];
   const perTopic = new Map<string, number>();
   for (const h of hits) {
@@ -313,7 +319,7 @@ export function applyValveTop<T extends ValveHit>(hits: T[]): T[] {
     if (n >= VALVE_PER_TOPIC) continue;
     perTopic.set(h.topic, n + 1);
     out.push(h);
-    if (out.length >= VALVE_TOP) break;
+    if (out.length >= limit) break;
   }
   return out;
 }

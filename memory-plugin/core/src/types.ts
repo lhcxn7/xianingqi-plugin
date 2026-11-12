@@ -27,6 +27,13 @@ export interface MemoryEntry {
   time: string;
   role: Role;
   window: WindowKind;
+  /** 终版 WP1: what this entry is, independent of the window it was
+   *  recorded in. "persona" = her side of the conversation, goes into
+   *  memory (injection / review / starmap); "task" = user work she did,
+   *  kept verbatim but never injected or reviewed; "greeting" = a bare
+   *  trigger call ("夏柠柒"), kept as raw text, not memory. Absent on
+   *  old entries = "persona" (zero migration). */
+  kind?: "persona" | "task" | "greeting";
   sessionId: string;
   importance: Importance;
   text: string;
@@ -52,10 +59,40 @@ export interface MemoryEntry {
    *  factKey + ts order; this is the explicit link, for the
    *  admin UI and the audit trail. */
   supersedes?: string;
+  /** 终版 WP4: epoch ms when the fact became true (absent = ts).
+   *  Current-version selection and history answers prefer this over
+   *  record time, so a backdated entry does not become "now". */
+  validFrom?: number;
+  /** 终版 WP4: epoch ms when the system learned the fact (absent =
+   *  ts). Kept separate from validFrom: "搬去上海" may be true since
+   *  March but only learned in November. */
+  observedAt?: number;
+  /** 终版 WP4: insufficient evidence. A candidate is kept in the log
+   *  but never injected as an established fact; an explicit search
+   *  can opt in. */
+  candidate?: boolean;
 }
 
 /** Layer 1: current state, at the head of MEMORY.md, always read on open,
  *  never archived away. */
+export type ProfileCategory =
+  | "爱好习惯"
+  | "理想"
+  | "偏好"
+  | "底线"
+  | "身体健康"
+  | "害怕担心"
+  | "秘密"
+  | "家人朋友";
+
+export interface ProfileItem {
+  text: string;
+  /** Log entry ids this item was derived from. Required: a profile
+   *  item with no source is a guess, not a memory. */
+  sourceIds: string[];
+  updatedAt: number;
+}
+
 export interface Layer1State {
   name?: string;
   stage?: string;
@@ -70,6 +107,9 @@ export interface Layer1State {
     stage?: string;
     relationshipStage?: string;
     updatedAt?: number;
+    /** 终版 WP6: structured 8-category profile. Each item carries its
+     *  source ids; no sensitivity tier (deliberately dropped). */
+    categories?: Partial<Record<ProfileCategory, ProfileItem[]>>;
   };
   /** Last update time, minute precision (skill: 最后更新时间). */
   lastUpdated?: string;
@@ -113,12 +153,18 @@ export interface CoreOptions {
    *  keyword-only. */
   semanticRecall?: {
     enabled?: boolean;
+    /** 终版 WP9: when `enabled` is omitted, turn semantic on if the
+     *  runtime and model are both present. Default true. */
+    autoEnable?: boolean;
     modelId?: string;
     modelDir?: string;
     modelRevision?: string;
     /** 0.5.3: directory whose node_modules holds the optional
      *  @huggingface/transformers runtime (default: dataDir). */
     runtimeDir?: string;
+    /** 终版 WP8: max vectors kept in the semantic index. Over the
+     *  cap, the build keeps the highest importance × recency. */
+    maxEntries?: number;
     timeoutMs?: number;
     maxCandidates?: number;
     /** Similarity floor for semantic candidates (default 0.5;
@@ -141,6 +187,9 @@ export interface RecallHit {
    *  its fact — a newer version with the same factKey exists.
    *  Rendered as "·旧版" in the injected block. */
   superseded?: boolean;
+  /** 终版 WP4: this hit is an unverified candidate (explicit search
+   *  only; never auto-injected). */
+  candidate?: boolean;
   /** 0.2.0: rarest matched token (valve topic). Graph hits inherit
    *  their seed's topic. */
   topic: string;
@@ -240,6 +289,8 @@ export interface CoreStats {
    *  not yet invalidated — "awaiting model review" (see
    *  stats()). */
   pendingInvalidationChecks: number;
+  /** 终版 WP1: entry counts by content kind (see MemoryEntry.kind). */
+  kinds?: { persona: number; task: number; greeting: number };
 }
 
 // ---- 0.2.0: graph + attributes + activation + review + starmap ----

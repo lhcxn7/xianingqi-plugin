@@ -52,11 +52,10 @@
 //       it) and never show for the hovered/selected star (that
 //       star already has its tooltip/panel). Drag/zoom/click/
 //       hover/panel are untouched.
-//   P8  Panel badge (0.4.2, user decision 2026-11-09): the
-//       bottom panel shows the keyword only — the "约定." /
-//       "ta." owner prefix is stripped for display (badgeText).
-//       The key itself is untouched: "ta.*" / "约定.*" still
-//       decide which arm/core a star belongs to (ownerOf).
+//   P8  Panel badge (1.0.0): the bottom panel badge names the
+//       speaker — 她 / 我 — instead of the old keyword badge. The
+//       key itself is untouched: "ta.*" / "约定.*" still decide
+//       which arm/core a star belongs to (ownerOf).
 //   P9  Lone-star suffix (0.4.2, user decision 2026-11-09):
 //       keySuffix's fallback no longer takes the first short
 //       keyword (that was how "我以前不该欺负你的" became
@@ -203,6 +202,8 @@ export interface ShiguangMemory {
   /** Owner/arm key: "ta.<topic>" or "约定.<keyword>". */
   key: string;
   kind: "fragment" | "entry";
+  /** 终版 WP7: who said it — "assistant" = 她, "user" = 我. */
+  role?: "user" | "assistant";
   /** Fragment tone label, e.g. 很喜欢 (fragment stars only). */
   toneLabel?: string;
   /** Fragment source log entries (fragment stars only). */
@@ -237,7 +238,7 @@ export interface StarmapData {
   total: number;
   capped: boolean;
   memories: ShiguangMemory[];
-  edges: Array<{ from: string; to: string }>;
+  edges: Array<{ from: string; to: string; weight?: number }>;
   traces: ShiguangTrace[];
 }
 
@@ -623,6 +624,9 @@ export function buildStarmapData(
       emotionIntensity: 0,
       keywords: f.keywords.slice(0, 8),
       topic: f.topic,
+      // 终版 WP7: a fragment follows its latest source's role, so
+      // the star gets a 她/我 label that matches the actual speaker.
+      role: latest.role,
       toneLabel: f.tone.label,
       sources: sources.map((s) => ({
         id: s.id,
@@ -667,17 +671,28 @@ export function buildStarmapData(
   // fragment) drop.
   const nodeIdForEntry = (entryId: string): string =>
     fragmentOfEntry.get(entryId)?.id ?? entryId;
-  const edgeKeys = new Set<string>();
-  const usableEdges: Array<{ from: string; to: string }> = [];
+  const edgeIndex = new Map<string, number>();
+  const usableEdges: Array<{ from: string; to: string; weight?: number }> = [];
   for (const e of edges) {
     const from = nodeIdForEntry(e.from);
     const to = nodeIdForEntry(e.to);
     if (from === to) continue;
     if (!pickedIds.has(from) || !pickedIds.has(to)) continue;
     const key = from < to ? `${from}\0${to}` : `${to}\0${from}`;
-    if (edgeKeys.has(key)) continue;
-    edgeKeys.add(key);
-    usableEdges.push({ from, to });
+    const weight =
+      typeof e.weight === "number" && Number.isFinite(e.weight)
+        ? Math.min(1, Math.max(0.01, e.weight))
+        : 0.5;
+    const at = edgeIndex.get(key);
+    if (at !== undefined) {
+      // Duplicate edges collapse; keep the strongest weight so the
+      // drawn line reflects the strongest relation, not the first one.
+      const existing = usableEdges[at];
+      if ((existing.weight ?? 0) < weight) existing.weight = weight;
+      continue;
+    }
+    edgeIndex.set(key, usableEdges.length);
+    usableEdges.push({ from, to, weight });
   }
   // Badge words for the key-suffix rule (review-15 m-2): the
   // star's content keywords (full set, NOT the 8-capped tags)
@@ -808,6 +823,7 @@ export function buildStarmapData(
       related: keywords,
       key,
       kind: e.kind,
+      role: e.role,
       toneLabel: e.toneLabel,
       sources: e.sources,
       emotion: e.emotion,
@@ -1073,6 +1089,10 @@ const SHIGUANG_TAIL = `;
   const CORE = { me: { x: -0.30, y: 0, z: 0 }, her: { x: 0.30, y: 0, z: 0 } };
 
   function ownerOf(m) {
+    // 终版 WP7: role wins when present (the shell records who spoke);
+    // the old key/text heuristic stays as a fallback for old data.
+    if (m.role === 'assistant') return 'her';
+    if (m.role === 'user') return 'me';
     const k = String(m.key || '');
     if (/^ta\\./.test(k)) return 'her';
     if (/^(约定|我|项目)\\./.test(k)) return 'me';
@@ -1143,16 +1163,32 @@ const SHIGUANG_TAIL = `;
   }
 
   // ── 关系 ────────────────────────────────────────────────
+  // 终版 WP7: constellation lines come from graph.json edges (DATA.edges),
+  // not from keyword-tag overlap. The lines stay hidden until a star is
+  // selected; EdgeAdj is the undirected adjacency of the remapped graph.
+  const starById = new Map(stars.map(function (s) { return [s.id, s]; }));
+  const edgeAdj = new Map();
+  function addEdge(a, b, w) {
+    const weight = typeof w === 'number' && isFinite(w) ? Math.min(1, Math.max(0.01, w)) : 0.5;
+    let list = edgeAdj.get(a);
+    if (!list) { list = new Map(); edgeAdj.set(a, list); }
+    if (weight > (list.get(b) || 0)) list.set(b, weight);
+  }
+  (DATA.edges || []).forEach(function (e) {
+    if (!e || !starById.has(e.from) || !starById.has(e.to)) return;
+    addEdge(e.from, e.to, e.weight);
+    addEdge(e.to, e.from, e.weight);
+  });
   function kinOf(n) {
-    const mine = new Set(n.tags.concat(n.related).map(String));
+    const list = edgeAdj.get(n.id);
+    if (!list) return [];
     const out = [];
-    stars.forEach(function (o) {
-      if (o === n) return;
-      let w = 0;
-      o.tags.concat(o.related).forEach(function (t) { if (mine.has(String(t))) w++; });
-      if (w > 0) out.push({ o: o, w: w });
+    list.forEach(function (w, id) {
+      const o = starById.get(id);
+      if (o) out.push({ o: o, w: w });
     });
-    return out.sort(function (a, b) { return b.w - a.w; }).slice(0, 7);
+    // Weak first, strong last: the strongest line is painted on top.
+    return out.sort(function (a, b) { return a.w - b.w; });
   }
 
   // ── 尺寸 ────────────────────────────────────────────────
@@ -1249,9 +1285,14 @@ const SHIGUANG_TAIL = `;
         kinOf(selected).forEach(function (r) {
           const q1 = project(r.o.x, r.o.y, r.o.z);
           if (!q1) return;
-          const al = 0.46 + r.w * 0.12;
+          // 终版 WP7: width and opacity follow graph weight. Weak
+          // edges stay thin/quiet; a repeatedly used relation is
+          // visibly stronger. Strong lines are drawn last (kinOf
+          // sorts ascending).
+          const weight = clamp(typeof r.w === 'number' ? r.w : 0.5, 0.01, 1);
+          const al = 0.18 + weight * 0.72;
           ctx.strokeStyle = 'rgba(' + selected.rgb + ',' + al.toFixed(3) + ')';
-          ctx.lineWidth = 1.5;
+          ctx.lineWidth = 0.6 + weight * 3.6;
           ctx.beginPath();
           ctx.moveTo(q0.x, q0.y);
           ctx.lineTo(q1.x, q1.y);
@@ -1440,17 +1481,12 @@ const SHIGUANG_TAIL = `;
     return best;
   }
 
-  // P8: 面板徽标只显示关键词 — "约定." / "ta." 前缀不显示
-  // （key 本身不动，ownerOf 仍用它分臂）。
-  function badgeText(k) {
-    return String(k || '').replace(/^(ta|约定)\\./, '');
-  }
-
   function showPanel(n) {
     if (!n) { panel.classList.remove('on'); return; }
     pTitle.textContent = n.text.length > 24 ? n.text.slice(0, 24) + '…' : n.text;
     pDate.textContent = new Date(n.at).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\\//g, '.');
-    pBadge.textContent = badgeText(n.key) || (n.owner === 'her' ? '关于' + USER_NAME : '关于我');
+    // P8: the panel badge names the speaker — 她 / 我.
+    pBadge.textContent = n.owner === 'her' ? '她' : '我';
     pBody.textContent = n.text;
     // P3: fragment stars append tone + source entries to the body.
     // 0.3.1 拾光适配：碎片星要能看到原文来源，拾光原版只显示正文。

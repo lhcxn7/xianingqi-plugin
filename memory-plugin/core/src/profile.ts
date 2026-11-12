@@ -8,15 +8,72 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteText } from "./atomic.ts";
-import type { Layer1State } from "./types.ts";
+import type {
+  Layer1State,
+  ProfileCategory,
+  ProfileItem,
+} from "./types.ts";
 
 export const PROFILE_FILE = "profile.json";
 export type PersonaProfile = NonNullable<Layer1State["profile"]>;
+
+export const PROFILE_CATEGORIES: ProfileCategory[] = [
+  "爱好习惯",
+  "理想",
+  "偏好",
+  "底线",
+  "身体健康",
+  "害怕担心",
+  "秘密",
+  "家人朋友",
+];
 
 function cleanString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const out = value.trim().slice(0, 500);
   return out || undefined;
+}
+
+function cleanItems(value: unknown): ProfileItem[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: ProfileItem[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const item = raw as Record<string, unknown>;
+    const text = cleanString(item.text);
+    if (text === undefined) continue;
+    const sourceIds = Array.isArray(item.sourceIds)
+      ? [
+          ...new Set(
+            item.sourceIds.filter(
+              (id): id is string => typeof id === "string" && id.length > 0,
+            ),
+          ),
+        ]
+      : [];
+    if (sourceIds.length === 0) continue;
+    const updatedAt =
+      typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt)
+        ? item.updatedAt
+        : Date.now();
+    out.push({ text, sourceIds: sourceIds.slice(0, 20), updatedAt });
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
+function cleanCategories(
+  value: unknown,
+): Partial<Record<ProfileCategory, ProfileItem[]>> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const out: Partial<Record<ProfileCategory, ProfileItem[]>> = {};
+  for (const category of PROFILE_CATEGORIES) {
+    const items = cleanItems((value as Record<string, unknown>)[category]);
+    if (items !== undefined && items.length > 0) out[category] = items;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Read optional profile state; an absent or legacy file is an empty profile. */
@@ -27,12 +84,17 @@ export function loadProfile(dataDir: string): PersonaProfile | undefined {
     const value = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
     if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
     const profile: PersonaProfile = {};
-    profile.name = cleanString(value.name);
-    profile.stage = cleanString(value.stage);
-    profile.relationshipStage = cleanString(value.relationshipStage);
+    const name = cleanString(value.name);
+    const stage = cleanString(value.stage);
+    const relationshipStage = cleanString(value.relationshipStage);
+    if (name !== undefined) profile.name = name;
+    if (stage !== undefined) profile.stage = stage;
+    if (relationshipStage !== undefined) profile.relationshipStage = relationshipStage;
     if (typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt)) {
       profile.updatedAt = value.updatedAt;
     }
+    const categories = cleanCategories(value.categories);
+    if (categories !== undefined) profile.categories = categories;
     return Object.values(profile).some((v) => v !== undefined) ? profile : undefined;
   } catch {
     return undefined;
@@ -48,6 +110,8 @@ export function saveProfile(dataDir: string, profile: PersonaProfile): void {
   if (typeof profile.updatedAt === "number" && Number.isFinite(profile.updatedAt)) {
     clean.updatedAt = profile.updatedAt;
   }
+  const categories = cleanCategories(profile.categories);
+  if (categories !== undefined) clean.categories = categories;
   atomicWriteText(join(dataDir, PROFILE_FILE), JSON.stringify(clean));
 }
 

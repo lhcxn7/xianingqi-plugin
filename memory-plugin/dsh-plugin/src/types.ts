@@ -84,6 +84,10 @@ export interface MemoryPluginConfig {
   dataDir?: string;
   /** Max estimated tokens for injected recall. Default 1500. */
   tokenCap?: number;
+  /** 终版 WP5: how many recall candidates the valve keeps for the
+   *  model to choose from. Default 8, clamped 1..10. This is soft
+   *  guidance, not a "use exactly N" rule. */
+  valveTop?: number;
   /** Substrings marking a session as a persona window. Default the
    *  skill's own trigger: messages containing 夏柠柒 / 柠柒. */
   triggerWords?: string[];
@@ -92,6 +96,15 @@ export interface MemoryPluginConfig {
    *  mid-conversation recall trigger). Default
    *  DEFAULT_MEMORY_CUE_WORDS. */
   memoryCueWords?: string[];
+  /** 终版 WP1: exact phrases that switch the session mode. The text
+   *  is stripped of trigger words and punctuation first; the rest
+   *  must equal one of these. Defaults to
+   *  DEFAULT_DECLARATION_PHRASES. */
+  declarationPhrases?: { task: string[]; persona: string[] };
+  /** 终版 WP1: an assistant reply longer than this (in code points)
+   *  is treated as task output, not her words. Only applies to a
+   *  turn whose user message was task/greeting. Default 800. */
+  assistantPersonaMaxChars?: number;
   /** 0.5.0 step 5: query rewriter — a host-injected async
    *  function that rewrites / expands the user's question before
    *  recall (the model call lives with the host: this plugin's
@@ -118,11 +131,17 @@ export interface MemoryPluginConfig {
    *  shipped models/ directory there first (see MODELS.md). */
   semanticRecall?: {
     enabled?: boolean;
+    /** 终版 WP9: when `enabled` is omitted, auto-enable if runtime +
+     *  model are present. Default true. */
+    autoEnable?: boolean;
     modelId?: string;
     modelDir?: string;
     modelRevision?: string;
     timeoutMs?: number;
     maxCandidates?: number;
+    /** 终版 WP8: max vectors in the semantic index (default 10000).
+     *  Over the cap, the rebuild keeps importance × recency. */
+    maxEntries?: number;
     /** Similarity floor for semantic candidates (default 0.5). */
     minSimilarity?: number;
   };

@@ -10,6 +10,11 @@
 //   same context name can live in two agents at once;
 // - ctx.tools.get returns the registered tool (used by the shell's
 //   post-register self-check).
+//
+// Tests isolate the machine environment: a globally set
+// MEMORY_PLUGIN_DATA_DIR would otherwise look like a config/env
+// conflict (WP0 read-only mode) for every temp-dir apply() below.
+delete process.env.MEMORY_PLUGIN_DATA_DIR;
 
 import { strict as assert } from "node:assert";
 import {
@@ -3192,13 +3197,14 @@ check("0.4.0 item 3: memory_reflect saves the conclusion as a reflection fragmen
   assert.equal(stored[0].id, saveRef.reflectionId);
 });
 
-// The three reflected entries no longer count: the remaining three
-// heavies (2.7 < 5) leave the gate closed — no reflecting twice
-// on the same day about the same memories.
+// The three reflected entries no longer count, but the remaining
+// three unreflected heavies still open the gate (终版 WP5: no
+// arithmetic floor — the model decides whether a second reflection
+// is worth it).
 const gateAfterSave = await reflectRef.execute({}, execRef);
-check("0.4.0 item 3: memory_reflect gate closes once the entries are already reflected", () => {
-  assert.equal(gateAfterSave.triggered, false, "already-reflected entries do not re-trigger");
-  assert.equal(gateAfterSave.text, undefined, "below the floor there is no prompt at all");
+check("0.4.0 item 3: memory_reflect gate still offers the unreflected entries", () => {
+  assert.equal(gateAfterSave.triggered, true, "unreflected entries keep the gate open");
+  assert.equal(typeof gateAfterSave.text, "string", "the prompt lists what is left");
 });
 
 // Reopen the gate with six fresh heavy entries, then try to save a
@@ -3318,11 +3324,11 @@ const reflectLow = ctxRefLow.registeredTools.find(
 const lowFirst = await rememberLow.execute({ text: "今天好累" }, execLow);
 assert.ok(lowFirst.ok, "low-dir first entry recorded");
 const gateLow = await reflectLow.execute({}, execLow);
-check("0.4.0 item 3: below the floor the tool returns triggered:false with no prompt", () => {
+check("终版 WP5: one new entry is enough to open the gate", () => {
   assert.equal(gateLow.ok, true);
-  assert.equal(gateLow.triggered, false, "one heavy entry (0.9) is below the floor");
-  assert.equal(gateLow.text, undefined, "no prompt is built below the floor");
-  assert.equal(existsSync(join(dirRefLow, "fragments.json")), false, "no prompt means no write");
+  assert.equal(gateLow.triggered, true, "one entry opens the gate (no arithmetic floor)");
+  assert.equal(typeof gateLow.text, "string", "a prompt is built");
+  assert.equal(existsSync(join(dirRefLow, "fragments.json")), false, "a prompt means no write");
 });
 for (const text of refTexts.slice(1)) {
   const r = await rememberLow.execute({ text }, execLow);
@@ -5111,5 +5117,224 @@ check("DSH contract: free-form output objects stay open", () => {
     assertOpenObjectSchemas(out.schema, String(t.name));
   }
 });
+
+// ---- 终版 WP1: shell wiring (greeting / task / declaration / restart)
+const wdir = mkdtempSync(join(tmpdir(), "memory-plugin-window-"));
+const wlogCount = (): number => {
+  const f = join(wdir, "log.jsonl");
+  if (!existsSync(f)) return 0;
+  return readFileSync(f, "utf8").trim().split("\n").filter(Boolean).length;
+};
+const wlastKind = (): string => {
+  const f = join(wdir, "log.jsonl");
+  const lines = readFileSync(f, "utf8").trim().split("\n").filter(Boolean);
+  return (JSON.parse(lines[lines.length - 1]) as { kind?: string }).kind ?? "";
+};
+const wmap = (): Record<string, string> =>
+  JSON.parse(
+    readFileSync(join(wdir, "persona-sessions.json"), "utf8"),
+  ) as Record<string, string>;
+const emitUser = async (
+  c: MockContext,
+  sid: string,
+  content: string,
+): Promise<void> => {
+  await c.emit("session/event", {
+    type: "user/message",
+    sessionId: sid,
+    source: { kind: "user" },
+    message: { content, source: { kind: "user" } },
+  });
+};
+const emitAssistant = async (
+  c: MockContext,
+  sid: string,
+  content: string,
+): Promise<void> => {
+  await c.emit("session/event", {
+    type: "assistant/message",
+    sessionId: sid,
+    message: { content, source: { kind: "assistant" } },
+  });
+};
+
+const wctx = new MockContext(wdir);
+apply(wctx as never, { dataDir: wdir } as never);
+await sleep(50);
+await wctx.emit("agent/created", { agent: { id: "w1" } });
+
+await emitUser(wctx, "w1", "夏柠柒");
+assert.equal(wlastKind(), "greeting", "bare trigger records greeting");
+assert.equal(wmap().w1, "persona", "bare trigger still marks the session");
+
+await emitUser(wctx, "w1", "我今天好累");
+assert.equal(wlastKind(), "persona", "next chat turn is persona");
+await emitAssistant(wctx, "w1", "怎么了");
+assert.equal(wlastKind(), "persona", "her reply follows the chat turn");
+
+const beforeDecl = wlogCount();
+await emitUser(wctx, "w1", "任务窗口");
+assert.equal(wlogCount(), beforeDecl, "declaration itself is not recorded");
+assert.equal(wmap().w1, "task", "task mode is persisted");
+await emitUser(wctx, "w1", "夏柠柒，在吗");
+assert.equal(
+  wlogCount(),
+  beforeDecl,
+  "a trigger does not flip a declared task session",
+);
+
+await emitUser(wctx, "w1", "人设窗口");
+assert.equal(wmap().w1, "persona", "persona declaration switches back");
+await emitUser(wctx, "w1", "夏柠柒，帮我把这段文字改得像你说话的口气");
+assert.equal(wlastKind(), "task", "work turn inside persona is task");
+await emitAssistant(wctx, "w1", "改好了，第三处我换了语气");
+assert.equal(wlastKind(), "persona", "short work reply stays her words");
+
+// Restart: the mode must survive a new apply() on the same dir.
+wctx.disposers.forEach((fn) => fn());
+const wctx2 = new MockContext(wdir);
+apply(wctx2 as never, { dataDir: wdir } as never);
+await sleep(50);
+await wctx2.emit("agent/created", { agent: { id: "w1" } });
+const beforeResume = wlogCount();
+await emitUser(wctx2, "w1", "在吗");
+assert.equal(wlogCount(), beforeResume + 1, "restored persona keeps recording");
+
+// A declared task session survives restart too.
+await wctx2.emit("agent/created", { agent: { id: "w2" } });
+await emitUser(wctx2, "w2", "任务窗口");
+const beforeTask = wlogCount();
+await emitUser(wctx2, "w2", "我今天好累");
+assert.equal(wlogCount(), beforeTask, "task session records nothing");
+wctx2.disposers.forEach((fn) => fn());
+const wctx3 = new MockContext(wdir);
+apply(wctx3 as never, { dataDir: wdir } as never);
+await sleep(50);
+await wctx3.emit("agent/created", { agent: { id: "w2" } });
+const beforeTask2 = wlogCount();
+await emitUser(wctx3, "w2", "我今天好累");
+assert.equal(
+  wlogCount(),
+  beforeTask2,
+  "restored task session stays read-only for memory",
+);
+assert.ok(
+  existsSync(join(wdir, "window-audit.jsonl")),
+  "mode switches are audited",
+);
+console.log("PASS WP1 shell: greeting / declaration / task / restart");
+
+// ---- 终版 WP0: config/env conflict -> read-only mode
+const rdir = mkdtempSync(join(tmpdir(), "memory-plugin-readonly-"));
+const otherDir = mkdtempSync(join(tmpdir(), "memory-plugin-other-"));
+process.env.MEMORY_PLUGIN_DATA_DIR = otherDir;
+const rctx = new MockContext(rdir);
+apply(rctx as never, { dataDir: rdir } as never);
+await sleep(50);
+const roStatusTool = rctx.tools.get("memory_status") as {
+  execute: (args: unknown, exec?: unknown) => Promise<unknown>;
+};
+const roStatusOut = (await roStatusTool.execute({})) as {
+  writeBlocked?: boolean;
+  warning?: string;
+  dataDir?: string;
+};
+assert.equal(roStatusOut.writeBlocked, true, "conflict enters read-only mode");
+assert.ok(
+  String(roStatusOut.warning).includes("冲突"),
+  "warning names the conflict",
+);
+assert.equal(roStatusOut.dataDir, rdir, "config wins for dataDir display");
+const roRememberTool = rctx.tools.get("memory_remember") as {
+  execute: (args: unknown, exec?: unknown) => Promise<unknown>;
+};
+const roRememberOut = (await roRememberTool.execute(
+  { text: "这条不该写进去" },
+  { agent: { session: { id: "ro1" } } },
+)) as { ok?: boolean; error?: string };
+assert.equal(roRememberOut.ok, false, "write tool is refused");
+assert.ok(
+  String(roRememberOut.error).includes("拒绝"),
+  "refusal explains why",
+);
+delete process.env.MEMORY_PLUGIN_DATA_DIR;
+console.log("PASS WP0: config/env conflict is read-only");
+
+// ---- 终版 WP4: fact warning + candidate wiring
+await wctx3.emit("agent/created", { agent: { id: "w1" } });
+const wmTool = wctx3.tools.get("memory_remember") as {
+  execute: (args: unknown, exec?: unknown) => Promise<unknown>;
+};
+const wmExec = { agent: { session: { id: "w1" } } };
+const wmOut = (await wmTool.execute(
+  { text: "我喜欢吃西瓜", importance: "light" },
+  wmExec,
+)) as { ok?: boolean; id?: string; warning?: string };
+assert.equal(wmOut.ok, true);
+assert.ok(String(wmOut.warning).includes("factKey"), "missing factKey warns");
+
+const wcOut = (await wmTool.execute(
+  { text: "我可能养了一只猫，还没确认", candidate: true },
+  wmExec,
+)) as { ok?: boolean; id?: string };
+assert.equal(wcOut.ok, true);
+const wsTool = wctx3.tools.get("memory_search") as {
+  execute: (args: unknown, exec?: unknown) => Promise<unknown>;
+};
+const wsDefault = (await wsTool.execute({ query: "猫" }, wmExec)) as {
+  hits?: Array<{ id?: string }>;
+};
+assert.equal(
+  (wsDefault.hits ?? []).some((h) => h.id === wcOut.id),
+  false,
+  "candidate is not in a default search",
+);
+const wsCand = (await wsTool.execute(
+  { query: "猫", includeCandidates: true },
+  wmExec,
+)) as { hits?: Array<{ id?: string; candidate?: boolean }> };
+assert.ok(
+  (wsCand.hits ?? []).some(
+    (h) => h.id === wcOut.id && h.candidate === true,
+  ),
+  "includeCandidates surfaces the candidate",
+);
+console.log("PASS WP4: fact warning + candidate search");
+
+// ---- 终版 WP6: 8-category profile, sources required, no sensitivity
+const wpTool = wctx3.tools.get("memory_profile") as {
+  execute: (args: unknown, exec?: unknown) => Promise<unknown>;
+};
+const wpAdd = (await wpTool.execute(
+  {
+    category: "偏好",
+    items: [{ text: "喜欢吃西瓜", sourceIds: [wmOut.id] }],
+  },
+  wmExec,
+)) as { ok?: boolean; profile?: { categories?: Record<string, unknown[]> }; error?: string };
+assert.equal(wpAdd.ok, true, String(wpAdd.error));
+assert.ok(wpAdd.profile?.categories?.偏好?.length === 1, "category item stored");
+
+const wpNoSource = (await wpTool.execute(
+  { category: "偏好", items: [{ text: "没有来源", sourceIds: [] }] },
+  wmExec,
+)) as { ok?: boolean; error?: string };
+assert.equal(wpNoSource.ok, false, "item without sources is refused");
+assert.ok(String(wpNoSource.error).includes("sourceIds"));
+
+const wpRead = (await wpTool.execute({ category: "偏好" }, wmExec)) as {
+  ok?: boolean;
+  profile?: { categories?: Record<string, unknown[]> };
+};
+assert.equal(wpRead.ok, true);
+assert.ok(wpRead.profile?.categories?.偏好?.length === 1, "read one category");
+
+const wpClear = (await wpTool.execute(
+  { category: "偏好", clearCategory: true },
+  wmExec,
+)) as { ok?: boolean; profile?: { categories?: Record<string, unknown[]> } };
+assert.equal(wpClear.ok, true);
+assert.equal(wpClear.profile?.categories?.偏好, undefined, "cleared category is gone");
+console.log("PASS WP6: profile categories + source validation + clear");
 
 console.log(`\nALL PASS (data dir: ${dir})`);

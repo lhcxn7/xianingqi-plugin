@@ -820,38 +820,39 @@ check("snapshots cover only plugin-owned files, never MEMORY.md", () => {
   assert.equal(coreD.stats().totalEntries, 6);
 });
 
-check("0.4.3 snapshot: profile.json is snapshotted and restored; audit / loop still are not — beliefs joined the snapshot in 0.5.1", () => {
+check("1.0.0 snapshot: profile, beliefs and loop are snapshotted and restored; audit is not", () => {
   const dirS = mkdtempSync(join(tmpdir(), "memory-core-snapshot-profile-"));
   writeFileSync(join(dirS, "MEMORY.md"), fixtureMemory, "utf8");
   const coreS = new MemoryCore({ dataDir: dirS });
   coreS.updateProfile({ name: "快照前", stage: "早期" });
-  // The two still-excluded files, placed with marker content so
+  // The still-excluded audit file, placed with marker content so
   // the snapshot-contents assertion reads the filename rule, not
-  // the absence of the files.
+  // the absence of the file.
   writeFileSync(join(dirS, "invalidation-audit.jsonl"), "{}\n", "utf8");
-  writeFileSync(join(dirS, "loop.json"), JSON.stringify({ version: 1, pendingActions: [] }), "utf8");
+  const loopBefore = JSON.stringify({ version: 1, pendingActions: [], recentTriggers: [{ trigger: "before", at: 1 }] });
+  writeFileSync(join(dirS, "loop.json"), loopBefore, "utf8");
   writeFileSync(join(dirS, "beliefs.json"), JSON.stringify({ version: 1, beliefs: [] }), "utf8");
   const snap = coreS.snapshot();
   const snapFiles = readdirSync(join(dirS, ".snapshots", snap));
   assert.ok(snapFiles.includes("profile.json"), `snapshot carries profile.json, got ${JSON.stringify(snapFiles)}`);
   assert.ok(!snapFiles.includes("invalidation-audit.jsonl"), "audit trail is never snapshotted");
-  assert.ok(!snapFiles.includes("loop.json"), "loop state is never snapshotted");
+  assert.ok(snapFiles.includes("loop.json"), "loop state is snapshotted since 1.0.0");
   // 0.5.1 (0.4.3 audit item 10): beliefs.json IS snapshotted now —
   // beliefs cite log entries as evidence, so a restore that reverts
   // the log but not the beliefs would leave them pointing at
   // pre-restore evidence (same reason fragments.json is in).
   assert.ok(snapFiles.includes("beliefs.json"), "beliefs are snapshotted since 0.5.1");
-  // Change the profile and the beliefs, restore, and both come back.
+  // Change the profile, beliefs and loop, restore, and all come back.
   coreS.updateProfile({ name: "快照后", stage: "中期" });
   assert.equal(coreS.readLayer1().name, "快照后", "profile changed after the snapshot");
   writeFileSync(join(dirS, "beliefs.json"), JSON.stringify({ version: 1, beliefs: [{ id: "BEL_X_001" }] }), "utf8");
+  writeFileSync(join(dirS, "loop.json"), JSON.stringify({ version: 1, pendingActions: [], recentTriggers: [{ trigger: "after", at: 2 }] }), "utf8");
   coreS.restore(snap);
   assert.equal(coreS.readLayer1().name, "快照前", "restore brings the profile back");
   assert.equal(coreS.readLayer1().stage, "早期", "restore brings the profile stage back");
   assert.equal(readFileSync(join(dirS, "beliefs.json"), "utf8"), JSON.stringify({ version: 1, beliefs: [] }), "restore brings beliefs.json back");
-  // The excluded files were never in the snapshot, so the restore
-  // leaves the live copies exactly as they were.
-  assert.equal(readFileSync(join(dirS, "loop.json"), "utf8"), JSON.stringify({ version: 1, pendingActions: [] }), "restore leaves loop.json alone");
+  // 1.0.0: loop.json is plugin-owned now — restore rewinds it too.
+  assert.equal(readFileSync(join(dirS, "loop.json"), "utf8"), loopBefore, "restore brings loop.json back");
 });
 
 check("B2: record() validates before writing — poison never lands on disk", () => {
@@ -1852,8 +1853,9 @@ const starmapTest = (async () => {
   assert.ok(panel.classList.contains("on"), "panel opens on star click");
   assert.ok(pBody.textContent.includes("酸梅汤真好喝"), "panel shows the memory text");
   assert.ok(pTitle.textContent.includes("酸梅汤"), "panel title shows the memory");
-  assert.equal(pBadge.textContent, "酸梅", "0.4.2 P8: panel badge shows the keyword only, no 约定. prefix");
-  assert.ok(seedMem.key.startsWith("约定."), "0.4.2 P8: DATA key keeps the prefix — only the display strips it");
+  const expectedBadge = seedStar.owner === "her" ? "她" : "我";
+  assert.equal(pBadge.textContent, expectedBadge, "1.0.0 P8: panel badge names the speaker (她/我)");
+  assert.ok(seedMem.key.startsWith("约定."), "0.4.2 P8: DATA key keeps the prefix — only the display changes");
   assert.ok(pDate.textContent.length > 0, "panel date shows");
 
   // Hover over the star: cursor turns to pointer.
@@ -2169,7 +2171,7 @@ check("0.4.3 mapping: lone-star suffix never takes a 1-char fragment topic (P9)"
 // textContent holds the whole sentence, but the pill's CSS
 // clamps it to two lines (-webkit-line-clamp:2); the full text
 // is read in the bottom panel after clicking the star.
-check("0.4.2 starmap: original-sentence labels fade in only up close (P7, two-line preview)", () => {
+check("0.4.2 starmap: original-sentence labels fade in only up close (P7)", () => {
   const seeds: Array<[string, "user" | "assistant"]> = [
     ["酸梅汤真好喝，今天特别开心", "user"],
     ["今晚吃拉面，暖暖的很安心", "assistant"],
@@ -2205,7 +2207,7 @@ check("0.4.2 starmap: original-sentence labels fade in only up close (P7, two-li
   // the pill never renders more than two lines of the sentence.
   assert.ok(
     html.includes("-webkit-line-clamp:2"),
-    "label CSS clamps the pill to two lines (preview, not full text on screen)",
+    "label CSS still clamps the pill (labels are one short word now)",
   );
   const d = driveShiguangHtml(html, "?t=5");
   const visible = () =>
@@ -2232,41 +2234,16 @@ check("0.4.2 starmap: original-sentence labels fade in only up close (P7, two-li
   assert.ok(maxSeen <= 24, `never more than 24 labels at once (max ${maxSeen})`);
   const starTexts = new Set(d.map.stars.map((s: any) => s.text));
   for (const t of seenTexts) {
-    assert.ok(starTexts.has(t), `label text is a star's original sentence (two-line preview, textContent holds the whole sentence): ${t}`);
+    assert.ok(
+      starTexts.has(t),
+      `label text is a star's original sentence: ${t}`,
+    );
   }
+  assert.ok(seenTexts.size > 0, "labels are visible up close");
   // Far again (dist 16): gone.
   d.map.setDist(16);
   d.stepFrames(3);
   assert.equal(visible().length, 0, "labels fade out again at dist 16");
-  // 0.4.3 P7: hovered/selected stars carry no label (they already
-  // have their tooltip/panel), and no-ui hides the label layer.
-  d.map.setDist(4);
-  d.stepFrames(3);
-  const shownNow = visible();
-  assert.ok(shownNow.length > 0, "labels are back up close for the hover/selected checks");
-  const hoverText = shownNow[0].textContent;
-  const hoverStar = d.map.stars.find((s: any) => s.text === hoverText);
-  assert.ok(hoverStar, "a visible label maps back to its star");
-  const hp = d.map.project(hoverStar.x, hoverStar.y, hoverStar.z);
-  assert.ok(hp, "hovered star projects onto the screen");
-  d.cv.fire("pointermove", { clientX: hp.x, clientY: hp.y });
-  d.stepFrames(2);
-  assert.ok(
-    !visible().some((c: any) => c.textContent === hoverText),
-    "hovered star shows no label while hovered",
-  );
-  // Click a different visible star: it becomes selected (panel
-  // opens) and its label goes away too.
-  const selText = visible().find((c: any) => c.textContent !== hoverText)?.textContent;
-  assert.ok(selText, "another labelled star is visible to select");
-  const selStar = d.map.stars.find((s: any) => s.text === selText);
-  clickShiguangStar(d, selStar);
-  assert.ok(d.panel.classList.contains("on"), "panel opens on the selected star");
-  d.stepFrames(2);
-  assert.ok(
-    !visible().some((c: any) => c.textContent === selText),
-    "selected star shows no label while selected",
-  );
   // no-ui: the VM's stub DOM has no stylesheet engine and no
   // document.body, so the `body.no-ui #labels{opacity:0}` rule
   // cannot be observed taking effect here — pin the rule itself
@@ -4012,7 +3989,7 @@ check("0.4.0 item 4: profile block costs no token-cap budget and no valve slot",
   const query = words.join(" ");
   const withProfile = recallFromEntries(entries, profLayer1, query);
   const withoutProfile = recallFromEntries(entries, null, query);
-  assert.equal(withProfile.hits.length, 5, "valve top 5 still holds with the profile block present");
+  assert.equal(withProfile.hits.length, 6, "valve keeps all 6 distinct-topic candidates (top 8)");
   assert.equal(withProfile.profileText.split("\n").length, 5, "block is 5 lines");
   assert.deepEqual(
     withProfile.hits.map((h) => h.entry.id),
@@ -4415,7 +4392,7 @@ check("0.4.0 item 5: candidates are at most 3, one per topic, ranked by activati
     source: "log",
   }));
   const r = recallFromEntries(entries, profLayer1, words.join(" "));
-  assert.equal(r.hits.length, 5, "valve top 5 still holds with spotlight on");
+  assert.equal(r.hits.length, 6, "valve keeps all 6 distinct-topic candidates (top 8) with spotlight on");
   const flagged = r.hits.filter((h) => h.spotlightCandidate);
   assert.equal(flagged.length, 3, "exactly 3 candidates");
   assert.equal(
@@ -4903,11 +4880,8 @@ console.log(`\nALL PASS (0.4.0 item 2 additions)`);
 
 // ---- 0.4.0 item 3: 反思触发器 (Generative Agents reflection) -------
 // 2026-11-09 去机械化：没有 50 分硬门槛，触发与否归模型，不归
-// 分数。代码只留一个极小防打扰下限（REFLECTION_MIN_FLOOR = 5，
-// 24h 新增 significance 总和）：低于它连提示词都不拼；高于它
-// 由模型自己决定做不做反思、做什么反思。反思结论存成一条
-// type: "reflection" 的特殊碎片——结论的新词是看出来的，不
-// 校验；只有「」引用的话必须逐字出自来源，找不到整条作废。
+// 分数。终版 WP5：5 分防打扰下限也去掉——24 小时内有新的 persona
+// 记忆就拼提示词，做不做反思由模型自己决定。
 
 const dirRef = mkdtempSync(join(tmpdir(), "memory-core-reflection-"));
 writeFileSync(join(dirRef, "MEMORY.md"), fixtureMemory, "utf8");
@@ -4927,16 +4901,14 @@ const refEntries = refTexts.map((text, i) =>
   }),
 );
 
-check("0.4.0 item 3: review hands the model a reflection prompt only above the floor — below it, no prompt at all", () => {
-  // 6 heavy in 24 h: 6 x 0.9 = 5.4 >= 5 — the prompt is built.
-  // (On the old 50-point scale this would never have triggered;
-  // the point of the de-mechanisation is that the code no longer
-  // scores whether to reflect at all.)
+check("0.4.0 item 3: review hands the model a reflection prompt whenever there are new persona entries", () => {
+  // 6 heavy in 24 h: the prompt is built. The old 5-point floor is
+  // gone (终版 WP5) — the model decides whether to reflect.
   const result = coreRef.review(true, local(2026, 11, 7, 9, 0));
   assert.ok(result !== null && result.ran, "review ran");
   assert.ok(
     typeof result.reflectionPrompt === "string" && result.reflectionPrompt.length > 0,
-    "above the floor the review carries a reflection prompt",
+    "new entries produce a reflection prompt",
   );
   assert.ok(
     (result.reflectionPrompt ?? "").includes("今天好累"),
@@ -4959,7 +4931,7 @@ check("0.4.0 item 3: review hands the model a reflection prompt only above the f
     false,
     "the review proposes only — it writes no reflection",
   );
-  // 5 heavy in 24 h: 5 x 0.9 = 4.5 < 5 — no prompt is built.
+  // 5 heavy in 24 h: the floor is gone, so a prompt is still built.
   const dirLow = mkdtempSync(join(tmpdir(), "memory-core-reflection-low-"));
   writeFileSync(join(dirLow, "MEMORY.md"), fixtureMemory, "utf8");
   const coreLow = new MemoryCore({ dataDir: dirLow });
@@ -4970,7 +4942,11 @@ check("0.4.0 item 3: review hands the model a reflection prompt only above the f
     });
   }
   const low = coreLow.review(true, local(2026, 11, 7, 9, 0));
-  assert.equal(low?.reflectionPrompt, undefined, "below the floor: no prompt at all");
+  assert.ok(
+    typeof low?.reflectionPrompt === "string" &&
+      low.reflectionPrompt.length > 0,
+    "5 entries still produce a prompt — no arithmetic floor",
+  );
   // 6 heavy but 49 h old: outside the 24 h window — no prompt.
   const dirOld = mkdtempSync(join(tmpdir(), "memory-core-reflection-old-"));
   writeFileSync(join(dirOld, "MEMORY.md"), fixtureMemory, "utf8");
@@ -5242,8 +5218,8 @@ check("0.4.3 reflection gate snapshot: sources cited from the issued prompt surv
   assert.equal(coreS.reflectionGateSnapshot(), null, "below-floor gate leaves no snapshot");
 });
 
-check("0.4.0 item 3: floor boundary — exactly 5.0 reaches, 4.9 does not; already-reflected entries never re-trigger", () => {
-  assert.equal(REFLECTION_MIN_FLOOR, 5, "the floor is 5 significance points");
+check("终版 WP5: any new persona entry opens the gate; already-reflected entries do not re-trigger", () => {
+  assert.equal(REFLECTION_MIN_FLOOR, 5, "legacy constant remains 5, but no longer gates");
   const mkEntry = (id: string, importance: "heavy" | "light", mins: number): MemoryEntry => ({
     id,
     ts: local(2026, 11, 6, 10, mins),
@@ -5258,7 +5234,8 @@ check("0.4.0 item 3: floor boundary — exactly 5.0 reaches, 4.9 does not; alrea
   });
   const sig = (e: MemoryEntry): number => (e.importance === "heavy" ? 0.9 : 0.4);
   const nowB = local(2026, 11, 6, 12, 0);
-  // 2 heavy + 8 light = 1.8 + 3.2 = exactly 5.0 — reached.
+  // 2 heavy + 8 light = exactly 5.0 — reached (and would be reached
+  // at any sum now: the arithmetic floor is gone).
   const exact: MemoryEntry[] = [
     mkEntry("b-h1", "heavy", 0),
     mkEntry("b-h2", "heavy", 1),
@@ -5266,34 +5243,42 @@ check("0.4.0 item 3: floor boundary — exactly 5.0 reaches, 4.9 does not; alrea
   ];
   const atFloor = reflectionGate(exact, sig, nowB);
   assert.ok(Math.abs(atFloor.significanceSum - 5) < 1e-9, `sum is exactly 5 (got ${atFloor.significanceSum})`);
-  assert.equal(atFloor.reached, true, "exactly at the floor triggers");
-  // 1 heavy + 10 light = 0.9 + 4.0 = 4.9 — not reached.
+  assert.equal(atFloor.reached, true, "entries open the gate");
+  // 1 heavy + 10 light = 4.9 — still reached, because the gate no
+  // longer looks at the sum.
   const below: MemoryEntry[] = [
     mkEntry("c-h1", "heavy", 0),
     ...Array.from({ length: 10 }, (_, i) => mkEntry(`c-l${i}`, "light", 1 + i)),
   ];
   const under = reflectionGate(below, sig, nowB);
   assert.ok(Math.abs(under.significanceSum - 4.9) < 1e-9, `sum is 4.9 (got ${under.significanceSum})`);
-  assert.equal(under.reached, false, "just below the floor does not trigger");
+  assert.equal(under.reached, true, "4.9 still opens the gate — no arithmetic floor");
   assert.deepEqual(reflectionGate([], sig, nowB), { entries: [], significanceSum: 0, reached: false }, "no entries means no trigger");
   // Entries already folded into a reflection are excluded: the
-  // three reflected entries (e1–e3) leave only e4–e6 (2.7 < 5),
-  // so a second review inside the same 24 h proposes nothing.
+  // three reflected entries (e1–e3) leave only e4–e6, which still
+  // open the gate (the model decides whether to reflect again).
   const second = coreRef.review(true, local(2026, 11, 6, 18, 0));
   assert.ok(second !== null && second.ran, "second review ran");
-  assert.equal(
-    second.reflectionPrompt,
-    undefined,
-    "already-reflected entries do not re-trigger in the same day",
+  assert.ok(
+    typeof second.reflectionPrompt === "string" &&
+      second.reflectionPrompt.length > 0,
+    "unreflected entries still produce a prompt",
   );
-  // A fresh heavy entry the same evening is still not enough on
-  // its own (2.7 + 0.9 = 3.6 < 5).
+  assert.ok(
+    !(second.reflectionPrompt ?? "").includes("今天好累0"),
+    "reflected entries are excluded",
+  );
+  // A fresh heavy entry the same evening opens the gate again.
   coreRef.record({
     role: "user", text: "今天累得不行了", window: "persona",
     importance: "heavy", sessionId: "s1", ts: local(2026, 11, 6, 18, 30),
   });
   const third = coreRef.review(true, local(2026, 11, 6, 19, 0));
-  assert.equal(third?.reflectionPrompt, undefined, "one new heavy entry is still below the floor");
+  assert.ok(
+    typeof third?.reflectionPrompt === "string" &&
+      third.reflectionPrompt.length > 0,
+    "one new entry is enough now",
+  );
 });
 
 check("0.4.0 item 3: starmap — a reflection fragment is a gold stable_profile star, like any fragment", () => {

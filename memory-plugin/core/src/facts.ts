@@ -103,7 +103,9 @@ export function factChains(
   }
   const out = new Map<string, FactVersion>();
   for (const [factKey, versions] of byKey) {
-    const sorted = [...versions].sort((a, b) => a.ts - b.ts);
+    const sorted = [...versions].sort(
+      (a, b) => (a.validFrom ?? a.ts) - (b.validFrom ?? b.ts),
+    );
     const hasLinks = versions.some(
       (e) => typeof e.supersedes === "string" && e.supersedes.length > 0,
     );

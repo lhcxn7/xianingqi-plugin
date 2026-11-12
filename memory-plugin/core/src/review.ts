@@ -290,7 +290,7 @@ export function runReview(input: ReviewInput): ReviewResult {
       // m-7 (review-12): candidates are shown to the model (M-1
       // exposes them in the daily review prompt), so task-window
       // entries must never be clustered — only persona entries.
-      if (entry.window !== "persona") continue;
+      if (entry.window !== "persona" || (entry.kind ?? "persona") !== "persona") continue;
       if (alreadyFragmented.has(entry.id)) continue;
       for (const token of new Set(
         tokenize(entry.text).filter(isReviewTopicToken),
@@ -334,7 +334,7 @@ export function runReview(input: ReviewInput): ReviewResult {
     }
     const df = new Map<string, string[]>();
     for (const entry of input.entries) {
-      if (entry.window !== "persona") continue;
+      if (entry.window !== "persona" || (entry.kind ?? "persona") !== "persona") continue;
       if (alreadyBelieved.has(entry.id)) continue;
       for (const token of new Set(
         tokenize(entry.text).filter(isReviewTopicToken),
@@ -430,7 +430,7 @@ export function runReview(input: ReviewInput): ReviewResult {
     ]);
     const df = new Map<string, number>();
     for (const e of input.entries) {
-      if (e.window !== "persona") continue;
+      if (e.window !== "persona" || (e.kind ?? "persona") !== "persona") continue;
       for (const t of new Set(tokenize(e.text))) {
         df.set(t, (df.get(t) ?? 0) + 1);
       }
@@ -480,7 +480,7 @@ export function runReview(input: ReviewInput): ReviewResult {
         e.window === "persona" && now - e.ts >= 0 && now - e.ts <= windowMs,
     );
     for (const entry of input.entries) {
-      if (entry.window !== "persona") continue;
+      if (entry.window !== "persona" || (entry.kind ?? "persona") !== "persona") continue;
       const attrs = input.attrs.get(entry.id);
       if (!attrs) continue;
       // Resolved by invalidation — a dead entry needs no check.
