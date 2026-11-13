@@ -161,6 +161,7 @@ memory-plugin/
 ## Status
 
 - [x] **1.0.0 (2026-11-11) — 封板版.** WP0 数据目录防分家、WP1 窗口边界（persona/task/greeting + 命令词 + 800 字助手回复规则）、WP2 删除账本 + `purge`、WP3 恢复 journal + 全量重建 + 校验回滚、WP4 `validFrom`/`observedAt`/candidate、WP5 软引导（8 条候选、裁剪留痕、3s 超时、反思去算术门）、WP6 画像 8 类（无敏感分级）、WP7 星图（星海外观不变、面板“她/我”徽标、graph 线、按权重画）、WP8 语义索引 10000 上限 + 删除/隐藏/失效同步、WP9 自动开语义 + `semantic install --yes`、WP10 48 条评测。封板后只修四类 bug。
+- [x] **1.1.0 (2026-11-13).** 印象层（Track B，第一人称印象，14 天过期，复盘自动留 0–2 条）、注入改成「脑子里冒出来的」念头格式 + 年龄分档、1.0.1 对齐（工作区隔离、任务窗口工具边界、语义召回默认开）；demo 全过。已知小毛病：core/package.json 版本号仍是 1.0.0。
 - [x] 0.5.5 (2026-11-10) — the three local-only fixes:
       (1) `composeInjection` enforces ONE total token budget across
       profile + hits + belief + experience, trimming experience →

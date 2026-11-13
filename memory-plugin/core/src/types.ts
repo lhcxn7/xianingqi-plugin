@@ -228,6 +228,21 @@ export interface RecallHit {
   fragmentFallback?: boolean;
 }
 
+/** 0.6.0 (人味改造 第 3 项): one 印象 — her current read of him
+ *  ("他这阵子累得不想说话") plus what she plans to do about it
+ *  ("别催他早睡，给他留盏灯"), stored as a fragment with kind
+ *  "impression". Injected at the top of the recall block. */
+export interface RecallImpression {
+  id: string;
+  text: string;
+  /** One short line: what she plans to do about it. */
+  strategy?: string;
+  createdAt: number;
+  /** Epoch ms; absent = never expires. */
+  validUntil?: number;
+  sourceIds: string[];
+}
+
 export interface RecallResult {
   hits: RecallHit[];
   layer1: Layer1State | null;
@@ -248,6 +263,10 @@ export interface RecallResult {
    *  (rule + source), in the order injected. Empty when none
    *  matched. */
   experiences?: Array<{ rule: string; source: string }>;
+  /** 0.6.0 (人味改造 第 3 项): her live impressions relevant to this
+   *  turn — at most 2, unexpired, matched by topic/keyword or by a
+   *  hit from the same source. Injected at the top of the block. */
+  impressions?: RecallImpression[];
 }
 
 /** Result of rolling the current log into per-month segments. The

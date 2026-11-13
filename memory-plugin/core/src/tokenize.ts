@@ -58,8 +58,10 @@ export function tokenize(text: string): string[] {
  *  generous side: overestimating only injects slightly less. */
 export function estimateTokens(text: string): number {
   if (typeof text !== "string") return 0;
-  const cjk = (text.match(CJK_RUN) ?? []).reduce(
-    (n, run) => n + run.length,
+  // `?? []` alone infers never[] under this tsconfig (TS 5.9), so
+  // the empty fallback is typed as string[] explicitly.
+  const cjk = (text.match(CJK_RUN) ?? ([] as string[])).reduce(
+    (n: number, run: string) => n + run.length,
     0,
   );
   const words = (text.toLowerCase().match(WORD_RUN) ?? []).length;

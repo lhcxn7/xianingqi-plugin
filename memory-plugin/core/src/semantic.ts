@@ -38,7 +38,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { atomicWriteText, backupCorruptFile } from "./atomic.ts";
 import type { MemoryEntry } from "./types.ts";
@@ -54,12 +54,30 @@ export const SEMANTIC_MODEL_DIRNAME = "bge-small-zh-v1.5";
  *    <package>/models/bge-small-zh-v1.5             (legacy layout)
  *    <core>/models/bge-small-zh-v1.5                (standalone core)
  *  No network: a missing model is reported as unavailable. */
+/** 0.5.6: walk up from this module to the package root (the
+ *  directory holding package.json). Works for both layouts:
+ *  source  (<pkg>/core/src/semantic.ts)
+ *  compiled (<pkg>/dist/core/src/semantic.js) */
+export function findPackageRoot(): string | null {
+  let dir = fileURLToPath(new URL(".", import.meta.url));
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(join(dir, "package.json"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
 export function findBundledModelDir(): string | null {
-  const here = fileURLToPath(new URL(".", import.meta.url)); // core/src/
+  const here = fileURLToPath(new URL(".", import.meta.url)); // <pkg>/core/src/ or <pkg>/dist/core/src/
+  const root = findPackageRoot();
   const candidates = [
-    join(here, "..", "..", "dsh-plugin", "models", SEMANTIC_MODEL_DIRNAME),
+    ...(root ? [join(root, "models", SEMANTIC_MODEL_DIRNAME)] : []),
     join(here, "..", "..", "models", SEMANTIC_MODEL_DIRNAME),
-    join(here, "..", "models", SEMANTIC_MODEL_DIRNAME),
+    // legacy: core still next to dsh-plugin (source layout used to be
+    // memory-plugin/core/src, i.e. one more level down from the package)
+    join(here, "..", "..", "..", "models", SEMANTIC_MODEL_DIRNAME),
   ];
   return candidates.find((d) => existsSync(join(d, "config.json"))) ?? null;
 }
@@ -83,6 +101,31 @@ export const SEMANTIC_DTYPE = "int8" as const;
 export const SEMANTIC_DEFAULT_TIMEOUT_MS = 3000;
 export const SEMANTIC_DEFAULT_MAX_CANDIDATES = 50;
 export const SEMANTIC_DEFAULT_MAX_ENTRIES = 10000;
+
+/** 0.5.6: locate the runtime bundled with the plugin, if any.
+ *  Returns the directory WHOSE `node_modules` holds the runtime (the
+ *  same shape as a dataDir:
+ *  `<dir>/node_modules/@huggingface/transformers`). Candidates:
+ *    <package>/dsh-plugin/runtime  (the shipped copy)
+ *    <package>/runtime             (packaged at the root)
+ *  A GitHub/local install that ships the runtime therefore gets
+ *  semantic recall on first launch with no npm step. */
+export function findBundledRuntimeDir(): string | null {
+  const here = fileURLToPath(new URL(".", import.meta.url)); // <pkg>/core/src/ or <pkg>/dist/core/src/
+  const root = findPackageRoot();
+  const candidates = [
+    ...(root ? [join(root, "runtime")] : []),
+    join(here, "..", "..", "runtime"),
+    join(here, "..", "..", "..", "runtime"),
+  ];
+  return (
+    candidates.find((d) =>
+      existsSync(
+        join(d, "node_modules", "@huggingface", "transformers", "package.json"),
+      ),
+    ) ?? null
+  );
+}
 
 /** 终版 WP9: is the optional transformers runtime installed? Checks
  *  `<runtimeDir>/node_modules` first, then the normal import path.

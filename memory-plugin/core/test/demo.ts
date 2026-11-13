@@ -7684,13 +7684,26 @@ await checkAsync("0.5.1 exp item 2: a mock provider's semantic-only hit surfaces
   assert.equal(hy.hits[0].entry.id, plum.id, "the semantic hit ranks first on similarity");
 });
 
-await checkAsync("0.5.1 exp item 2: a hanging provider times out to keyword-only, and semantic is off by default", async () => {
+await checkAsync("0.5.1 exp item 2: a hanging provider times out to keyword-only, and semantic follows the bundled runtime", async () => {
   const dirT = mkdtempSync(join(tmpdir(), "memory-core-051-sem-timeout-"));
   writeFileSync(join(dirT, "MEMORY.md"), fixtureMemory, "utf8");
   const coreT = new MemoryCore({ dataDir: dirT });
-  assert.equal(coreT.semanticEnabled(), false, "semantic is off unless configured");
+  // 0.5.6/0.5.9: "default" means auto-enabled exactly when the
+  // checkout ships both the transformers runtime and the model —
+  // the assertion follows that rule instead of a bare false, so the
+  // test passes on a bare checkout and on a bundled one alike.
+  const depT = coreT.semanticStatus().dependency;
+  assert.equal(
+    coreT.semanticEnabled(),
+    depT.runtimePresent && depT.modelPresent,
+    "semantic follows the bundled runtime/model, never a bare default",
+  );
   assert.deepEqual(await coreT.semanticCandidateIds("酸梅汤", []), [], "disabled semantic returns no candidates");
-  assert.equal(coreT.semanticStatus().enabled, false, "status reports disabled");
+  assert.equal(
+    coreT.semanticStatus().enabled,
+    coreT.semanticEnabled(),
+    "status echoes semanticEnabled",
+  );
   assert.equal(coreT.semanticMinSimilarity(), SEMANTIC_DEFAULT_MIN_SIMILARITY, "default floor is the constant");
   const hanging = {
     modelId: "mock-hanging",
@@ -8076,5 +8089,69 @@ check("0.5.2 P0-04: restore removes plugin-owned files absent from the snapshot"
   c.restore(snap);
   assert.equal(existsSync(extra), false, "a post-snapshot summary file is rolled back");
 });
+
+// ---- 0.6.0 (人味改造): 念头注入格式 + 印象层 ----
+{
+  const dirY = mkdtempSync(join(tmpdir(), "memory-core-060-impression-"));
+  writeFileSync(join(dirY, "MEMORY.md"), "名字: 夏柠柒\n阶段: 1\n", "utf8");
+  const cy = new MemoryCore({ dataDir: dirY });
+  const t0 = Date.now();
+  cy.record({ role: "user", text: "他说胃不好，吃辣会难受", window: "persona", sessionId: "s1", ts: t0 - 3600_000 });
+  const e2 = cy.record({ role: "user", text: "他说周四要汇报，最近有点累", window: "persona", sessionId: "s1", ts: t0 - 3 * DAY_MS });
+
+  check("0.6.0 item 5: the injected block speaks in 念头 + age buckets, memory_search keeps the list form", () => {
+    const r5 = cy.recall("胃不好", { window: "persona", limit: 5 });
+    const inj = formatRecallBlock(r5.hits, undefined, undefined, { mode: "injection", now: t0 });
+    assert.ok(inj.includes("【脑子里突然冒出来的】"), "injection uses the 念头 header");
+    assert.ok(inj.includes("刚说过"), "an hour ago reads 刚说过");
+    assert.ok(!inj.includes("相关记忆"), "the 档案 header is gone from injection");
+    assert.ok(!inj.includes("候选"), "no candidate wording in injection");
+    const list = formatRecallBlock(r5.hits);
+    assert.ok(list.includes("相关记忆") && list.includes("候选"), "list mode keeps the search wording for memory_search");
+    const rAge = cy.recall("汇报", { window: "persona", limit: 5 });
+    const injAge = formatRecallBlock(rAge.hits, undefined, undefined, { mode: "injection", now: t0 });
+    assert.ok(injAge.includes("前几天"), "3 days ago reads 前几天");
+  });
+
+  check("0.6.0 item 1: an impression needs strategy, gets a 14-day clock; a voiced line wins the injection", () => {
+    const bad = cy.createFragment({ sourceIds: [e2.id], text: "他最近很累", tone: "心疼", quotes: ["最近有点累"], kind: "impression" });
+    assert.equal(bad.ok, false, "an impression without strategy is rejected");
+    const vf = cy.createFragment({ sourceIds: [e2.id], text: "最近有点累", tone: "心疼", quotes: ["最近有点累"], voiced: "又硬撑。" });
+    assert.equal(vf.ok, true, "voiced fragment saved: " + vf.reasons.join("；"));
+    const rv = cy.recall("累", { window: "persona", limit: 5 });
+    assert.ok(rv.hits.some((h) => h.displayText === "又硬撑。"), "injection uses the voiced form, not the plain text");
+    const imp = cy.createFragment({ sourceIds: [e2.id], text: "他这阵子累得不想说话", tone: "心疼但嘴硬", quotes: ["最近有点累"], kind: "impression", strategy: "别催他早睡，给他留盏灯" });
+    assert.equal(imp.ok, true, "impression saved: " + imp.reasons.join("；"));
+    assert.equal(imp.fragment?.kind, "impression");
+    assert.ok((imp.fragment?.validUntil ?? 0) > t0 + 10 * DAY_MS, "default clock is ~14 days");
+  });
+
+  check("0.6.0 item 3: a matching strategy alone surfaces the impression, at the top of the block", () => {
+    const r = cy.recall("早睡", { window: "persona", limit: 5 });
+    assert.equal((r.impressions ?? []).length, 1, "one impression selected by its strategy keyword");
+    const block = composeInjection("", r.hits, undefined, undefined, 1500, undefined, r.impressions);
+    assert.ok(block.includes("他这阵子累得不想说话"), "the read is injected");
+    assert.ok(block.includes("别催他早睡"), "the strategy rides the same line");
+    const lines = block.split("\n");
+    assert.ok(lines[1]?.includes("他这阵子累得不想说话"), "the impression is the first line under the header");
+  });
+
+  check("0.6.0 item 4: a denied impression never injects again; an expired row is skipped on load", () => {
+    const imp = cy.listImpressions(t0);
+    assert.equal(imp.length, 1, "one live impression before the denial");
+    const fb = cy.applyFeedback({ kind: "wrong", impressionId: imp[0].id, reason: "他说他没焦虑" });
+    assert.equal(fb.ok, true);
+    assert.equal(fb.impressionRejected, true, "the denial rejects the impression");
+    const r = cy.recall("早睡", { window: "persona", limit: 5 });
+    assert.equal((r.impressions ?? []).length, 0, "a rejected impression stays out");
+    const f = join(dirY, "fragments.json");
+    const data = JSON.parse(readFileSync(f, "utf8")) as { fragments: Array<Record<string, unknown>> };
+    data.fragments.push({ id: "frag-expired", kind: "impression", strategy: "不提", validUntil: t0 - 1000, sourceIds: [e2.id], text: "最近有点累", tone: { label: "心疼", level: "unknown", intensity: 0.5 }, quotes: ["最近有点累"], topic: "累", keywords: ["累", "早睡"], createdAt: t0 - DAY_MS, verified: true });
+    writeFileSync(f, JSON.stringify(data), "utf8");
+    const cy2 = new MemoryCore({ dataDir: dirY });
+    const r2 = cy2.recall("早睡", { window: "persona", limit: 5 });
+    assert.equal((r2.impressions ?? []).some((i) => i.id === "frag-expired"), false, "an expired impression never injects");
+  });
+}
 
 console.log(`\nALL PASS (0.5.1 expansion: fact chain + forget, embedding, admin, experiences, goals)`);

@@ -185,7 +185,7 @@ import {
   parseModelReviewIds,
   parseProactDecision,
   selectCappedEntries,
-} from "../../core/src/index.ts";
+} from "../core/src/index.ts";
 import type {
   BeliefCandidate,
   FragmentCandidate,
@@ -196,7 +196,7 @@ import type {
   RecallHit,
   RecallResult,
   ReviewResult,
-} from "../../core/src/index.ts";
+} from "../core/src/index.ts";
 import { isObjectSchema, loadDefineTool } from "./define-tool.ts";
 import {
   DEFAULT_DECLARATION_PHRASES,
@@ -768,6 +768,13 @@ interface SessionState {
    *  each recall, so the current turn never attends to itself.
    *  In-memory only — a rebuilt session starts empty. */
   recentUserTexts: string[];
+  /** 0.6.0 (人味改造): impression ids already injected into this
+   *  session. An impression is a standing judgement, not a new
+   *  fact — repeating it every turn reads like nagging, so a
+   *  session shows each one at most once. In-memory only; a
+   *  rebuilt session may show it again (it is a new conversation
+   *  and the judgement is still live). */
+  injectedImpressionIds: Set<string>;
   /** 0.3.0 daily model review: set at agent/created when the code
    *  review ran (restored persona, >24h — the m-6 gate); the first
    *  pre-step after that hands yesterday's messages to the model
@@ -898,6 +905,38 @@ export function apply(
   const assistantPersonaMaxChars = config?.assistantPersonaMaxChars ?? 800;
   const memoryCueWords =
     config?.memoryCueWords ?? DEFAULT_MEMORY_CUE_WORDS;
+
+  // 2026-11-12 工作区隔离：记忆插件原本没有任何工作区概念，任务窗口里提一句
+  // 「夏柠柒」就会把整个会话标成 persona 并开始记录（实测把默认工作区的
+  // 81 条技术讨论记进了人设记忆）。这里加一层：只有 cwd 落在人设工作区
+  // （含子目录）里的会话，才允许被触发词标成 persona、才记录消息。
+  // 未配置 personaWorkspace 时保持旧行为，不改变其他部署。
+  // 0.5.6: the env var is the fallback for installs that cannot edit the
+  // plugin patch (single-workdir personas need this whitelist to exist,
+  // or a task window that merely says her name starts recording again).
+  // config.personaWorkspace wins over the env var.
+  const personaWorkspace = String(
+    config?.personaWorkspace ??
+      process.env.MEMORY_PLUGIN_PERSONA_WORKSPACE ??
+      "",
+  ).trim();
+  const normalizePath = (p: string): string =>
+    p.replace(/[\\/]+/g, "\\").replace(/\\+$/, "").toLowerCase();
+  const inPersonaWorkspace = (cwd: unknown): boolean => {
+    if (!personaWorkspace) return true;
+    const raw = typeof cwd === "string" ? cwd.trim() : "";
+    if (!raw) return false;
+    const cur = normalizePath(raw);
+    const root = normalizePath(personaWorkspace);
+    return cur === root || cur.startsWith(`${root}\\`);
+  };
+  const cwdOf = (agentOrSession: unknown): string | null => {
+    const anyObj = agentOrSession as
+      | { session?: { header?: { cwd?: string } }; header?: { cwd?: string }; cwd?: string }
+      | null
+      | undefined;
+    return anyObj?.session?.header?.cwd ?? anyObj?.header?.cwd ?? anyObj?.cwd ?? null;
+  };
   // 0.5.0 step 5: host-injected query rewriter (model call lives
   // with the host) + its per-turn timeout. Absent = keyword-only.
   const queryRewriter = config?.queryRewriter;
@@ -1257,6 +1296,7 @@ export function apply(
         disposer: null,
         appendedIds: new Set(),
         recentUserTexts: [],
+        injectedImpressionIds: new Set(),
         modelReviewDue: false,
         modelReviewDone: false,
         modelReviewCandidates: null,
@@ -1349,20 +1389,15 @@ export function apply(
     return { sid, persona: current?.persona === true };
   };
 
-  // Stable directives: facts only, no stage judgments. Duplicate
-  // registration (plugin applied twice in one process, e.g. two
-  // profiles) must not kill the plugin (audit m14).
-  try {
-    ctx.systemPrompt.section({
-      name: "memory-plugin:directives",
-      order: 700,
-      text: "记忆插件已启用: 以下注入的记忆是过去对话的原始事实片段, 仅供参考; 阶段、关系与人设以 MEMORY.md 第一层为准, 不要自行推断阶段; 不要把注入的片段当成小说剧情。",
-    });
-  } catch (err) {
-    console.warn(
-      `[memory-plugin] 静态 directives section 注册失败（可能是插件在同一进程里被加载了两次：${err instanceof Error ? err.message : String(err)}），插件继续运行，记忆注入不受影响。`,
-    );
-  }
+  // 0.5.6: the old global "memory-plugin:directives" section is GONE.
+  // It was registered on the process-wide prompt layer, so every
+  // session — task windows, subagents, other profiles — got a line
+  // saying "阶段、关系与人设以 MEMORY.md 第一层为准". In a task window
+  // that line reads as "there is a persona here", and it was one of the
+  // two cues that made a plain 「你好」 in the default workspace answer
+  // in-character. The same guard rails already exist where they belong:
+  // the persona workspace's AGENTS.md, the persona plugin's rendered
+  // block, and the header of each injected recall.
 
   // 终版 WP9: a one-time setup hint when semantic is wanted but the
   // optional runtime is missing. The plugin does not install by
@@ -1726,6 +1761,7 @@ export function apply(
       disposer: null,
       appendedIds,
       recentUserTexts: [],
+      injectedImpressionIds: new Set(),
       modelReviewDue: false,
       modelReviewDone: false,
       modelReviewCandidates: null,
@@ -1863,7 +1899,21 @@ export function apply(
         );
         if (declared !== null) declareMode(sid, declared, text);
       }
-      if (userTexts.some((t) => shouldMarkPersona(t, triggerWords))) {
+      // 2026-11-12 工作区隔离：不在人设工作区的会话，触发词不许把它标成 persona。
+      const inWs = inPersonaWorkspace(cwdOf(agent) ?? cwdOf(ev));
+      if (!inWs) {
+        session.persona = false;
+      } else if (personaWorkspace) {
+        // 0.5.6: when a persona-workdir whitelist IS configured, a
+        // session inside that workdir is a persona window by default —
+        // same cadence as persona-plugin's defaultPersona and the
+        // skill's "every turn writes memory". Without the whitelist the
+        // old trigger-word rule stays exactly as before, so other
+        // deployments and the mock tests are unaffected. A session that
+        // explicitly declared 任务窗口 keeps task: markPersona returns
+        // early on modeLocked+task.
+        markPersona(sid);
+      } else if (userTexts.some((t) => shouldMarkPersona(t, triggerWords))) {
         markPersona(sid);
       }
       if (!session.persona) {
@@ -1981,7 +2031,14 @@ export function apply(
       // Update the recent-texts list AFTER the recall: the current
       // turn's own words must not feed its own attention factor.
       session.recentUserTexts = [...session.recentUserTexts, ...userTexts].slice(-5);
-      if (result.hits.length > 0) {
+      // 0.6.0: an impression can ride in even when no keyword hit
+      // survives — it is her standing judgement, not a fact hit.
+      // Each impression is shown to a session ONCE: repeating the
+      // same judgement every turn reads like nagging.
+      const freshImpressions = (result.impressions ?? []).filter(
+        (i) => !session.injectedImpressionIds.has(i.id),
+      );
+      if (result.hits.length > 0 || freshImpressions.length > 0) {
         // 0.4.0 item 4: the profile block rides with the recall — it
         // is the head of every injection (turn-1 append and the
         // refreshed context alike), never a standalone injection:
@@ -1993,6 +2050,7 @@ export function apply(
           (result.experiences ?? []).map((e) => e.rule),
           tokenCap,
           (dropped) => logRecallDropped(sid, query, dropped),
+          freshImpressions,
         );
         // Turn 1: append directly — a context registered during
         // pre-step would otherwise not reach the first request.
@@ -2026,9 +2084,14 @@ export function apply(
         const freshHits = result.hits.filter(
           (h) => !session.appendedIds.has(h.entry.id),
         );
+        // 0.6.0: on turn 1 the append above already carried the
+        // impressions; later turns carry them through the refreshed
+        // context. Either way a session sees each impression once,
+        // so it is marked only after this turn's injection.
+        const impsForContext = session.turns <= 1 ? [] : freshImpressions;
         refreshRecallContext(
           sid,
-          freshHits.length > 0
+          freshHits.length > 0 || impsForContext.length > 0
             ? composeInjection(
                 result.profileText,
                 freshHits,
@@ -2036,10 +2099,14 @@ export function apply(
                 undefined,
                 tokenCap,
                 (dropped) => logRecallDropped(sid, query, dropped),
+                impsForContext,
               )
             : "",
           agentCtx,
         );
+        for (const imp of freshImpressions) {
+          session.injectedImpressionIds.add(imp.id);
+        }
       } else {
         refreshRecallContext(sid, "", agentCtx);
       }
@@ -2093,6 +2160,8 @@ export function apply(
       return;
     }
     if (type === "user/message") {
+      // 2026-11-12 工作区隔离：不在人设工作区的会话，一个字都不记。
+      if (!inPersonaWorkspace(cwdOf(subject) ?? cwdOf(event))) return;
       // Skip plugin-injected messages (our own recall) and anything
       // that is not a real user message, or injected memory would be
       // re-recorded as if the user said it. When source.kind is
@@ -2485,6 +2554,9 @@ export function apply(
               profileText: { type: "string" },
               layer1: { type: "string" },
               hits: { type: "array" },
+              // 0.6.0: live impressions (id + text + strategy), so
+              // the model can name one in memory_feedback.
+              impressions: { type: "array" },
               error: { type: "string" },
             },
           },
@@ -2554,6 +2626,11 @@ export function apply(
             return {
               profileText: result.profileText,
               layer1: result.layer1 ? formatLayer1(result.layer1) : "",
+              // 0.6.0 (人味改造 第 3 项): the live impressions, with
+              // ids — injected blocks carry no ids, so this is where
+              // the model gets the impressionId it needs when the
+              // user denies one (memory_feedback + wrong).
+              impressions: core.listImpressions(),
               hits: result.hits.map((h) => {
                 // 0.5.0 step 3: every hit carries its provenance —
                 // the fragment's when fragment-backed, otherwise
@@ -2918,7 +2995,7 @@ export function apply(
       registerTool({
         name: "memory_fragment",
         description:
-          "把几条原文提炼成一条短片段（约 10 token），存在 fragments.json 里：以后召回时优先注入片段而不是整段原文，省 token；星空图里片段就是一颗星。片段必须注明来源（sourceIds，必填）、带 1–2 句从原文逐字抄来的引用（quotes，必填），语气（tone）用你自己的词写就行，不限固定列表（比如 “很喜欢”“嘴上嫌弃心里喜欢”“有点喜欢但不太确定”，可加 :强度如 很喜欢:0.9）。插件会用代码逐字核对：正文关键词、引用、语气都必须和来源对得上，对不上就拒绝保存并告诉你原因——不要编来源里没有的词，不要改写引用，不要把语气写得比来源更重。",
+          "把几条原文提炼成一条短片段（约 10 token），存在 fragments.json 里：以后召回时优先注入片段而不是整段原文，省 token；星空图里片段就是一颗星。片段必须注明来源（sourceIds，必填）、带 1–2 句从原文逐字抄来的引用（quotes，必填），语气（tone）用你自己的词写就行，不限固定列表（比如 “很喜欢”“嘴上嫌弃心里喜欢”“有点喜欢但不太确定”，可加 :强度如 很喜欢:0.9）。插件会用代码逐字核对：正文关键词、引用、语气都必须和来源对得上，对不上就拒绝保存并告诉你原因——不要编来源里没有的词，不要改写引用，不要把语气写得比来源更重。想留一条「印象」（你对他现在的判断 + 你打算怎么对他），就传 kind: \"impression\" + strategy（一句对策），印象会带天数、到点自己过期。",
         parameters: {
           sourceIds: {
             type: "array",
@@ -2962,6 +3039,33 @@ export function apply(
             required: false,
             description: "关键词列表；不填时从正文里取",
           },
+          // 0.6.0 (人味改造 第 1 项): 印象是「你现在的看法 + 你打算
+          // 怎么对他」，不是普通片段。写了 kind:"impression" 就必须
+          // 带 strategy；印象会按 validUntil 过期，默认为 14 天。
+          kind: {
+            type: "string",
+            required: false,
+            description:
+              "填 \"impression\" 表示这是一条印象（你对他的判断 + 你打算怎么对他）；普通片段不填。填了就必须带 strategy。",
+          },
+          strategy: {
+            type: "string",
+            required: false,
+            description:
+              "印象专用：一句你打算怎么对他（如「别催他早睡，给他留盏灯」）。只有看法没有对策的不是印象。",
+          },
+          validUntil: {
+            type: "string",
+            required: false,
+            description:
+              "印象专用：这条印象到什么时候就不算数了（YYYY-MM-DD 或毫秒时间戳）；不填默认 14 天。到期后不会再用它说话。",
+          },
+          voiced: {
+            type: "string",
+            required: false,
+            description:
+              "可选：这句记忆你自己的口吻版（一句话，按你现在这个阶段说话的样子写）；注入时用这一句，检索仍用 text。",
+          },
         },
         output: {
           schema: {
@@ -2995,6 +3099,10 @@ export function apply(
             topic?: unknown;
             sourceType?: unknown;
             keywords?: unknown;
+            kind?: unknown;
+            strategy?: unknown;
+            validUntil?: unknown;
+            voiced?: unknown;
           };
           const sourceIds = Array.isArray(a.sourceIds)
             ? a.sourceIds.filter((x): x is string => typeof x === "string")
@@ -3010,6 +3118,14 @@ export function apply(
           const keywords = Array.isArray(a.keywords)
             ? a.keywords.filter((x): x is string => typeof x === "string")
             : undefined;
+          const kind = typeof a.kind === "string" ? a.kind : undefined;
+          const strategy =
+            typeof a.strategy === "string" ? a.strategy : undefined;
+          const voiced = typeof a.voiced === "string" ? a.voiced : undefined;
+          const validUntil =
+            typeof a.validUntil === "string" || typeof a.validUntil === "number"
+              ? a.validUntil
+              : undefined;
           try {
             const result = core.createFragment({
               sourceIds,
@@ -3019,6 +3135,10 @@ export function apply(
               topic,
               sourceType,
               keywords,
+              kind,
+              strategy,
+              validUntil,
+              voiced,
             });
             if (!result.ok || !result.fragment) {
               return {
@@ -3168,6 +3288,11 @@ export function apply(
               snapshots: { type: "array" },
               graphEdges: { type: "number" },
               attributes: { type: "number" },
+              // 0.5.5: a fresh install has never run a review, so
+              // core.stats() reports null here. The host checks this
+              // schema strictly ("value.lastReviewAt must be a number")
+              // and fails the whole call — the execute below normalizes
+              // null to 0 ("never reviewed"), so keep the schema number.
               lastReviewAt: { type: "number" },
               fragments: { type: "number" },
               suspectFragments: { type: "number" },
@@ -3213,9 +3338,18 @@ export function apply(
         execute: async () => {
           try {
             const goals = core.goals.all();
+            const stats = core.stats();
             return {
               ok: true,
-              ...core.stats(),
+              ...stats,
+              // 0.5.5: core.stats() returns null before the first daily
+              // review; the host's output-schema check rejects null for
+              // a number field and the whole status call dies. 0 reads
+              // as "never reviewed" and always satisfies the schema.
+              lastReviewAt:
+                typeof stats.lastReviewAt === "number"
+                  ? stats.lastReviewAt
+                  : 0,
               tools: registeredToolNames.length,
               toolNames: [...registeredToolNames],
               openGoals: goals.filter((g) => g.status === "open").length,
@@ -4006,17 +4140,22 @@ export function apply(
         name: "memory_feedback",
         deferLoading: true,
         description:
-          "对刚才召回的某条记忆给反馈：correct 对了 / wrong 错了 / irrelevant 不相关。wrong 会让它失效，irrelevant 会降权，correct 记一次验证。",
+          "对刚才召回的某条记忆给反馈：correct 对了 / wrong 错了 / irrelevant 不相关。wrong 会让它失效，irrelevant 会降权，correct 记一次验证。如果这条是“印象”（注入块最上面那句你对他的判断），用户一句话否定了它（“我没焦虑”“我不累”），就直接传 impressionId + wrong，这条印象立刻作废、以后不再用。",
         parameters: {
           entryId: {
             type: "string",
-            required: true,
-            description: "记忆条目 id（见 memory_search 的 hits）",
+            required: false,
+            description: "记忆条目 id（见 memory_search 的 hits）；只压印象时可只传 impressionId",
           },
           feedback: {
             type: "string",
             required: true,
             description: "correct / wrong / irrelevant 之一",
+          },
+          impressionId: {
+            type: "string",
+            required: false,
+            description: "印象的 id（注入块里那条判断的 id，或 memory_search 的印象 id）。用户一句话否定它时传这个 + wrong，印象立刻作废。",
           },
           fragmentId: {
             type: "string",
@@ -4038,6 +4177,7 @@ export function apply(
               feedback: { type: "string" },
               invalidated: { type: "array" },
               significance: { type: "number" },
+              impressionRejected: { type: "boolean" },
               counts: { type: "object", additionalProperties: true },
               error: { type: "string" },
             },
@@ -4061,6 +4201,7 @@ export function apply(
           const a = (args ?? {}) as {
             entryId?: unknown;
             feedback?: unknown;
+            impressionId?: unknown;
             fragmentId?: unknown;
             reason?: unknown;
           };
@@ -4068,19 +4209,24 @@ export function apply(
             typeof a.entryId === "string" ? a.entryId : "";
           const feedback =
             typeof a.feedback === "string" ? a.feedback : "";
+          const impressionId =
+            typeof a.impressionId === "string" && a.impressionId.length > 0
+              ? a.impressionId
+              : undefined;
           const fragmentId =
             typeof a.fragmentId === "string" && a.fragmentId.length > 0
               ? a.fragmentId
               : undefined;
           const reason =
             typeof a.reason === "string" ? a.reason : undefined;
-          if (!entryId) {
+          if (!entryId && !impressionId) {
             return {
               ok: false,
               entryId: "",
               feedback,
               invalidated: [],
-              error: "memory_feedback 需要 entryId（见 memory_search 的 hits）。",
+              error:
+                "memory_feedback 需要 entryId（见 memory_search 的 hits）或 impressionId（印象）之一。",
             };
           }
           if (
@@ -4099,9 +4245,10 @@ export function apply(
           }
           try {
             const res = core.applyFeedback({
-              entryId,
+              entryId: entryId || undefined,
               kind: feedback,
               fragmentId,
+              impressionId,
               reason,
             });
             if (!res.ok) {
@@ -4129,6 +4276,7 @@ export function apply(
               feedback,
               invalidated: res.invalidated,
               significance: res.significance,
+              impressionRejected: res.impressionRejected,
               counts: res.feedback,
             };
           } catch (err) {

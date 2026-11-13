@@ -105,6 +105,10 @@ export interface MemoryPluginConfig {
    *  is treated as task output, not her words. Only applies to a
    *  turn whose user message was task/greeting. Default 800. */
   assistantPersonaMaxChars?: number;
+  /** 2026-11-12 工作区隔离：只有工作目录落在这些人设工作区（含子目录）里的会话，
+   *  才允许被触发词标成 persona、才记录消息。空或未配置 = 旧行为（不限工作区）。
+   *  单工作区版里设成角色的工作区，例如 'C:\\夏柠柒'。 */
+  personaWorkspace?: string;
   /** 0.5.0 step 5: query rewriter — a host-injected async
    *  function that rewrites / expands the user's question before
    *  recall (the model call lives with the host: this plugin's

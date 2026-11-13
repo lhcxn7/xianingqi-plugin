@@ -31,6 +31,7 @@ export {
 } from "./snapshot.ts";
 export {
   DEFAULT_TOKEN_CAP,
+  agePhrase,
   formatLayer1,
   composeInjection,
   formatProfileBlock,
@@ -42,9 +43,11 @@ export {
   normalizeForDedupe,
   recallFromEntries,
   scoreEntry,
+  selectImpressions,
   selectSpotlightCandidates,
 } from "./recall.ts";
-export type { RecallOptions } from "./recall.ts";
+export type { RecallOptions, FormatRecallOptions } from "./recall.ts";
+export type { RecallImpression } from "./types.ts";
 // 0.5.0 step 3: 来源 / 可信度 — the model proposes the source
 // type, the code computes the confidence and checks the sources
 // exist; legacy rows read as unknown, never forged.

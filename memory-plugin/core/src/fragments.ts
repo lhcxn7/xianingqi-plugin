@@ -74,6 +74,42 @@ export const FRAGMENT_MAX_QUOTES = 2;
  *  a 「」 citation is a short verbatim anchor by design. */
 export const FRAGMENT_MIN_QUOTE_CHARS = 4;
 
+/** 0.6.0 (人味改造 第 1 项): an impression is one deliberate
+ *  breath, not a paragraph — one line of how she reads him, plus
+ *  one line of what she will do about it. */
+export const IMPRESSION_MAX_TEXT_CHARS = 40;
+export const IMPRESSION_MAX_STRATEGY_CHARS = 60;
+/** An impression that never expires stops being a judgement and
+ *  becomes a label, so every impression gets a clock (14 days). */
+export const IMPRESSION_DEFAULT_TTL_MS = 14 * 86_400_000;
+/** Her own-voice version is one short line, not a rewrite. */
+export const FRAGMENT_MAX_VOICED_CHARS = 60;
+
+/** Parse a validUntil input: epoch ms (number, or numeric string)
+ *  or a YYYY-MM-DD date (local midnight). Returns undefined for
+ *  anything else — the caller then uses the default TTL. */
+export function parseValidUntil(raw: unknown): number | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    if (!s) return undefined;
+    if (/^\d+$/.test(s)) {
+      const n = Number(s);
+      return Number.isFinite(n) ? n : undefined;
+    }
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (m) {
+      const t = new Date(
+        Number(m[1]),
+        Number(m[2]) - 1,
+        Number(m[3]),
+      ).getTime();
+      return Number.isFinite(t) ? t : undefined;
+    }
+  }
+  return undefined;
+}
+
 export type ToneLevel =
   | "strong-positive"
   | "mild-positive"
@@ -263,6 +299,12 @@ export interface Fragment {
    *  verified (quote-only, see verifyStored): the starmap and
    *  recall treat every fragment the same. */
   type?: "reflection";
+  /** 0.6.0 (人味改造 第 1 项): "impression" = her current read of
+   *  him plus what she plans to do about it. Verified quote-only
+   *  (the read is a new judgement, like a reflection), expires on
+   *  validUntil, and is injected at the top of the recall block in
+   *  her own words. Absent = an ordinary fragment. */
+  kind?: "impression";
   sourceIds: string[];
   /** 0.5.0 step 3: provenance — where this fragment came from
    *  and how much it can be trusted. The model proposes the
@@ -270,6 +312,19 @@ export interface Fragment {
    *  Rows written before 0.5.0 load as legacy (unknown). */
   provenance?: Provenance;
   text: string;
+  /** 0.6.0: with kind "impression", one short line — what she plans
+   *  to do about it ("别催他早睡，给他留盏灯"). Required for an
+   *  impression, absent for an ordinary fragment. */
+  strategy?: string;
+  /** 0.6.0: epoch ms after which an impression stops being true —
+   *  recall skips it from then on (the row stays on disk). Only
+   *  impressions carry one; absent = never expires. */
+  validUntil?: number;
+  /** 0.6.0 (人味改造 第 1 项 / 第 27 轮): her own-voice version of
+   *  the fragment, written in the stage's tone. The block injects
+   *  this one, while recall/keywords keep using `text` — the model
+   *  reads human words, the index still matches plain ones. */
+  voiced?: string;
   tone: FragmentTone;
   quotes: string[];
   topic: string;
@@ -300,6 +355,19 @@ export interface FragmentInput {
    *  rejected (the vocabulary is fixed). */
   sourceType?: string;
   keywords?: string[];
+  /** 0.6.0: "impression" makes this row her standing read of him
+   *  (with strategy + validUntil). Absent = an ordinary fragment;
+   *  any other value is rejected (the vocabulary is fixed). */
+  kind?: string;
+  /** 0.6.0: what she plans to do about it — required for an
+   *  impression, ignored for an ordinary fragment. */
+  strategy?: string;
+  /** 0.6.0: epoch ms (number) or YYYY-MM-DD; impressions default
+   *  to now + 14 days. */
+  validUntil?: number | string;
+  /** 0.6.0: her own-voice version of the text (injected, never
+   *  used for matching). */
+  voiced?: string;
 }
 
 export interface FragmentCreateResult {
@@ -638,6 +706,58 @@ export function validateFragmentInput(
       `片段太长（约 ${estimateTokens(input.text)} tokens，上限 ${FRAGMENT_MAX_TOKENS}）：片段是 ~10 token 的短句，不是复述原文。`,
     );
   }
+  // 0.6.0 (人味改造 第 1 项): the impression shape. kind is a fixed
+  // vocabulary — a typo must be rejected, not silently stored as an
+  // ordinary fragment.
+  let kind: "impression" | undefined;
+  if (input.kind !== undefined) {
+    const k = typeof input.kind === "string" ? input.kind.trim() : "";
+    if (k === "impression") {
+      kind = "impression";
+    } else if (k !== "") {
+      reasons.push(
+        `kind 只能是 "impression"（印象）或不填（普通片段），传了「${k}」。`,
+      );
+    }
+  }
+  let strategy: string | undefined;
+  let validUntil: number | undefined;
+  let voiced: string | undefined;
+  if (kind === "impression") {
+    strategy =
+      typeof input.strategy === "string" ? input.strategy.trim() : "";
+    if (!strategy) {
+      reasons.push(
+        "印象必须带 strategy：一句你打算怎么对他（如「别催他早睡，给他留盏灯」）。只有看法没有对策的不是印象。",
+      );
+    } else if (strategy.length > IMPRESSION_MAX_STRATEGY_CHARS) {
+      reasons.push(
+        `strategy 太长（${strategy.length} 字，上限 ${IMPRESSION_MAX_STRATEGY_CHARS}）：一句对策就够，别写成方案。`,
+      );
+    }
+    if (typeof input.text === "string" && input.text.trim().length > IMPRESSION_MAX_TEXT_CHARS) {
+      reasons.push(
+        `印象正文太长（${input.text.trim().length} 字，上限 ${IMPRESSION_MAX_TEXT_CHARS}）：一句你怎么看他，不是分析报告。`,
+      );
+    }
+    const parsed = parseValidUntil(input.validUntil);
+    validUntil = parsed ?? (now + IMPRESSION_DEFAULT_TTL_MS);
+    if (parsed !== undefined && parsed <= now) {
+      reasons.push(
+        "validUntil 已经过去了：印象要有寿命，但不能一开始就过期——换个未来的日期，或者不填（默认 14 天）。",
+      );
+    }
+  }
+  if (input.voiced !== undefined) {
+    voiced = typeof input.voiced === "string" ? input.voiced.trim() : "";
+    if (!voiced) {
+      voiced = undefined;
+    } else if (voiced.length > FRAGMENT_MAX_VOICED_CHARS) {
+      reasons.push(
+        `voiced 太长（${voiced.length} 字，上限 ${FRAGMENT_MAX_VOICED_CHARS}）：只要一句你自己的口吻，不是重写。`,
+      );
+    }
+  }
   const tone = parseToneLabel(input.tone);
   if (!tone) {
     reasons.push(
@@ -653,21 +773,37 @@ export function validateFragmentInput(
   const sources = input.sourceIds
     .map((id) => entriesById.get(id) as MemoryEntry)
     .filter(Boolean);
+  // 0.6.0: an impression is a JUDGEMENT, so its own words are new
+  // by design (like a reflection) — only its citations are checked
+  // verbatim. The provenance rule (sourceIds exist, persona window)
+  // above still applies: an impression must always be able to point
+  // at the lines it was formed from, or it is not saved.
   const verified = verifyFragment(
     { text: input.text, tone: tone as FragmentTone, quotes: input.quotes },
     sources,
+    kind === "impression" ? { quoteOnly: true } : undefined,
   );
   if (!verified.ok) return { ok: false, reasons: verified.reasons };
   const topic =
     typeof input.topic === "string" && input.topic.trim()
       ? input.topic.trim()
       : (fragmentKeyTerms(input.text)[0] ?? "");
+  // 0.6.0: an impression's keywords cover BOTH halves — a query about
+  // "早睡" must surface an impression whose strategy mentions it,
+  // even when the read ("他累了") does not.
+  const impressionSource = kind === "impression"
+    ? `${input.text} ${strategy ?? ""}`
+    : input.text;
   const keywords =
     Array.isArray(input.keywords) && input.keywords.length > 0
       ? input.keywords.filter((k): k is string => typeof k === "string")
-      : fragmentKeyTerms(input.text);
+      : fragmentKeyTerms(impressionSource);
   const fragment: Fragment = {
     id: `frag-${now}-${randomBytes(3).toString("hex")}`,
+    ...(kind === "impression"
+      ? { kind, strategy, validUntil }
+      : {}),
+    ...(voiced !== undefined ? { voiced } : {}),
     sourceIds: [...input.sourceIds],
     // 0.5.0 step 3: creation passed code verification, so it
     // counts as the first verification (verifyCount 1, stamped).
@@ -754,6 +890,39 @@ export class FragmentStore {
   /** Fragments covering one log entry (in creation order). */
   forEntry(entryId: string): Fragment[] {
     return this.list.filter((f) => f.sourceIds.includes(entryId));
+  }
+
+  /** 0.6.0 (人味改造 第 3 项): the live impressions for this turn —
+   *  kind "impression", not suspect, not yet expired. At most two
+   *  are ever injected; this returns them in creation order and the
+   *  caller picks by relevance. */
+  impressions(now = Date.now()): Fragment[] {
+    return this.list.filter(
+      (f) =>
+        f.kind === "impression" &&
+        !f.suspect &&
+        (f.validUntil === undefined || f.validUntil > now),
+    );
+  }
+
+  /** 0.6.0 (第 4 项): the user flatly denied an impression ("我没
+   *  焦虑") — it stops being injected at once: suspect + validUntil
+   *  stamped to now. The row stays on disk for audit, and the next
+   *  review may form a better one. Returns false when the id is not
+   *  an impression. */
+  reject(id: string, reason: string, now = Date.now()): boolean {
+    const f = this.get(id);
+    if (!f || f.kind !== "impression") return false;
+    f.suspect = true;
+    f.suspectReason = reason;
+    f.validUntil = now;
+    this.dirty.set(id, {
+      ...(this.dirty.get(id) ?? {}),
+      suspect: true,
+      suspectReason: reason,
+    });
+    this.save();
+    return true;
   }
 
   /** Ids of fragments whose sources are ALL inside `ids` — they
@@ -856,6 +1025,22 @@ export class FragmentStore {
           // version) is dropped, never trusted. Old rows without
           // the field load as ordinary fragments.
           type: f.type === "reflection" ? "reflection" : undefined,
+          // 0.6.0: only "impression" survives — a hand-edited or
+          // future kind value is dropped back to an ordinary row,
+          // never trusted. strategy / validUntil only ride an
+          // impression (a stray value on an ordinary row is ignored).
+          kind: f.kind === "impression" ? "impression" : undefined,
+          ...(f.kind === "impression" && typeof f.strategy === "string" && f.strategy.trim()
+            ? { strategy: f.strategy.trim() }
+            : {}),
+          ...(f.kind === "impression" &&
+          typeof f.validUntil === "number" &&
+          Number.isFinite(f.validUntil)
+            ? { validUntil: f.validUntil }
+            : {}),
+          ...(typeof f.voiced === "string" && f.voiced.trim()
+            ? { voiced: f.voiced.trim() }
+            : {}),
           sourceIds: [...f.sourceIds],
           // 0.5.0 step 3: rows written before this step have no
           // provenance — they load as legacy (unknown), never
@@ -969,7 +1154,9 @@ export class FragmentStore {
     return verifyFragment(
       { text: fragment.text, tone: fragment.tone, quotes: fragment.quotes },
       sources,
-      fragment.type === "reflection" ? { quoteOnly: true } : undefined,
+      fragment.type === "reflection" || fragment.kind === "impression"
+        ? { quoteOnly: true }
+        : undefined,
     );
   }
 

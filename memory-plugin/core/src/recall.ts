@@ -54,6 +54,7 @@ import type {
   MemoryAttributes,
   MemoryEntry,
   RecallHit,
+  RecallImpression,
   RecallResult,
 } from "./types.ts";
 
@@ -843,13 +844,22 @@ export function recallFromEntries(
     let fragmentTone: string | undefined;
     let fragmentFallback = false;
     const frags = opts.fragments?.forEntry(hit.entry.id) ?? [];
+    // 0.6.0: an impression is NOT a fragment for hit purposes — it
+    // rides the dedicated top-of-block channel (selectImpressions),
+    // never a dated hit line. An ordinary live fragment is used if
+    // one exists; an impression-only entry falls back to its own
+    // verbatim text, exactly like an entry with no fragment.
+    const ordinary = frags.filter((f) => f.kind !== "impression");
     // A suspect fragment is never injected again — it already
     // failed once, so it goes straight to the verbatim fallback.
-    const live = frags.find((f) => !f.suspect);
+    const live = ordinary.find((f) => !f.suspect);
     if (live && opts.fragments) {
       const check = opts.fragments.verifyStored(live, allById);
       if (check.ok) {
-        displayText = live.text;
+        // 0.6.0: her own-voice version wins when she wrote one —
+        // the block reads like her, the index still matches the
+        // plain text (keywords are built from `text`).
+        displayText = live.voiced ?? live.text;
         fragmentId = live.id;
         fragmentTone = live.tone.label;
       } else {
@@ -860,7 +870,7 @@ export function recallFromEntries(
           check.reasons.join("；"),
         );
       }
-    } else if (frags.some((f) => f.suspect)) {
+    } else if (ordinary.some((f) => f.suspect)) {
       // No live fragment left, only suspect ones: this hit is still
       // a fragment fallback (the verbatim source, never the
       // compressed summary), it is just not re-marked — the
@@ -969,7 +979,55 @@ export function recallFromEntries(
       rule: m.experience.rule,
       source: m.experience.source,
     })),
+    // 0.6.0 (人味改造 第 3 项): at most two live impressions that
+    // touch this query — they ride at the TOP of the injected block.
+    // No keyword/source match means no impression: like the hits,
+    // an unrelated turn gets no 判断 injected into it.
+    impressions: selectImpressions(opts.fragments, tokens, finalHits, now, 2),
   };
+}
+
+/** 0.6.0: pick this turn's impressions. An impression is relevant
+ *  when one of its sources surfaced as a hit (score 2), or one of
+ *  its keywords/topic appears in the query tokens (score 1). Only
+ *  live rows (not suspect, not expired — the store filters those)
+ *  are candidates; the caller injects at most two, most relevant
+ *  first, newest as the tie-break. `text` returns the VOICED form
+ *  when she wrote one — the block shows her words, never the
+ *  plain summary. */
+export function selectImpressions(
+  fragments: FragmentStore | undefined,
+  tokens: string[],
+  hits: RecallHit[],
+  now = Date.now(),
+  limit = 2,
+): RecallImpression[] {
+  if (!fragments) return [];
+  const live = fragments.impressions(now);
+  if (live.length === 0) return [];
+  const tokenSet = new Set(tokens);
+  const hitIds = new Set(hits.map((h) => h.entry.id));
+  const scored = live
+    .map((f) => {
+      const sourceHit = f.sourceIds.some((id) => hitIds.has(id)) ? 2 : 0;
+      const keywordHit =
+        f.keywords.some((k) => tokenSet.has(k)) ||
+        (f.topic !== "" && tokenSet.has(f.topic))
+          ? 1
+          : 0;
+      return { f, score: sourceHit + keywordHit };
+    })
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score || b.f.createdAt - a.f.createdAt)
+    .slice(0, Math.max(0, limit));
+  return scored.map(({ f }) => ({
+    id: f.id,
+    text: f.voiced ?? f.text,
+    strategy: f.strategy,
+    createdAt: f.createdAt,
+    validUntil: f.validUntil,
+    sourceIds: f.sourceIds,
+  }));
 }
 
 /** 0.4.0 item 5 (心光选择 + 传播激活, 小凌识海心光 + HippoRAG
@@ -1076,15 +1134,64 @@ export function formatLayer1(layer1: Layer1State): string {
  *  `关系：信任 0.7（证据 6 条）· 亲近 0.4`) is appended at the very
  *  end, after the spotlight prompt line. Empty / absent means no
  *  line — an empty belief layer never pollutes the block. */
+/** 0.6.0 (人味改造 第 5 项): age buckets for the INJECTED block.
+ *  A `[2026/11/10 12:01 user]` stamp reads like a log line, and the
+ *  model echoes that file voice back at the user. The bucket says
+ *  the same thing the way a person remembers it. Boundaries are
+ *  fixed: within a day, within a week, within a month, older. */
+export function agePhrase(ts: number, now: number): string {
+  const days = Math.max(0, (now - ts) / 86_400_000);
+  if (days < 1) return "刚说过";
+  if (days < 7) return "前几天";
+  if (days < 30) return "前阵子";
+  return "隐约记得";
+}
+
+export interface FormatRecallOptions {
+  /** "injection" = the block handed to the persona model: 念头
+   *  phrasing, no ids, no timestamps, no per-hit tags. "list" =
+   *  the result memory_search shows the model: ids + stamps,
+   *  unchanged (the tool needs the ids it can cite). Default
+   *  "list", so every old caller keeps its exact output. */
+  mode?: "injection" | "list";
+  /** Clock for the age buckets (tests pin it; default now). */
+  now?: number;
+  /** 0.6.0 (人味改造 第 3 项): this turn's impressions — at most
+   *  two, already filtered (unexpired, topic-relevant) by the
+   *  caller. Injection mode only: they ride at the very top of the
+   *  block, one line each, in her own words. "list" ignores them
+   *  (a search result is evidence, not a mood). */
+  impressions?: RecallImpression[];
+}
+
+/** 0.6.0 (人味改造 第 3 项): one 印象 — defined in types.ts so the
+ *  result type and this block share the shape. */
+export type { RecallImpression } from "./types.ts";
 export function formatRecallBlock(
   hits: RecallHit[],
   beliefLine?: string,
   experienceRules?: string[],
+  opts: FormatRecallOptions = {},
 ): string {
-  if (hits.length === 0) return "";
+  const injections = opts.mode === "injection" ? (opts.impressions ?? []) : [];
+  if (hits.length === 0 && injections.length === 0) return "";
+  const injection = opts.mode === "injection";
+  const now = opts.now ?? Date.now();
   const parts: string[] = [
-    `相关记忆（以下 ${hits.length} 条是候选，不是必须全用；你自己判断用哪几条、用几条，不必凑满 5 条）：`,
+    injection
+      ? hits.length > 0
+        ? `【脑子里突然冒出来的】这几件事你本来就记得，随口带出来就行，别背成清单，也别一条一条念（${hits.length} 条，用哪条、用几条，你自己判断，不用凑）：`
+        : "【脑子里突然冒出来的】"
+      : `相关记忆（以下 ${hits.length} 条是候选，不是必须全用；你自己判断用哪几条、用几条，不必凑满 5 条）：`,
   ];
+  // 0.6.0: her standing impression of him goes FIRST — it is the
+  // judgement that colours the whole reply, not another fact.
+  if (injection) {
+    for (const imp of injections) {
+      const line = imp.strategy ? `${imp.text}，${imp.strategy}` : imp.text;
+      parts.push(`- ${line.replace(/[\r\n]+/g, " ")}`);
+    }
+  }
   for (const hit of hits) {
     const label =
       hit.entry.source === "archive" ? "归档" : hit.entry.role;
@@ -1113,12 +1220,16 @@ export function formatRecallBlock(
         ? `${oneLine.slice(0, MAX_INJECT_CHARS_PER_HIT)}…（单条过长，已截断）`
         : oneLine;
     parts.push(
-      `- ${hit.spotlightCandidate ? "☆ " : ""}[${hit.entry.date} ${hit.entry.time} ${label}${mark}${versionMark}] ${shown}`,
+      injection
+        ? `- ${hit.spotlightCandidate ? "☆ " : ""}${agePhrase(hit.entry.ts, now)}${versionMark ? "（旧说法）" : ""}：${shown}`
+        : `- ${hit.spotlightCandidate ? "☆ " : ""}[${hit.entry.date} ${hit.entry.time} ${label}${mark}${versionMark}] ${shown}`,
     );
   }
   if (hits.some((h) => h.spotlightCandidate)) {
     parts.push(
-      "心光：上面标 ☆ 的是这次最值得注意的候选（最多 3 条），请挑其中最值得注意的一条，在回复里用自己的话自然点出来，不用调工具、不用单独解释。",
+      injection
+        ? "心光：上面标 ☆ 的几条里，有一条最值得你现在自然提一句——自己挑，用自己的话说，不用调工具、不用单独解释这是记忆。"
+        : "心光：上面标 ☆ 的是这次最值得注意的候选（最多 3 条），请挑其中最值得注意的一条，在回复里用自己的话自然点出来，不用调工具、不用单独解释。",
     );
   }
   if (beliefLine) {
@@ -1154,15 +1265,20 @@ export function composeInjection(
   experienceRules: string[] | undefined,
   tokenCap: number,
   onDrop?: (dropped: RecallHit[]) => void,
+  impressions?: RecallImpression[],
 ): string {
   const cap = Math.max(1, Math.floor(tokenCap));
   let profile = profileText ?? "";
   let belief = beliefLine;
   let rules = [...(experienceRules ?? [])];
   let hs = [...hits];
+  let imps = [...(impressions ?? [])];
   const dropped: RecallHit[] = [];
   const make = (): string => {
-    const block = hs.length > 0 ? formatRecallBlock(hs, belief, rules) : "";
+    const block =
+      hs.length > 0 || imps.length > 0
+        ? formatRecallBlock(hs, belief, rules, { mode: "injection", impressions: imps })
+        : "";
     return [profile, block].filter((s) => s.length > 0).join("\n");
   };
   let text = make();
@@ -1174,9 +1290,20 @@ export function composeInjection(
     belief = undefined;
     text = make();
   }
+  // 0.6.0: impressions are the smallest and warmest part of the
+  // block — drop the second one before touching any hit, the first
+  // only as a last resort before the profile.
+  while (estimateTokens(text) > cap && imps.length > 1) {
+    imps = imps.slice(0, -1);
+    text = make();
+  }
   while (estimateTokens(text) > cap && hs.length > 0) {
     dropped.push(hs[hs.length - 1]);
     hs = hs.slice(0, -1);
+    text = make();
+  }
+  if (estimateTokens(text) > cap && imps.length > 0) {
+    imps = [];
     text = make();
   }
   if (estimateTokens(text) > cap && profile.length > 0) {

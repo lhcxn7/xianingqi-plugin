@@ -147,6 +147,7 @@ import {
   buildSemanticIndex,
   findBundledModelDir,
   hasTransformersRuntime,
+  findBundledRuntimeDir,
   selectSemanticEntriesForIndex,
   type SemanticIndexLoadStatus,
 } from "./semantic.ts";
@@ -230,6 +231,10 @@ export interface FeedbackResult {
   /** Entry ids invalidated by this feedback (only "wrong"). */
   invalidated: string[];
   fragmentId?: string;
+  /** 0.6.0 (人味改造 第 4 项): with impressionId, whether the
+   *  impression was rejected (wrong → suspect + expired) or
+   *  re-verified (correct). */
+  impressionRejected?: boolean;
   /** The entry's feedback counts after this call. */
   feedback: { correct: number; wrong: number; irrelevant: number };
   /** The entry's significance after this call ("irrelevant"
@@ -361,7 +366,13 @@ export class MemoryCore {
       (existsSync(join(dataModelDir, "config.json"))
         ? dataModelDir
         : (bundledModelDir ?? dataModelDir));
-    const runtimeDir = opts.semanticRecall?.runtimeDir ?? opts.dataDir;
+    // 0.5.6: a plugin that ships the runtime (dsh-plugin/runtime/
+    // node_modules) enables semantic recall on first launch — no npm
+    // step for the user. An explicit runtimeDir still wins; otherwise
+    // the bundled copy, otherwise the data dir (npm install --prefix).
+    const bundledRuntimeDir = findBundledRuntimeDir();
+    const runtimeDir =
+      opts.semanticRecall?.runtimeDir ?? bundledRuntimeDir ?? opts.dataDir;
     // 终版 WP9: auto-enable semantic when the runtime AND the model
     // are both present. An explicit semanticRecall.enabled always
     // wins; autoEnable:false restores the old default-off behaviour.
@@ -1909,25 +1920,67 @@ export class MemoryCore {
   // An unknown entry id (or fragment id) is reported, never
   // created. Runs under the write lock and persists.
   applyFeedback(input: {
-    entryId: string;
+    entryId?: string;
     kind: FeedbackKind;
     fragmentId?: string;
+    /** 0.6.0 (人味改造 第 4 项): the user denied an IMPRESSION
+     *  ("我没焦虑") — wrong rejects it (suspect + expired at once);
+     *  correct re-verifies it. Entry feedback is optional when this
+     *  is given: an impression can be overruled by name alone. */
+    impressionId?: string;
     reason?: string;
     now?: number;
   }): FeedbackResult {
     const now = input.now ?? Date.now();
     return this.withWriteLock(() => {
       this.refreshIfStale();
-      const entry = this.entries.find((e) => e.id === input.entryId);
-      if (!entry) {
+      const entryId = typeof input.entryId === "string" ? input.entryId : "";
+      const entry = entryId
+        ? this.entries.find((e) => e.id === entryId)
+        : undefined;
+      const impression = input.impressionId
+        ? this.fragments.get(input.impressionId)
+        : undefined;
+      // 0.6.0: only a real impression can be denied by name — an
+      // impressionId that points at an ordinary fragment is an
+      // error, not a back door into markVerified/reject.
+      const impressionTarget =
+        impression?.kind === "impression" ? impression : undefined;
+      if (!entry && !impressionTarget) {
         return {
           ok: false,
-          entryId: input.entryId,
+          entryId,
           kind: input.kind,
           invalidated: [],
           fragmentId: input.fragmentId,
           feedback: { correct: 0, wrong: 0, irrelevant: 0 },
-          reason: "记忆条目不存在。",
+          reason: entryId
+            ? "记忆条目不存在。"
+            : "需要 entryId（记忆条目）或 impressionId（印象）之一。",
+        };
+      }
+      let impressionRejected = false;
+      // 0.6.0: the impression-only path (no entry). wrong kills the
+      // impression at once; correct counts as one more verification.
+      if (!entry) {
+        if (input.kind === "wrong") {
+          impressionRejected = this.fragments.reject(
+            impressionTarget.id,
+            input.reason ?? "用户反馈：这条印象不对",
+            now,
+          );
+        } else if (input.kind === "correct") {
+          this.fragments.markVerified(impressionTarget.id, now);
+          this.fragments.save();
+        }
+        return {
+          ok: true,
+          entryId,
+          kind: input.kind,
+          invalidated: [],
+          fragmentId: input.fragmentId,
+          impressionRejected,
+          feedback: { correct: 0, wrong: 0, irrelevant: 0 },
         };
       }
       const attrs = this.attrs.ensure(entry, undefined, now);
@@ -1946,7 +1999,7 @@ export class MemoryCore {
         // Same path as memory_invalidate (re-entrant under the
         // lock): validTo is stamped, graph edges die, both files
         // persist. The log text is never touched.
-        invalidated = this.invalidateEntries([input.entryId], now).invalidated;
+        invalidated = this.invalidateEntries([entryId], now).invalidated;
         if (input.fragmentId && this.fragments.get(input.fragmentId)) {
           this.fragments.markSuspect(
             input.fragmentId,
@@ -1964,14 +2017,29 @@ export class MemoryCore {
           attrs.significance = Math.max(0.1, attrs.significance * 0.5);
         }
       }
+      // 0.6.0: an impression named alongside an entry follows the
+      // same verdict (wrong → rejected; correct → re-verified).
+      if (impressionTarget && input.impressionId) {
+        if (input.kind === "wrong") {
+          impressionRejected = this.fragments.reject(
+            input.impressionId,
+            input.reason ?? "用户反馈：这条印象不对",
+            now,
+          );
+        } else if (input.kind === "correct") {
+          this.fragments.markVerified(input.impressionId, now);
+          fragmentTouched = true;
+        }
+      }
       this.attrs.save();
       if (fragmentTouched) this.fragments.save();
       return {
         ok: true,
-        entryId: input.entryId,
+        entryId,
         kind: input.kind,
         invalidated,
         fragmentId: input.fragmentId,
+        impressionRejected,
         feedback: {
           correct: attrs.feedbackCorrect ?? 0,
           wrong: attrs.feedbackWrong ?? 0,
@@ -2005,6 +2073,23 @@ export class MemoryCore {
   /** All stored fragments (for memory_status / review / tests). */
   listFragments(): import("./fragments.ts").Fragment[] {
     return this.fragments.all();
+  }
+
+  /** 0.6.0 (人味改造 第 3/4 项): the live impressions — not
+   *  suspect, not expired — with their ids, so memory_search (and
+   *  the model) can name one when the user says "我没焦虑". The
+   *  injected form carries no ids; this is the lookup form. */
+  listImpressions(
+    now = Date.now(),
+  ): import("./types.ts").RecallImpression[] {
+    return this.fragments.impressions(now).map((f) => ({
+      id: f.id,
+      text: f.voiced ?? f.text,
+      strategy: f.strategy,
+      createdAt: f.createdAt,
+      validUntil: f.validUntil,
+      sourceIds: f.sourceIds,
+    }));
   }
 
   // ---- beliefs (0.4.0 item 2, 带证据的信念层 + 三维信念) --------

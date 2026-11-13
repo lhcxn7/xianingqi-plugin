@@ -32,7 +32,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { HybridRetriever, MemoryCore } from "../../core/src/index.ts";
+import { HybridRetriever, MemoryCore } from "../core/src/index.ts";
 import { apply, hasTaskActionWord, hasTaskBlocklistWord, hasTaskTechnicalWord, inject, INVALIDATION_AUDIT_FILE, isBareTaskPhrase, isPersonaTrigger, MODEL_REVIEW_AUTO_RELEASE_TURNS, name, parseEmotion, rewriteQuery, shouldMarkPersona } from "../src/index.ts";
 import { compileWithDshTools, normalizeToolSpec } from "../src/define-tool.ts";
 
@@ -421,9 +421,12 @@ check("apply never reads ctx.config (real-DSH regression)", () => {
   apply(strictProxy as never, { dataDir: strictDir } as never);
 });
 
-check("registers directives section and all seventeen tools (compiled JSON Schema)", () => {
+check("registers all seventeen tools and NO global directives section (compiled JSON Schema)", () => {
+  // 0.5.6: the process-wide "memory-plugin:directives" section was
+  // removed — it leaked persona wording into every task window.
   assert.ok(
-    ctx.sections.some((s) => s.name === "memory-plugin:directives"),
+    !ctx.sections.some((s) => s.name === "memory-plugin:directives"),
+    "no global directives section",
   );
   const names = ctx.registeredTools.map((t) => t.name as string);
   for (const n of [
@@ -4501,7 +4504,13 @@ check("0.5.0 step 5: memory_search with the stub rewriter finds what keyword-onl
 const dirRw0 = mkdtempSync(join(tmpdir(), "memory-plugin-rewrite0-"));
 writeFileSync(join(dirRw0, "MEMORY.md"), fixtureMemory, "utf8");
 const ctxRw0 = new MockContext(dirRw0);
-apply(ctxRw0 as never, { dataDir: dirRw0 } as never);
+// The package now ships the semantic runtime, so a fresh data dir
+// auto-enables it — this is the keyword-only CONTROL group, so it must
+// turn semantic off explicitly.
+apply(ctxRw0 as never, {
+  dataDir: dirRw0,
+  semanticRecall: { enabled: false },
+} as never);
 await sleep(50);
 await ctxRw0.emit("agent/created", { agent: { id: "s-rw0" } });
 await ctxRw0.emit("agent/pre-step", {
@@ -4973,7 +4982,17 @@ check("0.5.1 exp: memory_status reports openGoals, doneGoals, pendingForgets and
   assert.equal(statusExp051.openGoals, 1, "one open goal");
   assert.equal(statusExp051.doneGoals, 0, "no done goals (reopened)");
   assert.equal(statusExp051.pendingForgets, 1, "one pending forget request");
-  assert.equal(statusExp051.semantic.enabled, false, "semantic off by default");
+  // 0.5.6: the package ships the runtime under runtime/, so "default"
+  // now means auto-enabled when (and only when) both the runtime and
+  // the model are present in this checkout.
+  const bundledRuntime = existsSync(
+    join(process.cwd(), "runtime", "node_modules", "@huggingface", "transformers", "package.json"),
+  );
+  assert.equal(
+    statusExp051.semantic.enabled,
+    bundledRuntime,
+    "semantic auto-enables exactly when the package ships the runtime",
+  );
   assert.equal(
     statusExp051.semantic.modelPresent,
     existsSync(join(process.cwd(), "models", "bge-small-zh-v1.5", "config.json")),
@@ -5336,5 +5355,116 @@ const wpClear = (await wpTool.execute(
 assert.equal(wpClear.ok, true);
 assert.equal(wpClear.profile?.categories?.偏好, undefined, "cleared category is gone");
 console.log("PASS WP6: profile categories + source validation + clear");
+
+// 0.5.6: MEMORY_PLUGIN_PERSONA_WORKSPACE is the config fallback for
+// installs that cannot edit the plugin patch, and a session inside the
+// whitelisted workdir is a persona window even without a trigger word.
+{
+  const dirEnv = mkdtempSync(join(tmpdir(), "memory-plugin-envws-"));
+  writeFileSync(join(dirEnv, "MEMORY.md"), fixtureMemory, "utf8");
+  process.env.MEMORY_PLUGIN_PERSONA_WORKSPACE = "C:\\夏柠柒";
+  try {
+    const ctxEnv = new MockContext(dirEnv);
+    apply(ctxEnv as never, { dataDir: dirEnv } as never);
+    await sleep(50);
+    await ctxEnv.emit("agent/pre-step", {
+      agent: {
+        id: "s-env",
+        session: { header: { cwd: "C:\\夏柠柒" } },
+        ctx: ctxEnv.agentCtx("s-env"),
+      },
+      messages: [{ role: "user", content: "你好", source: { kind: "user" } }],
+    });
+    const afterIn = JSON.parse(
+      readFileSync(join(dirEnv, "persona-sessions.json"), "utf8"),
+    ) as Record<string, string>;
+    assert.equal(
+      afterIn["s-env"],
+      "persona",
+      "env whitelist: workdir session is persona without a trigger word",
+    );
+
+    await ctxEnv.emit("agent/pre-step", {
+      agent: {
+        id: "s-env-out",
+        session: { header: { cwd: "C:\\some\\other\\workspace" } },
+        ctx: ctxEnv.agentCtx("s-env-out"),
+      },
+      messages: [{ role: "user", content: "夏柠柒，你好", source: { kind: "user" } }],
+    });
+    const afterOut = JSON.parse(
+      readFileSync(join(dirEnv, "persona-sessions.json"), "utf8"),
+    ) as Record<string, string>;
+    assert.equal(
+      afterOut["s-env-out"],
+      undefined,
+      "outside the whitelist even a trigger word does not mark persona",
+    );
+    console.log("PASS 0.5.6: MEMORY_PLUGIN_PERSONA_WORKSPACE marks the workdir only");
+  } finally {
+    delete process.env.MEMORY_PLUGIN_PERSONA_WORKSPACE;
+  }
+}
+
+// ---- 0.6.0 (人味改造): an impression rides at most once per session ----
+{
+  const dirImp0 = mkdtempSync(join(tmpdir(), "memory-plugin-impression-once-"));
+  writeFileSync(join(dirImp0, "MEMORY.md"), fixtureMemory, "utf8");
+  const ctxImp0 = new MockContext(dirImp0);
+  apply(ctxImp0 as never, { dataDir: dirImp0 } as never);
+  await sleep(50);
+  const impDecision0 = (id: string, content: string): Record<string, unknown> => ({
+    agent: { id, ctx: ctxImp0.agentCtx(id) },
+    messages: [{ role: "user", content, source: { kind: "user" } }],
+  });
+  await ctxImp0.emit("agent/created", { agent: { id: "imp0" } });
+  await ctxImp0.emit("agent/pre-step", impDecision0("imp0", "夏柠柒，在吗"));
+  await ctxImp0.emit("session/event", {
+    type: "user/message",
+    sessionId: "imp0",
+    source: { kind: "user" },
+    message: { content: "我最近有点累，别催我早睡", source: { kind: "user" } },
+  });
+  const impEntry = readFileSync(join(dirImp0, "log.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as Record<string, unknown>)
+    .find((e) => String(e.text).includes("最近有点累")) as { id: string };
+  const impTool = ctxImp0.registeredTools.find((t) => t.name === "memory_fragment") as unknown as {
+    execute: (args: Record<string, unknown>, exec?: unknown) => Promise<{ ok: boolean; id?: string; reasons?: string[] }>;
+  };
+  const impCreated = await impTool.execute(
+    {
+      sourceIds: [impEntry.id],
+      text: "他这阵子累得不想说话",
+      tone: "心疼",
+      quotes: ["最近有点累"],
+      kind: "impression",
+      strategy: "别催他早睡，给他留盏灯",
+    },
+    { agent: { session: { id: "imp0" } } },
+  );
+  check("0.6.0: memory_fragment saves an impression with strategy", () => {
+    assert.equal(impCreated.ok, true, `impression saved: ${JSON.stringify(impCreated.reasons ?? [])}`);
+  });
+
+  // Turn 2: the impression is due — it rides the refreshed context.
+  await ctxImp0.emit("agent/pre-step", impDecision0("imp0", "夏柠柒，你还记得早睡吗"));
+  check("0.6.0: a due impression rides the refreshed context with its strategy", () => {
+    const rec = ctxImp0.agentCtx("imp0").contexts.filter((c) => c.name === "memory-plugin:recall");
+    const text = rec.map((c) => c.text).join("\n");
+    assert.ok(text.includes("他这阵子累得不想说话"), `impression injected (got: ${JSON.stringify(text)})`);
+    assert.ok(text.includes("别催他早睡"), "strategy rides the same line");
+  });
+
+  // Turn 3: same query, same session — the impression must not repeat.
+  await ctxImp0.emit("agent/pre-step", impDecision0("imp0", "夏柠柒，你还记得早睡吗，我累"));
+  check("0.6.0: the same impression is not repeated later in the session", () => {
+    const rec = ctxImp0.agentCtx("imp0").contexts.filter((c) => c.name === "memory-plugin:recall");
+    const last = rec[rec.length - 1]?.text ?? "";
+    assert.ok(!last.includes("他这阵子累得不想说话"), `no second copy in the refreshed context (got: ${JSON.stringify(last)})`);
+  });
+}
 
 console.log(`\nALL PASS (data dir: ${dir})`);

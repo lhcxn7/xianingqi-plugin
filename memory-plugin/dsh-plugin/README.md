@@ -590,7 +590,7 @@ turns, and that a second window's persona turn does not crash.
   `LOCAL-EMBEDDING.md`).
 - **Admin centre (CLI + local API first).** No web UI yet. The
   plugin itself does not serve the API — run
-  `node core/src/admin-cli.ts --dataDir <dir> serve` (or
+  `node dsh-plugin/core/src/admin-cli.ts --dataDir <dir> serve` (or
   `… serve --port N --token T`). The command prints the bearer
   token; every request needs
   `Authorization: Bearer <token>`.
@@ -715,11 +715,13 @@ summaries.
 
 ## Publish notes
 
-- `main` points at `./src/index.ts` for local dev (Node runs the TS
-  directly). A published package needs a build step (`tsc` producing
-  `index.js` + `lib/`, wired through the `prepare` script) because a
-  GitHub install fetches sources, not built artifacts — see the
-  research report §1.
+- **Ship compiled output, never TS-only.** `main` points at
+  `./dist/src/index.js`; `pnpm build` (tsc, `tsconfig.build.json`)
+  regenerates `dist/`. Node ≥ 22.6 refuses type stripping under
+  `node_modules` (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`), so a
+  package that only ships `.ts` cannot load from a copy-style install at
+  all — that was the real "插件未启用" cause, beyond the missing `core/`.
+  For local dev the tests import `src/index.ts` directly and still run.
 - `@deepseek-ai/dsh-tools` is loaded dynamically, but it NEVER
   resolves in a `link:` install (live verified 2026-11-06) — so the
   loader compiles tool parameters to JSON Schema locally instead

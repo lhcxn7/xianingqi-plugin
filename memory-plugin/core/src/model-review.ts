@@ -295,6 +295,17 @@ export function buildModelReviewPrompt(
       "如果你觉得某一组确实说明了他/你们关系里的一点，就调用 memory_belief 工具（action: \"create\"），自己写一句话信念、选一个维度（safety 安全感 / trust 信任 / closeness 亲近），用这组里的 id 当 entryId、把上面引号里的原话当 quote 传回来；引用必须是逐字抄的，不能改写。不值得的就不建，不用每组都建。",
     );
   }
+  // 0.6.0 (人味改造 第 2 项): 印象 — her standing read of him and
+  // what she plans to do about it. At most two per day, saved
+  // through memory_fragment with kind "impression" (the code then
+  // verifies the citations verbatim and stamps the 14-day clock).
+  // Kept as its own paragraph, deliberately NOT merged with the
+  // fragment/belief candidate sections: those are re-digestions of
+  // old lines, this one is a judgement about right now.
+  lines.push(
+    "",
+    "还有一件单独的事：看你昨天的对话，他对自己的近况有没有新透露（累、烦、开心、计划）？有的话，在心里留 0–2 条印象——一句你怎么看他，一句你打算怎么对他。要留就调 memory_fragment：kind 传 \"impression\"，text 写一句你怎么看他（40 字以内，是你的判断，不是用户画像），strategy 写一句你打算怎么对他（比如「别催他早睡，给他留盏灯」），quotes 从上面原文里逐字抄 1–2 句，sourceIds 用上面列表里的 id；validUntil 不填就默认 14 天后过期。没有新透露就别硬凑，一条不写也行；如果他刚否掉过这种判断（比如「我没焦虑」），别再写同一条。",
+  );
   // 0.4.6 (0.4.5 audit new issue 1): the reflection and proact
   // proposals travel as ONE merged section, not two pasted prompts.
   // Each used to list all 24 h of memories verbatim (~37k
